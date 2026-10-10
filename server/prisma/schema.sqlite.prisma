@@ -1,0 +1,213 @@
+// 自动生成，请勿手工编辑。
+// 源：prisma/schema.prisma（MySQL 真源），由 scripts/gen-sqlite-schema.mjs 生成。
+// 本地开发用（SQLite），生产请用 MySQL 版。
+
+// 数据字典真源。
+// 生产用 MySQL（utf8mb4）；本地无 MySQL 时由 scripts/gen-sqlite-schema.mjs
+// 自动生成等价的 SQLite 版本，无需维护两份。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// 赛道。账号挂在赛道下，同赛道多账号共享该赛道的角度池。
+model Track {
+  id           Int       @id @default(autoincrement())
+  name         String
+  slug         String    @unique
+  quotaPerDay  Int       @default(2)
+  enabled      Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  accounts Account[]
+  angles   Angle[]
+  articles Article[]
+
+  @@index([enabled])
+}
+
+/// 公众号账号。AppSecret 加密存储，API 层只暴露 secretMask。
+model Account {
+  id          Int        @id @default(autoincrement())
+  trackId     Int
+  name        String
+  appid       String     @unique
+  secretEnc   Bytes?
+  secretMask  String     @default("")
+  author      String     @default("")
+  credStatus  String @default("missing")
+  enabled     Boolean    @default(false)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  track   Track         @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  tokens  WechatToken[]
+  articles Article[]
+
+  @@index([trackId, enabled])
+}
+
+/// access_token 缓存。本机流水线每次运行都重新取 token，上云必须缓存（微信有调用频率限制）。
+model WechatToken {
+  id         Int      @id @default(autoincrement())
+  accountId  Int      @unique
+  tokenEnc   Bytes
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+/// 选题角度。同赛道内取一个少一个，抢占用 CAS 保证并发安全。
+model Angle {
+  id        Int       @id @default(autoincrement())
+  trackId   Int
+  code      String
+  seq       Int
+  theme     String
+  content   String
+  used      Boolean   @default(false)
+  usedBy    String    @default("")
+  usedDate  String?
+  source    String    @default("")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  track    Track      @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  articles Article[]
+
+  @@unique([trackId, code])
+  @@index([trackId, used, seq])
+  @@index([theme])
+}
+
+/// 文章。contentHtml 可编辑，contentWechat 是推送渲染产物（由同一渲染函数产出）。
+model Article {
+  id              Int           @id @default(autoincrement())
+  trackId         Int?
+  accountId       Int?
+  angleId         Int?
+  title           String
+  digest          String        @default("")
+  contentHtml     String
+  contentWechat   String        @default("")
+  contentPath     String        @default("")
+  coverPath       String        @default("")
+  mediaId         String        @default("")
+  status          String @default("draft")
+  pushDate        String
+  blocks          Int           @default(0)
+  chars           Int           @default(0)
+  qualityJson     String?
+  idempotencyKey  String        @unique
+  note            String        @default("")
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  track   Track?   @relation(fields: [trackId], references: [id], onDelete: SetNull)
+  // 删账号即删其名下文章：避免产生永远推不出去的孤儿文章。
+  // 应用层 services/accounts.deleteAccount 也做了显式级联，双保险。
+  account Account? @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  angle   Angle?   @relation(fields: [angleId], references: [id], onDelete: SetNull)
+
+  @@index([pushDate, accountId])
+  @@index([status])
+  @@index([angleId])
+}
+
+/// 任务执行记录。排产、写作、生图、推送都走这里，便于监控与重试。
+model TaskRun {
+  id             Int        @id @default(autoincrement())
+  jobType        String
+  status         String @default("pending")
+  trigger        String    @default("manual")
+  parentId       Int?
+  trackId        Int?
+  accountId      Int?
+  articleId      Int?
+  angleId        Int?
+  runDate        String
+  attempt        Int        @default(1)
+  paramsJson     String?
+  resultJson     String?
+  errorCode      String     @default("")
+  errorMessage   String     @default("")
+  tokensPrompt   Int        @default(0)
+  tokensComplete Int        @default(0)
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  createdAt      DateTime   @default(now())
+
+  logs RunLog[]
+
+  @@index([status, createdAt])
+  @@index([jobType, runDate])
+  @@index([articleId])
+}
+
+/// 运行日志。本机流水线完全没有日志落盘，这是补上的一环。
+model RunLog {
+  id         Int      @id @default(autoincrement())
+  taskRunId  Int?
+  level      String @default("info")
+  stage      String   @default("")
+  message    String
+  contextJson String?
+  createdAt  DateTime @default(now())
+
+  taskRun TaskRun? @relation(fields: [taskRunId], references: [id], onDelete: Cascade)
+
+  @@index([taskRunId, createdAt])
+}
+
+/// 可配置的 LLM 模型。OpenAI 兼容协议一个 provider 覆盖多家厂商。
+model LlmModel {
+  id         Int         @id @default(autoincrement())
+  name       String
+  provider   String
+  capability String
+  baseUrl    String
+  modelId    String
+  apiKeyEnc  Bytes?
+  apiKeyMask String      @default("")
+  paramsJson String?
+  enabled    Boolean     @default(true)
+  isDefault  Boolean     @default(false)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  bindings ModelBinding[]
+
+  @@index([capability, enabled])
+}
+
+/// 用途绑定：写作 / 修订 / 封面 / 扩库 各用哪个模型。
+model ModelBinding {
+  id       Int       @id @default(autoincrement())
+  role     String @unique
+  modelId  Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  model LlmModel @relation(fields: [modelId], references: [id], onDelete: Cascade)
+}
+
+/// 系统设置。readonly=1 的项（如 auto_publish）界面只读，不允许改。
+model Setting {
+  id        Int      @id @default(autoincrement())
+  k         String   @unique
+  v         String
+  kind      String   @default("string")
+  readonly  Boolean  @default(false)
+  desc      String   @default("")
+  updatedAt DateTime @updatedAt
+}

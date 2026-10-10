@@ -1,0 +1,416 @@
+/* ============================================================================
+   设计令牌与全局基础层
+   - 语义化变量优先，避免各组件散落颜色值
+   - 主色取自微信品牌绿并加深，保证白字对比度 ≥ 4.5:1
+   - 统一圆角 / 间距 / 字号尺度，全站只声明一次
+   ========================================================================== */
+
+:root {
+  /* 语义色 */
+  --wb-bg: #f4f6f8;
+  --wb-surface: #ffffff;
+  --wb-surface-muted: #fafbfc;
+  --wb-text: #1f2329;
+  --wb-text-secondary: #4e5969;
+  --wb-text-muted: #86909c;
+  --wb-border: #e5e6eb;
+  --wb-border-strong: #d0d3d9;
+
+  /* 品牌与状态 */
+  --wb-primary: #0a7c47;
+  --wb-primary-hover: #0d9455;
+  --wb-primary-soft: #e8f5ee;
+  --wb-danger: #d54941;
+  --wb-warning: #b8801a;
+
+  /* 尺度 */
+  --wb-radius: 10px;
+  --wb-radius-sm: 6px;
+  --wb-gap: 16px;
+  --wb-space-1: 4px;
+  --wb-space-2: 8px;
+  --wb-space-3: 12px;
+  --wb-space-4: 16px;
+  --wb-space-5: 24px;
+
+  /* 阴影克制：只用于真正浮起的层 */
+  --wb-shadow-card: 0 1px 2px rgba(31, 35, 41, 0.04);
+}
+
+/* Element Plus 主题对齐，让组件库主色与项目一致 */
+:root {
+  --el-color-primary: #0a7c47;
+  --el-color-primary-light-3: #43a97b;
+  --el-color-primary-light-5: #6dbf9c;
+  --el-color-primary-light-7: #9ad5bd;
+  --el-color-primary-light-8: #b8e2ce;
+  --el-color-primary-light-9: #dcf1e7;
+  --el-color-primary-dark-2: #086339;
+  --el-border-radius-base: 8px;
+  --el-font-size-base: 14px;
+  --el-text-color-primary: #1f2329;
+  --el-text-color-regular: #4e5969;
+  --el-border-color-lighter: #eef0f3;
+}
+
+/* 品牌扩展令牌：在既有 --wb-primary 基础上补充渐变、强调底色、导航激活态与节奏感尺度，
+   不改动任何既有色值，组件内仍只引用语义变量。 */
+:root {
+  /* 品牌衍生 */
+  --wb-primary-rgb: 10, 124, 71;
+  --wb-primary-grad: linear-gradient(135deg, #11a35f 0%, #0a7c47 100%);
+  --wb-primary-soft-2: #f1f8f4;
+  --wb-nav-active-bg: #eaf5ee;
+  --wb-chip-bg: #eef3f0;
+  --wb-ring: rgba(10, 124, 71, 0.18);
+
+  /* 文本强度层次 */
+  --wb-text-strong: #0f1216;
+
+  /* 更大圆角用于强调卡 */
+  --wb-radius-lg: 14px;
+
+  /* 浮起层（对话框/下拉/抽屉）的克制阴影 */
+  --wb-shadow-pop: 0 8px 28px rgba(31, 35, 41, 0.12);
+
+  /* 主内容入场过渡 */
+  --wb-ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--wb-bg);
+  color: var(--wb-text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  /* 中文正文需要比英文更宽松的行高 */
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 焦点可见：不删除轮廓，统一为品牌色描边 */
+:focus-visible {
+  outline: 2px solid var(--wb-primary);
+  outline-offset: 2px;
+  border-radius: var(--wb-radius-sm);
+}
+
+/* 跳到主内容：仅键盘聚焦时出现 */
+.wb-skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 2000;
+  background: var(--wb-surface);
+  color: var(--wb-primary);
+  padding: 8px 16px;
+  border: 1px solid var(--wb-primary);
+  border-radius: 0 0 var(--wb-radius-sm) 0;
+}
+
+.wb-skip-link:focus {
+  left: 0;
+}
+
+.wb-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ── 页面骨架 ── */
+
+.wb-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wb-gap);
+}
+
+.wb-page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--wb-space-3);
+  flex-wrap: wrap;
+}
+
+.wb-page-head h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.wb-page-desc {
+  margin: 2px 0 0;
+  color: var(--wb-text-muted);
+  font-size: 13px;
+}
+
+.wb-page-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--wb-space-2);
+  flex-wrap: wrap;
+}
+
+.wb-muted {
+  color: var(--wb-text-muted);
+  font-size: 12px;
+}
+
+.wb-secondary {
+  color: var(--wb-text-secondary);
+}
+
+.wb-mono {
+  font-family: 'JetBrains Mono', Consolas, Menlo, monospace;
+  font-size: 12px;
+}
+
+.wb-gap {
+  height: var(--wb-space-3);
+}
+
+.wb-num {
+  font-variant-numeric: tabular-nums;
+}
+
+.wb-danger-text {
+  color: var(--wb-danger);
+  font-weight: 600;
+}
+
+/* ── 卡片：默认扁平，不滥用悬浮 ── */
+
+.el-card {
+  border-radius: var(--wb-radius);
+  border-color: var(--wb-border);
+  box-shadow: var(--wb-shadow-card);
+}
+
+.el-card__header {
+  font-weight: 600;
+  padding: 14px 16px;
+  border-bottom-color: var(--wb-border);
+}
+
+/* ── 表格 ── */
+
+.el-table {
+  --el-table-border-color: var(--wb-border);
+  --el-table-header-text-color: var(--wb-text-secondary);
+}
+
+.el-table th.el-table__cell {
+  background: var(--wb-surface-muted) !important;
+  font-weight: 600;
+}
+
+.el-table .el-table__cell {
+  padding: 9px 0;
+}
+
+/* ── 微信正文预览容器：还原公众号排版宽度与行距 ── */
+
+.wb-preview {
+  background: #fff;
+  border: 1px solid var(--wb-border);
+  border-radius: var(--wb-radius);
+  padding: 20px 18px;
+  max-width: 720px;
+  line-height: 1.75;
+  font-size: 16px;
+  word-break: break-word;
+}
+
+.wb-preview h1,
+.wb-preview h2,
+.wb-preview h3 {
+  line-height: 1.4;
+}
+
+/* ── 响应式：窄屏隐藏次要列（配合 el-table-column 的 class-name="col-optional"）── */
+
+@media (max-width: 900px) {
+  .col-optional {
+    display: none !important;
+  }
+}
+
+@media (max-width: 767px) {
+  body {
+    font-size: 13px;
+  }
+
+  .wb-page-head h2 {
+    font-size: 17px;
+  }
+}
+
+/* 尊重系统「减少动态效果」偏好 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ── 侧边导航：品牌色「磁贴」式激活态 ──
+   默认 el-menu 是通栏高亮，改为带圆角的内缩磁贴，激活项左侧加品牌色色条，
+   让当前页面一眼可辨，又不破坏既有的扁平克制基调。 */
+.aside .el-menu {
+  background: transparent;
+  --el-menu-hover-bg-color: var(--wb-surface-muted);
+  --el-menu-active-color: var(--wb-primary);
+  --el-menu-text-color: var(--wb-text-secondary);
+  padding: 6px 0;
+}
+
+.aside .el-menu-item {
+  position: relative;
+  height: 44px;
+  margin: 3px 10px;
+  border-radius: 9px;
+}
+
+.aside .el-menu-item.is-active {
+  background: var(--wb-nav-active-bg);
+  color: var(--wb-primary);
+  font-weight: 600;
+}
+
+.aside .el-menu-item.is-active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 20px;
+  border-radius: 0 3px 3px 0;
+  background: var(--wb-primary);
+}
+
+.aside .el-menu-item:not(.is-active):hover {
+  background: var(--wb-surface-muted);
+}
+
+/* ── 图标芯片：指标卡 / 列表前导的统一视觉锚点 ── */
+.wb-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: var(--wb-primary-soft);
+  color: var(--wb-primary);
+  font-size: 19px;
+  flex: none;
+}
+
+.wb-chip--soft {
+  background: var(--wb-surface-muted);
+  color: var(--wb-text-secondary);
+}
+
+.wb-chip--muted {
+  background: var(--wb-chip-bg);
+  color: var(--wb-text-secondary);
+}
+
+/* ── 指标卡顶部品牌强调条 ── */
+.el-card.wb-stat {
+  position: relative;
+  overflow: hidden;
+}
+
+.el-card.wb-stat::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: var(--wb-primary-grad);
+}
+
+/* 小标签：分组 / 区隔标题 */
+.wb-kicker {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--wb-text-muted);
+}
+
+/* ── 主滚动区：克制的细滚动条 ── */
+.main {
+  scrollbar-width: thin;
+  scrollbar-color: #d6dae0 transparent;
+}
+
+.main::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.main::-webkit-scrollbar-thumb {
+  background: #d6dae0;
+  border-radius: 8px;
+  border: 3px solid var(--wb-bg);
+}
+
+.main::-webkit-scrollbar-thumb:hover {
+  background: #c2c8d0;
+}
+
+.main::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ── 路由切换：轻量淡入上浮，遵循系统减少动效偏好 ── */
+.wb-fade-enter-active {
+  transition: opacity 0.26s var(--wb-ease-out), transform 0.26s var(--wb-ease-out);
+}
+
+.wb-fade-leave-active {
+  transition: opacity 0.12s ease;
+}
+
+.wb-fade-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+.wb-fade-leave-to {
+  opacity: 0;
+}
+
+/* 浮起层（对话框 / 下拉）的阴影收敛到统一 token */
+.el-popper,
+.el-dialog {
+  box-shadow: var(--wb-shadow-pop) !important;
+}

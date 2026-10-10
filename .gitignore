@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+.env
+*.env
+!.env.example
+app.env
+
+var/logs/*
+var/tmp/*
+var/content/*
+!var/logs/.gitkeep
+!var/tmp/.gitkeep
+!var/content/.gitkeep
+!var/content/articles/.gitkeep
+!var/content/covers/.gitkeep
+
+node_modules/
+web/dist/
+web/.vite/
+
+# local dev database (sqlite, may contain encrypted credentials)
+*.db
+*.sqlite
+*.sqlite3
+
+# server runtime state: holds AES master key + temp scratch files
+server/var/
+
+# workbuddy local tooling state (not project source)
+.workbuddy/
+
+# root stub lockfile (real locks live in server/ and web/)
+/package-lock.json
+
+.DS_Store
+Thumbs.db
+*.log
