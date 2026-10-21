@@ -1,0 +1,50 @@
+[Unit]
+Description=WeChat Pipeline Cloud — API 服务
+Documentation=file:/opt/wechat-pipeline-cloud/deploy/README.md
+After=network-online.target mysql.service mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wpc
+Group=wpc
+
+# dotenv 从 process.cwd() 读 .env，生产不依赖它；但相对路径的资源（prisma/、config/）
+# 都从这里推导，所以 WorkingDirectory 必须准确，否则会报找不到 schema。
+WorkingDirectory=/opt/wechat-pipeline-cloud/server
+
+# 生产环境不要放仓库里的 .env：所有配置走这个文件
+EnvironmentFile=/etc/wechat-pipeline-cloud/app.env
+Environment=NODE_ENV=production
+
+# ⚠️ ExecStart 必须用 node 的**绝对路径**：systemd 不读 login shell 的 PATH，
+#    nvm 装的 node 在这里一定找不到。用 `which node` 或 `readlink -f $(which node)`
+#    查真实路径后填进来（nvm 常见：/root/.nvm/versions/node/v22.x/bin/node）。
+ExecStart=/usr/bin/node --experimental-strip-types src/index.ts
+
+Restart=always
+RestartSec=5
+
+# src/app.ts 已注册 SIGTERM 优雅退出（先关 HTTP server 再断开 DB）
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wechat-pipeline
+
+# ── 加固 ──
+# ProtectSystem=strict 会把整个文件系统挂成只读，所以写入点必须显式放行：
+#   · BASE_DIR/var  → 日志（logger.ts 硬编码）与内容（文章 HTML、封面 PNG）
+#   · server/var    → 本地临时文件
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/wechat-pipeline-cloud/var /opt/wechat-pipeline-cloud/server/var
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

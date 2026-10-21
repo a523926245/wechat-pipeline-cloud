@@ -7,7 +7,7 @@ import { errMsg } from '../api/http.ts';
 import { getDashboard } from '../api/index.ts';
 import StateError from '../components/StateError.vue';
 import type { DashboardData } from '../types.ts';
-import { statusTag, statusText } from '../utils/format.ts';
+import { pipelineTagType, pipelineText, statusTag, statusText } from '../utils/format.ts';
 
 const router = useRouter();
 
@@ -37,17 +37,14 @@ const quotaPct = computed(() => {
   return Math.min(100, Math.round((t.produced / t.quotaTotal) * 100));
 });
 
-const roleLabels: Record<string, string> = {
-  write: '写作',
-  revise: '改写',
-  cover: '封面',
-  expand_angles: '扩角度',
-};
-
 function pctOf(produced: number, quota: number): number {
   if (!quota) return 0;
   return Math.min(100, Math.round((produced / quota) * 100));
 }
+
+/** 按产线汇总（后端 groupByPipeline）。单产线时不重复展示，避免和总进度打架。 */
+const pipelineRows = computed(() => data.value?.today.byPipeline ?? []);
+const multiPipeline = computed(() => pipelineRows.value.length > 1);
 
 /** 次要指标卡：图标芯片 + 顶部品牌强调条（由 .wb-stat 提供），数字右对齐更整齐。 */
 const metricCards = computed(() => {
@@ -84,7 +81,7 @@ const metricCards = computed(() => {
     <header class="wb-page-head">
       <div>
         <h2>仪表盘</h2>
-        <p class="wb-page-desc">今天的产出进度、角度库存与系统健康</p>
+        <p class="wb-page-desc">今天的产出进度与角度库存（系统状态常驻侧边栏底部）</p>
       </div>
       <div class="wb-page-actions">
         <el-button :icon="Refresh" @click="load">刷新</el-button>
@@ -141,6 +138,20 @@ const metricCards = computed(() => {
               <span>可用角度 <strong class="wb-num">{{ data.counts.angles.unused }}</strong></span>
               <span>草稿 <strong class="wb-num">{{ data.counts.articles.draft }}</strong></span>
             </div>
+            <!-- 多产线时按产线拆开看：一条线欠账、另一条线完成，总进度会把它抹平 -->
+            <div v-if="multiPipeline" class="pipeline-chips">
+              <span
+                v-for="p in pipelineRows"
+                :key="p.pipeline"
+                class="pipeline-chip"
+              >
+                <el-tag :type="pipelineTagType(p.pipeline)" size="small">{{ pipelineText(p.pipeline) }}</el-tag>
+                <span class="wb-num">{{ p.produced }}/{{ p.quota }}</span>
+                <span class="wb-muted">· {{ p.accounts }} 个账号</span>
+                <el-tag v-if="p.pending > 0" type="warning" size="small" effect="plain">待补 {{ p.pending }}</el-tag>
+                <el-tag v-else type="success" size="small" effect="plain">已完成</el-tag>
+              </span>
+            </div>
             <el-button
               v-if="data.today.pending > 0"
               type="primary"
@@ -174,10 +185,17 @@ const metricCards = computed(() => {
 
       <!-- 今日各账号 -->
       <el-card shadow="never">
-        <template #header>今日配额（各账号）</template>
+        <template #header>今日配额（各账号 · 各产线）</template>
         <el-table v-if="data.today.byAccount.length" :data="data.today.byAccount" size="small">
           <el-table-column prop="account" label="账号" min-width="130" />
           <el-table-column prop="track" label="赛道" min-width="110" class-name="col-optional" />
+          <el-table-column v-if="multiPipeline" label="产线" width="88">
+            <template #default="{ row }">
+              <el-tag :type="pipelineTagType(row.pipeline)" size="small">
+                {{ pipelineText(row.pipeline) }}
+              </el-tag>
+            </template>
+          </el-table-column>
           <el-table-column prop="quota" label="配额" width="72" />
           <el-table-column prop="produced" label="已出" width="72" />
           <el-table-column label="待补" width="78">
@@ -194,65 +212,6 @@ const metricCards = computed(() => {
         </el-table>
         <el-empty v-else description="暂无可排产账号（需凭据就绪且启用）" :image-size="60" />
       </el-card>
-
-      <el-row :gutter="12">
-        <el-col :xs="24" :md="12">
-          <el-card shadow="never">
-            <template #header>系统健康</template>
-            <el-descriptions :column="1" size="small" border>
-              <el-descriptions-item label="数据库">
-                <el-tag :type="data.health.db ? 'success' : 'danger'" size="small">
-                  {{ data.health.db ? '正常' : '异常' }}
-                </el-tag>
-              </el-descriptions-item>
-              <el-descriptions-item label="主密钥">
-                <el-tag :type="data.health.masterKey ? 'success' : 'danger'" size="small">
-                  {{ data.health.masterKey ? '已就绪' : '未就绪' }}
-                </el-tag>
-              </el-descriptions-item>
-              <el-descriptions-item label="自动发布（硬常量）">
-                <el-tag :type="data.health.autoPublishConstant ? 'danger' : 'success'" size="small">
-                  {{ data.health.autoPublishConstant ? '已开启' : 'false（不可开启）' }}
-                </el-tag>
-              </el-descriptions-item>
-              <el-descriptions-item label="库中 auto_publish">
-                <span class="wb-mono">{{ data.health.autoPublishSetting ?? '(未设置)' }}</span>
-              </el-descriptions-item>
-              <el-descriptions-item label="调度">
-                <el-tag :type="data.health.scheduler.enabled ? 'success' : 'info'" size="small">
-                  {{ data.health.scheduler.enabled ? `已启用 ${data.health.scheduler.writeTime}` : '未启用' }}
-                </el-tag>
-                <span class="wb-muted" style="margin-left: 6px">
-                  {{ data.health.scheduler.pushEnabled ? '含推送' : '不推送' }}
-                </span>
-              </el-descriptions-item>
-            </el-descriptions>
-          </el-card>
-        </el-col>
-
-        <el-col :xs="24" :md="12">
-          <el-card shadow="never">
-            <template #header>
-              <span>模型与角色绑定</span>
-              <el-tag size="small" type="info" style="margin-left: 8px">
-                {{ data.models.enabled }}/{{ data.models.total }} 启用
-              </el-tag>
-            </template>
-            <el-descriptions :column="1" size="small" border>
-              <el-descriptions-item v-for="(label, role) in roleLabels" :key="role" :label="label">
-                <el-tag :type="data.models.bindings[role] ? 'success' : 'warning'" size="small" effect="light">
-                  {{ data.models.bindings[role]?.modelName ?? '未绑定' }}
-                </el-tag>
-              </el-descriptions-item>
-              <el-descriptions-item label="写作模型">
-                <el-tag :type="data.models.writeModelReady ? 'success' : 'warning'" size="small">
-                  {{ data.models.writeModelReady ? '已配置 Key' : '无 Key（回退骨架）' }}
-                </el-tag>
-              </el-descriptions-item>
-            </el-descriptions>
-          </el-card>
-        </el-col>
-      </el-row>
 
       <el-row :gutter="12" v-if="data.backlog.length || data.skipped.length">
         <el-col v-if="data.backlog.length" :xs="24" :md="12">
@@ -337,8 +296,8 @@ const metricCards = computed(() => {
 
 <style scoped>
 .focus-card {
-  border-color: #cfe6d9;
-  background: linear-gradient(180deg, #f4fbf7 0%, #ffffff 60%);
+  border-color: var(--wb-primary-soft);
+  background: linear-gradient(180deg, var(--wb-primary-soft-2) 0%, var(--wb-surface) 60%);
 }
 
 .focus {
@@ -369,6 +328,20 @@ const metricCards = computed(() => {
 
 .focus-meta strong {
   color: var(--wb-text);
+}
+
+.pipeline-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--wb-space-2) var(--wb-space-4);
+  margin-bottom: var(--wb-space-3);
+  font-size: 12px;
+}
+
+.pipeline-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--wb-space-2);
 }
 
 .ring-inner {

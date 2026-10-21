@@ -13,7 +13,12 @@ import { z } from 'zod';
 import { prisma } from '../../db.ts';
 import { encryptSecret, looksLikePlaceholder, maskSecret } from '../../lib/crypto.ts';
 import { BadRequestError, CredentialError, NotFoundError, WechatApiError } from '../../errors.ts';
-import { decideCredStatus, validateCredentials } from '../../services/accounts.ts';
+import {
+  createAccount,
+  decideCredStatus,
+  deleteAccount,
+  validateCredentials,
+} from '../../services/accounts.ts';
 import { WechatClient } from '../../services/wechat.ts';
 import { asyncHandler } from '../async-handler.ts';
 
@@ -21,7 +26,17 @@ export const credentialsRouter: Router = Router();
 
 const idParam = z.coerce.number().int().positive();
 
+const createSchema = z.object({
+  trackId: z.number().int().positive('trackId 必须是正整数'),
+  name: z.string().trim().min(1, '账号名不能为空').max(64),
+  appid: z.string().trim().min(1, 'AppID 不能为空').max(32),
+  secret: z.string().max(128).optional(),
+  author: z.string().trim().max(64).optional(),
+});
+
 const updateSchema = z.object({
+  name: z.string().trim().min(1).max(64).optional(),
+  trackId: z.number().int().positive().optional(),
   appid: z.string().trim().optional(),
   secret: z.string().optional(),
   author: z.string().trim().max(64).optional(),
@@ -49,6 +64,56 @@ credentialsRouter.get(
         author: a.author,
       })),
     });
+  }),
+);
+
+/**
+ * 新建账号。账号数量不是固定的，运行期可随时增删。
+ * 传了 Secret 就按真实凭据判定状态，不传则建成 missing（占位）待补。
+ */
+credentialsRouter.post(
+  '/',
+  asyncHandler(async (req, res) => {
+    const body = createSchema.parse(req.body);
+    const secret = body.secret ?? '';
+
+    // 与 PUT 一致的宽松策略：占位值放行（当"未配置"），只有"看似真实却格式错"才拒绝。
+    if (secret && !looksLikePlaceholder(secret)) {
+      const v = validateCredentials(body.appid, secret);
+      if (!v.secretOk) throw new CredentialError(`Secret 不合规：${v.problems.join('；')}`);
+      if (!looksLikePlaceholder(body.appid) && !v.appidOk) {
+        throw new CredentialError(`AppID 不合规：${v.problems.join('；')}`);
+      }
+    }
+
+    try {
+      const a = await createAccount({
+        trackId: body.trackId,
+        name: body.name,
+        appid: body.appid,
+        secret,
+        author: body.author,
+      });
+      res.status(201).json({
+        id: a.id,
+        name: a.name,
+        trackId: a.trackId,
+        appid: a.appid,
+        secretMask: a.secretMask,
+        credStatus: a.credStatus,
+        enabled: a.enabled,
+        author: a.author,
+        message:
+          a.credStatus === 'ok'
+            ? '账号已创建，凭据合规并已启用（建议再跑一次连通测试确认）'
+            : `账号已创建，凭据状态：${a.credStatus}。请补全 AppID/Secret 后测试连通`,
+      });
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('Unique')) {
+        throw new BadRequestError('AppID 已存在（与其他账号冲突）');
+      }
+      throw e;
+    }
   }),
 );
 
@@ -81,6 +146,12 @@ credentialsRouter.put(
     const current = await prisma.account.findUnique({ where: { id } });
     if (!current) throw new NotFoundError(`账号 ${id} 不存在`);
 
+    // 改绑赛道：赛道必须真实存在，否则账号会挂到一个不存在的赛道上。
+    if (body.trackId !== undefined && body.trackId !== current.trackId) {
+      const track = await prisma.track.findUnique({ where: { id: body.trackId }, select: { id: true } });
+      if (!track) throw new NotFoundError(`赛道 ${body.trackId} 不存在`);
+    }
+
     // 合并：只更新传入的字段，其余沿用现有值
     const nextAppid = body.appid ?? current.appid;
     const nextSecret = body.secret ?? '';
@@ -100,6 +171,8 @@ credentialsRouter.put(
     const { status, enabled } = decideCredStatus(nextAppid, nextSecret);
 
     const data: Record<string, unknown> = { author, credStatus: status, enabled };
+    if (body.name !== undefined) data.name = body.name;
+    if (body.trackId !== undefined) data.trackId = body.trackId;
     if (body.appid !== undefined) data.appid = nextAppid;
     if (body.secret !== undefined) {
       data.secretEnc = encryptSecret(nextSecret);
@@ -111,6 +184,7 @@ credentialsRouter.put(
       res.json({
         id: updated.id,
         name: updated.name,
+        trackId: updated.trackId,
         appid: updated.appid,
         secretMask: updated.secretMask,
         credStatus: updated.credStatus,
@@ -189,5 +263,30 @@ credentialsRouter.post(
         detail,
       });
     }
+  }),
+);
+
+/**
+ * 删除账号。级联逻辑全部在 services/accounts.deleteAccount 的事务里完成：
+ * 未送达文章所占角度归还池中 → 名下文章删除 → TaskRun 的 accountId 置空 → 删账号。
+ * 微信侧已经发出去的内容不受影响（系统只写草稿箱，且这里不碰微信接口）。
+ */
+credentialsRouter.delete(
+  '/:id',
+  asyncHandler(async (req, res) => {
+    const id = idParam.parse(req.params.id);
+    const r = await deleteAccount(id);
+    res.json({
+      ok: true,
+      id: r.id,
+      name: r.name,
+      deletedArticles: r.deletedArticles,
+      recycledAngles: r.recycledAngles,
+      message:
+        r.deletedArticles > 0
+          ? `已删除账号「${r.name}」，同时删除其名下 ${r.deletedArticles} 篇文章` +
+            (r.recycledAngles > 0 ? `，归还 ${r.recycledAngles} 个未用选题到角度池` : '')
+          : `已删除账号「${r.name}」`,
+    });
   }),
 );

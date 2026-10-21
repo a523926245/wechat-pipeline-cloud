@@ -8,17 +8,21 @@ import express from 'express';
 import helmet from 'helmet';
 import { ZodError } from 'zod';
 
-import { PORT } from './config.ts';
+import { CONTENT_DIR, PORT } from './config.ts';
 import { AppError } from './errors.ts';
 import { logger } from './logger.ts';
+import { requestLogger } from './lib/request-logger.ts';
 import { systemRouter } from './api/routes/system.ts';
 import { credentialsRouter } from './api/routes/credentials.ts';
+import { tracksRouter } from './api/routes/tracks.ts';
 import { articlesRouter } from './api/routes/articles.ts';
 import { modelsRouter } from './api/routes/models.ts';
+import { reviseRouter } from './api/routes/revise.ts';
 import { plansRouter } from './api/routes/plans.ts';
 import { emphasisRouter } from './api/routes/emphasis.ts';
 import { schedulerRouter } from './api/routes/scheduler.ts';
 import { dashboardRouter } from './api/routes/dashboard.ts';
+import { anglesRouter } from './api/routes/angles.ts';
 
 export function createApp() {
   const app = express();
@@ -29,10 +33,23 @@ export function createApp() {
   app.use(express.urlencoded({ extended: false }));
   app.use(cookieParser());
 
+  // 接口访问日志：每条 /api 请求在响应结束时输出到控制台（复用 logger，同时落文件）
+  app.use(requestLogger);
+
+  // 内容文件（文章 HTML、生成的封面图）。挂在 /api 下是为了复用前端的 /api 代理，
+  // 无需改 vite.config.ts。必须在业务路由之前注册，否则会被下面的 404 兜底吃掉。
+  app.use(
+    '/api/content',
+    express.static(CONTENT_DIR, { index: false, dotfiles: 'deny', maxAge: '1h', fallthrough: true }),
+  );
+
   app.use('/api', systemRouter);
   app.use('/api/credentials', credentialsRouter);
+  app.use('/api/tracks', tracksRouter);
+  app.use('/api/angles', anglesRouter);
   app.use('/api/articles', articlesRouter);
   app.use('/api/models', modelsRouter);
+  app.use('/api/revise', reviseRouter);
   app.use('/api/plan', plansRouter);
   app.use('/api/emphasize', emphasisRouter);
   app.use('/api/scheduler', schedulerRouter);

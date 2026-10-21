@@ -1,0 +1,19 @@
+[Unit]
+Description=WeChat Pipeline Cloud — 每天触发一次排产推送
+Documentation=file:/opt/wechat-pipeline-cloud/deploy/README.md
+
+[Timer]
+# 每天 06:05。改时间只改这一行，例如 07:30 就写 OnCalendar=*-*-* 07:30
+OnCalendar=*-*-* 06:05
+
+# 关机/休眠错过了执行点 → 开机后补跑一次（配合 AccuracySec 尽快补上）
+Persistent=true
+
+# 0~180 秒随机延迟：避免多台机器同时打微信接口被限流
+RandomizedDelaySec=180
+AccuracySec=1min
+
+Unit=wechat-pipeline-scheduler.service
+
+[Install]
+WantedBy=timers.target

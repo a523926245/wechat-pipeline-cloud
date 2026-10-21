@@ -26,8 +26,8 @@ const emit = defineEmits<{ retry: [] }>();
   align-items: center;
   gap: var(--wb-space-3);
   padding: 12px 16px;
-  background: #fef2f1;
-  border: 1px solid #f7c9c5;
+  background: var(--wb-danger-soft);
+  border: 1px solid var(--wb-danger-border);
   border-radius: var(--wb-radius);
 }
 

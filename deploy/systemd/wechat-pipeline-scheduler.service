@@ -1,0 +1,35 @@
+[Unit]
+Description=WeChat Pipeline Cloud — 排产调度（单次）
+Documentation=file:/opt/wechat-pipeline-cloud/deploy/README.md
+After=network-online.target wechat-pipeline.service
+Wants=network-online.target
+
+[Service]
+# oneshot：跑完一次就退出，由 .timer 按点唤起。
+# 相比常驻 `npm run scheduler`（60s 心跳轮询），每天只需跑一次的场景下省资源，
+# 且不会因进程崩溃而漏跑——Timer 有自己的重试与持久化语义。
+Type=oneshot
+User=wpc
+Group=wpc
+WorkingDirectory=/opt/wechat-pipeline-cloud/server
+EnvironmentFile=/etc/wechat-pipeline-cloud/app.env
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/node --experimental-strip-types src/cli/scheduler.ts --once
+
+# 一次 tick 可能触发整批写作 + 生图 + 推送，LLM_TIMEOUT_MS 默认 300 秒，
+# 这里给到 900 秒留足余量
+TimeoutStartSec=900
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wechat-pipeline-scheduler
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/wechat-pipeline-cloud/var /opt/wechat-pipeline-cloud/server/var
+
+# 没有 [Install] 段是故意的：这个 service 不随开机启动，只由 .timer 拉起。
+# 误执行 systemctl enable 反而会让它在开机时白跑一次。

@@ -7,8 +7,13 @@
  * 安全红线（不可动摇，沿用阶段 2/3 的约定）：
  *   - 只写草稿箱：`WechatClient.addDraft`，**绝不调用 masssend / 群发接口**
  *   - 账号必须 `credStatus === 'ok'`，否则不发起任何外网调用
- *   - 封面仅在文件真实存在时上传，否则推无封面草稿
+ *   - 封面仅在文件真实存在时上传；文件缺失时**显式返回 coverMissing**，绝不静默
  *   - 失败时把文章置 `failed` 并优雅返回，不抛到调用方导致崩溃
+ *
+ * TODO（本轮不接）：`WechatClient.updateDraft` 目前零调用方。换封面后若要「原地更新旧草稿」
+ * 而非「再建一篇新草稿」，必须先 `getDraft` 比对再写——`updateDraft` 内部走 normalizeArticle
+ * 会整篇覆盖，草稿若被人工在公众号后台编辑过会被静默冲掉。仅当调用方显式传入
+ * `{ updateDraft: true }` 时才启用。
  */
 
 import { existsSync } from 'node:fs';
@@ -16,10 +21,14 @@ import { existsSync } from 'node:fs';
 import { prisma } from '../db.ts';
 import { NotFoundError, WechatApiError } from '../errors.ts';
 import { WechatClient } from './wechat.ts';
+import { resolveCoverPath, toRelativeCoverPath } from './content-path.ts';
 import { packJson } from '../db-json.ts';
+import { todayKey } from '../lib/day.ts';
 import { logger } from '../logger.ts';
+import { lintArticle, lintSummary, type LintReport } from './lint.ts';
+import { ensureComicAssetsReady } from './render/comic.ts';
 
-export type PushReason = 'no_account' | 'cred_not_ok' | 'empty_content';
+export type PushReason = 'no_account' | 'cred_not_ok' | 'empty_content' | 'lint_failed';
 
 export interface PushResult {
   ok: boolean;
@@ -32,6 +41,10 @@ export interface PushResult {
   errcode?: number | null;
   detail?: unknown;
   reason?: PushReason;
+  /** 配了封面但磁盘上找不到文件：已推无封面草稿。显式暴露，避免静默失败。 */
+  coverMissing?: boolean;
+  /** 成稿体检报告（仅文章产线）。未通过时 reason='lint_failed'。 */
+  lint?: LintReport;
 }
 
 /**
@@ -65,6 +78,22 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
     };
   }
 
+  // 漫画产线：推送前确保全部格图/金句卡已上传微信并渲染正文（幂等，uploadedKey 复用判据）。
+  // 必须在 empty_content 校验之前执行——漫画平时 contentWechat 为空，就绪后才被现算填充。
+  if (a.pipeline === 'comic') {
+    const ready = await ensureComicAssetsReady(a.id);
+    if (!ready.ok) {
+      return {
+        ok: false,
+        id: a.id,
+        account: account.name,
+        reason: 'empty_content',
+        message: `漫画尚未就绪，无法推送：${ready.message}`,
+      };
+    }
+    a.contentWechat = ready.contentWechat;
+  }
+
   if (!a.title || !a.contentWechat) {
     return {
       ok: false,
@@ -75,14 +104,56 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
     };
   }
 
-  const runDate = new Date().toISOString().slice(0, 10);
+  // ── 成稿体检门禁（仅文章产线；漫画正文是图片序列，结构规则不同）──
+  // 放在凭据校验之后：先确认「能推」，再判断「值不值得推」，免得白跑一次体检。
+  if (a.pipeline !== 'comic' && a.contentHtml.trim()) {
+    const lint = lintArticle(a.contentHtml);
+    if (!lint.ok) {
+      logger.warn(
+        { articleId: a.id, errors: lint.errors.map((e) => e.code) },
+        '成稿体检未通过，已拦截推送',
+      );
+      return {
+        ok: false,
+        id: a.id,
+        account: account.name,
+        reason: 'lint_failed',
+        lint,
+        message: `未通过成稿体检（${lintSummary(lint)}）：${lint.errors.map((e) => e.message).join('；')}`,
+      };
+    }
+    if (lint.warnings.length > 0) {
+      logger.info({ articleId: a.id, warnings: lint.warnings.map((w) => w.code) }, '成稿体检有改进项，已放行推送');
+    }
+  }
+
+  const runDate = todayKey();
 
   try {
     const client = await WechatClient.fromAccountId(account.id);
 
-    let thumbMediaId = '';
-    if (a.coverPath && existsSync(a.coverPath)) {
-      thumbMediaId = await client.uploadImage(a.coverPath);
+    // 封面：库里存的是相对路径，这里解析成绝对路径再判断是否存在。
+    const coverAbs = a.coverPath ? resolveCoverPath(a.coverPath) : '';
+    const coverRel = coverAbs ? toRelativeCoverPath(coverAbs) : '';
+    const coverExists = Boolean(coverAbs) && existsSync(coverAbs);
+    const coverMissing = Boolean(a.coverPath) && !coverExists;
+
+    // 复用判据 = 「已上传过的封面标识」。coverUploaded 形如 "<accountId>:covers/xxx.png"：
+    //  - 带 accountId：永久素材 media_id 是账号维度的，换账号复用会报素材无效；
+    //  - 用相对路径而非 mtime：cover 命名含时间戳+随机，路径变 ⇔ 封面变，零额外 IO；
+    //    mtime 在 rsync / 跨机迁移后不可靠（可能变新误判重传，也可能被保留漏传）。
+    const wantKey = coverRel ? `${a.accountId}:${coverRel}` : '';
+    let thumbMediaId = a.coverMediaId || '';
+    let uploadedKey = a.coverUploaded || '';
+
+    if (coverMissing) {
+      logger.warn(
+        { articleId: a.id, coverPath: a.coverPath, resolved: coverAbs },
+        '封面文件缺失，将推送无封面草稿',
+      );
+    } else if (coverRel && !(thumbMediaId && wantKey && wantKey === uploadedKey)) {
+      thumbMediaId = await client.uploadImage(coverAbs);
+      uploadedKey = wantKey; // 只有上传成功才记
     }
 
     const mediaId = await client.addDraft({
@@ -93,10 +164,15 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
       thumb_media_id: thumbMediaId || undefined,
     });
 
-    const pushDate = new Date().toISOString().slice(0, 10);
+    const pushDate = todayKey();
     const updated = await prisma.article.update({
       where: { id: articleId },
-      data: { mediaId, status: 'pushed', pushDate },
+      data: {
+        mediaId,
+        status: 'pushed',
+        pushDate,
+        ...(thumbMediaId ? { coverMediaId: thumbMediaId, coverUploaded: uploadedKey } : {}),
+      },
     });
 
     await recordPushRun({
@@ -113,7 +189,10 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
       id: updated.id,
       mediaId,
       pushDate,
-      message: '已推送到草稿箱（未群发）。可在公众号后台草稿箱查看',
+      ...(coverMissing ? { coverMissing: true } : {}),
+      message: coverMissing
+        ? '已推送到草稿箱（未群发），但封面文件缺失，推的是无封面草稿'
+        : '已推送到草稿箱（未群发）。可在公众号后台草稿箱查看',
     };
   } catch (e) {
     let errcode: number | null = null;

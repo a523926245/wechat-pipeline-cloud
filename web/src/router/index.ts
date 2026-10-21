@@ -12,7 +12,13 @@ const routes = [
     path: '/plan',
     name: 'plan',
     component: () => import('../views/PlanView.vue'),
-    meta: { title: '创作计划', desc: '今日排产、手动出稿与自动调度开关' },
+    meta: { title: '创作计划', desc: '今日排产、手动出稿与告警' },
+  },
+  {
+    path: '/scheduler',
+    name: 'scheduler',
+    component: () => import('../views/SchedulerView.vue'),
+    meta: { title: '自动调度', desc: '定时任务开关、写稿时间与手动心跳补跑' },
   },
   {
     path: '/articles',
@@ -32,6 +38,19 @@ const routes = [
     name: 'accounts',
     component: () => import('../views/AccountsView.vue'),
     meta: { title: '账号管理', desc: '公众号账号的 AppID / Secret 维护与连通测试' },
+  },
+  {
+    path: '/tracks',
+    name: 'tracks',
+    component: () => import('../views/TracksView.vue'),
+    meta: { title: '赛道管理', desc: '赛道的新增、每日配额与选题扩库' },
+  },
+  {
+    path: '/tracks/:trackId(\\d+)/angles',
+    name: 'track-angles',
+    component: () => import('../views/TrackAnglesView.vue'),
+    props: true,
+    meta: { title: '选题库', desc: '某赛道选题的查看、编辑与手动新增' },
   },
   {
     path: '/models',

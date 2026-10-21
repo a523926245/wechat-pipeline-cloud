@@ -19,10 +19,14 @@
 
 import { prisma } from '../db.ts';
 import { withLock } from '../db.ts';
-import { LOCK_PLAN, LOCK_TIMEOUT_SEC } from '../constants.ts';
+import { COMIC_IMAGE } from '../config.ts';
+import { LOCK_COMIC_IMAGE, LOCK_PLAN, LOCK_TIMEOUT_SEC } from '../constants.ts';
 import { logger } from '../logger.ts';
 import { packJson } from '../db-json.ts';
-import { createDraftsForAccount } from './planner.ts';
+import { dayKeyOf, todayKey } from '../lib/day.ts';
+import { getPipelineQuota, isPipelineEnabled, PIPELINES } from './pipeline.ts';
+import { runPipelineForAccount } from './planner.ts';
+import { processComicImages } from './comic/panels.ts';
 import { pushArticleToDraft } from './publisher.ts';
 
 /** 调度相关设置键。值以字符串存 Setting.v（与现有约定一致）。 */
@@ -44,7 +48,7 @@ export interface SchedulerConfig {
 }
 
 function todayStr(): string {
-  return new Date().toISOString().slice(0, 10);
+  return todayKey();
 }
 
 /** 读取设置，缺失时返回内置默认值（不自动落库，避免读操作产生副作用）。 */
@@ -105,6 +109,7 @@ function parseHm(hm: string): number {
 export interface TickWritten {
   accountId: number;
   account: string;
+  pipeline: 'article' | 'comic';
   need: number;
   created: number;
   reason?: string;
@@ -124,6 +129,15 @@ export interface TickResult {
   reason?: string;
   wrote: TickWritten[];
   pushed: TickPushed[];
+  /** 阶段二（漫画生图）推进摘要；本轮没跑漫画时为 null。 */
+  comic: {
+    done: number;
+    failed: number;
+    /** 退避窗口内跳过、留给后续心跳的格数。 */
+    skipped: number;
+    /** 本次心跳内实际推进的轮数（受 COMIC_TICK_BUDGET_MS 预算约束）。 */
+    rounds: number;
+  } | null;
 }
 
 /** 查询当前可排产账号（已启用且凭据就绪）。 */
@@ -135,19 +149,20 @@ async function listReadyAccounts() {
   });
 }
 
-/** 各账号今日已产文章数（用于配额幂等判断，避免无意义调用写稿）。 */
-async function todayCounts(accountIds: number[]): Promise<Map<number, number>> {
-  const map = new Map<number, number>();
+/** 各账号各产线今日已产数（配额幂等判断），key = `${accountId}:${pipeline}`。 */
+async function todayPipelineCounts(accountIds: number[]): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
   if (accountIds.length === 0) return map;
   const today = todayStr();
   const rows = await prisma.article.findMany({
     where: { accountId: { in: accountIds } },
-    select: { accountId: true, createdAt: true },
+    select: { accountId: true, pipeline: true, createdAt: true },
   });
   for (const r of rows) {
     if (r.accountId == null) continue;
-    if (r.createdAt.toISOString().slice(0, 10) !== today) continue;
-    map.set(r.accountId, (map.get(r.accountId) ?? 0) + 1);
+    if (dayKeyOf(r.createdAt) !== today) continue;
+    const k = `${r.accountId}:${r.pipeline}`;
+    map.set(k, (map.get(k) ?? 0) + 1);
   }
   return map;
 }
@@ -183,6 +198,7 @@ export async function tick(force = false): Promise<TickResult> {
     enabled: cfg.enabled,
     wrote: [],
     pushed: [],
+    comic: null,
   };
 
   if (!cfg.enabled && !force) {
@@ -202,8 +218,18 @@ export async function tick(force = false): Promise<TickResult> {
     return { ...base, due: true, reason: '无可排产账号（请先在凭据配置完成并连通测试）' };
   }
 
-  const counts = await todayCounts(accounts.map((a) => a.id));
-  const targets = accounts.filter((a) => (counts.get(a.id) ?? 0) < a.track.quotaPerDay);
+  // 产线维度 targets：外层账号、内层产线（PIPELINES 顺序）→ 同一账号先文章后漫画。
+  const counts = await todayPipelineCounts(accounts.map((a) => a.id));
+  const targets: { accountId: number; account: string; pipeline: 'article' | 'comic' }[] = [];
+  for (const a of accounts) {
+    for (const kind of PIPELINES) {
+      if (!(await isPipelineEnabled(a.trackId, kind))) continue;
+      const quota = await getPipelineQuota(a.trackId, kind);
+      if ((counts.get(`${a.id}:${kind}`) ?? 0) < quota) {
+        targets.push({ accountId: a.id, account: a.name, pipeline: kind });
+      }
+    }
+  }
   if (targets.length === 0) {
     return { ...base, due: true, reason: '今日配额已满（所有账号均已产出当日篇数）' };
   }
@@ -212,36 +238,39 @@ export async function tick(force = false): Promise<TickResult> {
     const wrote: TickWritten[] = [];
     const pushed: TickPushed[] = [];
 
-    logger.info({ count: targets.length }, '开始写稿');
-    await logRun('info', 'scheduler', `开始写稿，目标账号 ${targets.length} 个`, {
-      accounts: targets.map((a) => a.name),
+    logger.info({ count: targets.length }, '开始排产（含产线）');
+    await logRun('info', 'scheduler', `开始排产，目标 ${targets.length} 项`, {
+      targets: targets.map((t) => `${t.account}:${t.pipeline}`),
     });
 
-    for (const a of targets) {
+    // 阶段一（锁内）：只产稿件 —— article 全流程；comic 只写脚本（生图慢，放阶段二）。
+    for (const t of targets) {
       try {
-        const res = await createDraftsForAccount(a.id);
+        const res = await runPipelineForAccount(t.accountId, t.pipeline);
         wrote.push({
-          accountId: a.id,
-          account: a.name,
+          accountId: t.accountId,
+          account: t.account,
+          pipeline: t.pipeline,
           need: res.need,
           created: res.created.length,
           reason: res.reason,
         });
-        logger.info({ account: a.name, created: res.created.length, reason: res.reason }, '写稿完成');
+        logger.info({ account: t.account, pipeline: t.pipeline, created: res.created.length, reason: res.reason }, '产稿完成');
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        wrote.push({ accountId: a.id, account: a.name, need: 0, created: 0, reason: `写稿失败：${msg}` });
-        await logRun('error', 'scheduler', `账号「${a.name}」写稿失败：${msg}`);
+        wrote.push({ accountId: t.accountId, account: t.account, pipeline: t.pipeline, need: 0, created: 0, reason: `产稿失败：${msg}` });
+        await logRun('error', 'scheduler', `账号「${t.account}」产稿失败（${t.pipeline}）：${msg}`);
       }
     }
 
+    // 推送：只推 contentWechat 非空的（漫画半成品自动跳过，不刷错误）。
     if (cfg.pushEnabled) {
       const today = todayStr();
       const pending = await prisma.article.findMany({
-        where: { status: 'draft', accountId: { in: targets.map((a) => a.id) } },
+        where: { status: 'draft', accountId: { in: targets.map((t) => t.accountId) } },
         orderBy: { id: 'asc' },
       });
-      const todays = pending.filter((x) => x.createdAt.toISOString().slice(0, 10) === today);
+      const todays = pending.filter((x) => dayKeyOf(x.createdAt) === today && !!x.contentWechat);
       for (const art of todays) {
         // 推送失败不中断后续文章（publisher 内部已收敛为 ok:false）
         const r = await pushArticleToDraft(art.id);
@@ -257,6 +286,38 @@ export async function tick(force = false): Promise<TickResult> {
 
   if (run === null) {
     return { ...base, due: true, reason: '已有调度任务在执行（未获得锁，本次跳过）' };
+  }
+
+  // 阶段二（锁外）：推进漫画格生图（慢任务，独立锁；幂等，无待处理格时为 no-op）。
+  //
+  // 时间预算：单次心跳最多烧 COMIC_TICK_BUDGET_MS（默认 4 分钟）。生图 30~40s/格，
+  // 一篇 6 格靠一轮推进不完，靠「多轮 + 行级状态机」续跑，而不是把心跳拖成几分钟的长事务；
+  // 预算用完就交还控制权，剩下的格下次心跳接着做（ComicPanel.status 本身就是队列）。
+  let comic: TickResult['comic'] = null;
+  if (targets.some((t) => t.pipeline === 'comic')) {
+    const startedAt = Date.now();
+    comic = await withLock(LOCK_COMIC_IMAGE, LOCK_TIMEOUT_SEC, async () => {
+      const acc = { done: 0, failed: 0, skipped: 0, rounds: 0 };
+      for (;;) {
+        const r = await processComicImages();
+        acc.rounds += 1;
+        acc.done += r.done;
+        acc.failed += r.failed;
+        acc.skipped += r.skipped;
+        // 本轮一格都没推进（没有待处理格，或全部处于退避窗口）即停，避免空转。
+        if (r.done + r.failed === 0) break;
+        if (Date.now() - startedAt >= COMIC_IMAGE.tickBudgetMs) {
+          logger.info({ ...acc }, '漫画生图达到本次心跳时间预算，剩余格留给下次心跳');
+          break;
+        }
+      }
+      return acc;
+    });
+    if (comic === null) {
+      logger.info('漫画生图推进未获得锁（已有任务在跑）');
+    } else {
+      logger.info({ ...comic }, '漫画生图推进完成');
+    }
   }
 
   return { ...base, due: true, wrote: run.wrote, pushed: run.pushed };

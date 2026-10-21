@@ -17,9 +17,14 @@ import { randomUUID } from 'node:crypto';
 import { prisma } from '../db.ts';
 import { NotFoundError } from '../errors.ts';
 import { packJson } from '../db-json.ts';
+import { dayKeyOf, dayKeyOffset, todayKey } from '../lib/day.ts';
+import { getPipelineQuota, isPipelineEnabled, PIPELINES, scopesFor, type AngleScope, type PipelineKind } from './pipeline.ts';
+import { tryResolveForRole } from './llm.ts';
 import { generateDraft } from './writer.ts';
 import { parseArticle } from './parse/index.ts';
 import { renderArticle } from './render/index.ts';
+import { createComicDraft } from './comic/write.ts';
+import { kickComicImages } from './comic/panels.ts';
 
 export interface PlanAngle {
   id: number;
@@ -32,16 +37,23 @@ export interface PlanTask {
   trackId: number;
   account: string;
   accountId: number;
+  /** 产线（article / comic）。同一账号同一天可能出现在两个任务里。 */
+  pipeline: PipelineKind;
   need: number;
   alreadyToday: number;
+  /** 本账号本产线的配额（前端别再用 perDay[trackId] 反查）。 */
+  perDay: number;
   angles: PlanAngle[];
+  /** 赛道角度池真实余量（未用且未被今日文章占用），与赛道管理页口径一致。 */
+  stock: number;
   short: number;
   avoid: { date: string; title: string }[];
 }
 
 export interface PlanResult {
   date: string;
-  perDay: Record<number, number>;
+  /** key = `${trackId}:${pipeline}`（产线维度后的新口径）。 */
+  perDay: Record<string, number>;
   tasks: PlanTask[];
   skipped: { track: string; account: string; reason: string }[];
   warnings: string[];
@@ -49,17 +61,17 @@ export interface PlanResult {
 }
 
 function todayStr(): string {
-  return new Date().toISOString().slice(0, 10);
+  return todayKey();
 }
 
-/** 某账号今日已建文章数（按 createdAt 落在今天统计，与排产配额对齐）。 */
-async function todayArticleCount(accountId: number): Promise<number> {
+/** 某账号某产线今日已建数（按 createdAt 落在今天统计，与排产配额对齐）。 */
+async function todayPipelineCount(accountId: number, pipeline: PipelineKind): Promise<number> {
   const today = todayStr();
   const rows = await prisma.article.findMany({
-    where: { accountId },
+    where: { accountId, pipeline },
     select: { createdAt: true },
   });
-  return rows.filter((r) => r.createdAt.toISOString().slice(0, 10) === today).length;
+  return rows.filter((r) => dayKeyOf(r.createdAt) === today).length;
 }
 
 /** 某赛道今天已被占用的角度 id 集合（避免同日重复选题）。 */
@@ -71,7 +83,7 @@ async function todayUsedAngleIds(trackId: number): Promise<Set<number>> {
   });
   const ids = new Set<number>();
   for (const r of rows) {
-    if (r.angleId != null && r.createdAt.toISOString().slice(0, 10) === today) ids.add(r.angleId);
+    if (r.angleId != null && dayKeyOf(r.createdAt) === today) ids.add(r.angleId);
   }
   return ids;
 }
@@ -92,6 +104,7 @@ export async function buildPlan(
       accounts: { orderBy: { name: 'asc' } },
       angles: { where: { used: false }, orderBy: { seq: 'asc' } },
       articles: { orderBy: { createdAt: 'desc' }, take: 8, select: { createdAt: true, title: true } },
+      pipelines: true,
     },
   });
 
@@ -99,14 +112,14 @@ export async function buildPlan(
   const tasks: PlanTask[] = [];
   const skipped: PlanResult['skipped'] = [];
   const warnings: string[] = [];
-  const perDay: Record<number, number> = {};
+  const perDay: Record<string, number> = {};
 
   // 近作（供写稿观点层去重）。蓝本只取最近 8 条避免上下文过长。
   const recentByTrack = new Map<number, { date: string; title: string }[]>();
   for (const t of tracks) {
     recentByTrack.set(
       t.id,
-      t.articles.map((a) => ({ date: a.createdAt.toISOString().slice(0, 10), title: a.title })),
+      t.articles.map((a) => ({ date: dayKeyOf(a.createdAt), title: a.title })),
     );
   }
 
@@ -114,64 +127,85 @@ export async function buildPlan(
   for (const t of tracks) usedAngleByTrack.set(t.id, await todayUsedAngleIds(t.id));
 
   for (const t of tracks) {
-    perDay[t.id] = t.quotaPerDay;
-    const poolFree = t.angles.filter((a) => !(usedAngleByTrack.get(t.id)?.has(a.id) ?? false));
-
     const usableAccs = t.accounts.filter((a) => a.enabled && a.credStatus === 'ok');
     for (const a of t.accounts) {
       if (a.enabled && a.credStatus === 'ok') continue;
       skipped.push({ track: t.name, account: a.name, reason: CRED_STATUS_REASON[a.credStatus] ?? a.credStatus });
     }
     if (targetAccount) {
-      // 只看指定账号：从可用里筛，其余转入 skipped
       for (const a of usableAccs.filter((x) => x.name !== targetAccount)) {
         skipped.push({ track: t.name, account: a.name, reason: '非目标账号（--account 过滤）' });
       }
     }
+    if (usableAccs.length === 0) continue;
 
-    const pool = poolFree.slice(); // 共享池，跨账号取一个少一个
-    const accs = targetAccount ? usableAccs.filter((a) => a.name === targetAccount) : usableAccs;
+    // 产线维度：article 先、comic 后（PIPELINES 顺序即执行顺序）。
+    for (const kind of PIPELINES) {
+      const enabled = await isPipelineEnabled(t.id, kind);
+      const quota = await getPipelineQuota(t.id, kind);
+      perDay[`${t.id}:${kind}`] = quota;
+      if (!enabled || quota <= 0) continue;
 
-    for (const acc of accs) {
-      const already = await todayArticleCount(acc.id);
-      const need = Math.max(0, t.quotaPerDay - already);
-      const picked: PlanAngle[] = [];
-      let short = 0;
-      for (let i = 0; i < need; i++) {
-        const a = pool.shift();
-        if (!a) {
-          short += 1;
-          continue;
+      const scopes = scopesFor(kind);
+      const poolFree = t.angles.filter(
+        (a) => scopes.includes(a.scope as AngleScope) && !(usedAngleByTrack.get(t.id)?.has(a.id) ?? false),
+      );
+
+      for (const acc of usableAccs.filter((a) => !targetAccount || a.name === targetAccount)) {
+        const already = await todayPipelineCount(acc.id, kind);
+        const need = Math.max(0, quota - already);
+        const picked: PlanAngle[] = [];
+        let short = 0;
+        for (let i = 0; i < need; i++) {
+          const a = poolFree.shift();
+          if (!a) {
+            short += 1;
+            continue;
+          }
+          picked.push({ id: a.id, theme: a.theme, angle: a.content });
         }
-        picked.push({ id: a.id, theme: a.theme, angle: a.content });
-      }
-      if (short > 0) {
-        warnings.push(`[${t.name}][${acc.name}] 角度不足，缺 ${short} 篇——请补充角度库`);
-      }
-      if (usableAccs.length > 0) {
-        const burn = t.quotaPerDay * usableAccs.length;
+        if (short > 0) {
+          warnings.push(`[${t.name}][${kind === 'comic' ? '漫画' : '文章'}][${acc.name}] 角度不足，缺 ${short} 篇——请补充角度库`);
+        }
+        const burn = quota * usableAccs.length;
         const days = burn > 0 ? Math.floor(poolFree.length / burn) : 0;
         if (days <= 10) {
           warnings.push(
-            `[${t.name}] 角度库存告急：剩 ${poolFree.length} 个，按 ${burn} 篇/天仅够约 ${days} 天。请先扩库再创作`,
+            `[${t.name}][${kind === 'comic' ? '漫画' : '文章'}] 角度库存告急：剩 ${poolFree.length} 个，按 ${burn} 篇/天仅够约 ${days} 天。请先扩库再创作`,
           );
         }
+        tasks.push({
+          track: t.name,
+          trackId: t.id,
+          account: acc.name,
+          accountId: acc.id,
+          pipeline: kind,
+          need,
+          alreadyToday: already,
+          perDay: quota,
+          angles: picked,
+          stock: poolFree.length,
+          short,
+          avoid: recentByTrack.get(t.id) ?? [],
+        });
       }
-      tasks.push({
-        track: t.name,
-        trackId: t.id,
-        account: acc.name,
-        accountId: acc.id,
-        need,
-        alreadyToday: already,
-        angles: picked,
-        short,
-        avoid: recentByTrack.get(t.id) ?? [],
-      });
     }
   }
 
   const backlog = await scanBacklog(tasks, tracks, backlogDays);
+
+  // 各产线所需角色不可用时提前预警：不拦截排产（文章仍可出骨架草稿），让用户在触发前就知道结果。
+  const roleChecks: Array<{ role: 'write' | 'comic_script' | 'comic_panel'; label: string }> = [
+    { role: 'write', label: '写作' },
+    { role: 'comic_script', label: '漫画脚本' },
+    { role: 'comic_panel', label: '漫画格' },
+  ];
+  for (const { role, label } of roleChecks) {
+    const res = await tryResolveForRole(role);
+    if (!res.usable && res.reason) {
+      warnings.push(`「${label}」角色未就绪：${res.reason}——请先到「模型配置」添加模型并绑定该角色`);
+    }
+  }
 
   return { date, perDay, tasks, skipped, warnings, backlog };
 }
@@ -187,35 +221,35 @@ async function scanBacklog(
 ): Promise<PlanResult['backlog']> {
   if (days <= 0 || tasks.length === 0) return [];
   const usableAccs = tasks.map((t) => t.accountId);
-  const quotaByTrack = new Map(tracks.map((t) => [t.id, t.quotaPerDay]));
+  // 产线维度的配额表：key = `${trackId}|${pipeline}`
+  const quotaByKey = new Map<string, number>(tasks.map((t) => [`${t.trackId}|${t.pipeline}`, t.perDay]));
 
   // 每个账号首个文章日（用于 floor 下限）
   const firstSeen = new Map<number, string>();
-  const done = new Map<string, number>(); // `${date}|${accountId}` -> count
+  const done = new Map<string, number>(); // `${date}|${accountId}|${pipeline}` -> count
   const all = await prisma.article.findMany({
     where: { accountId: { in: usableAccs } },
-    select: { accountId: true, createdAt: true },
+    select: { accountId: true, createdAt: true, pipeline: true },
   });
   for (const r of all) {
     if (r.accountId == null) continue;
-    const d = r.createdAt.toISOString().slice(0, 10);
+    const d = dayKeyOf(r.createdAt);
     const prev = firstSeen.get(r.accountId);
     if (prev === undefined || d < prev) firstSeen.set(r.accountId, d);
     if (d !== todayStr()) {
-      const k = `${d}|${r.accountId}`;
+      const k = `${d}|${r.accountId}|${r.pipeline}`;
       done.set(k, (done.get(k) ?? 0) + 1);
     }
   }
 
   const out: PlanResult['backlog'] = [];
-  const today = new Date();
   for (let i = days; i >= 1; i--) {
-    const d = new Date(today.getTime() - i * 86400000).toISOString().slice(0, 10);
+    const d = dayKeyOffset(-i);
     for (const t of tasks) {
       const floor = firstSeen.get(t.accountId);
       if (floor && d < floor) continue; // 该账号当时还没上线
-      const got = done.get(`${d}|${t.accountId}`) ?? 0;
-      const quota = quotaByTrack.get(t.trackId) ?? 2;
+      const got = done.get(`${d}|${t.accountId}|${t.pipeline}`) ?? 0;
+      const quota = quotaByKey.get(`${t.trackId}|${t.pipeline}`) ?? 0;
       if (got < quota) out.push({ date: d, account: t.account, got, miss: quota - got });
     }
   }
@@ -223,17 +257,21 @@ async function scanBacklog(
 }
 
 /**
- * 为指定账号预留 need 个未用角度（事务内 CAS：先读未用池，再标记 used）。
- * 返回被预留的角度列表。
+ * 为指定账号在指定产线的角度切片里预留 need 个未用角度（事务内 CAS：先读未用池，再标记 used）。
+ * article 消费 [article, shared]，comic 消费 [comic, shared]；used 全局先到先得。
  */
-export async function reserveAnglesForAccount(accountId: number, need: number): Promise<Angle[]> {
+export async function reserveAnglesForPipeline(
+  accountId: number,
+  need: number,
+  pipeline: PipelineKind,
+): Promise<Angle[]> {
   if (need <= 0) return [];
   return prisma.$transaction(async (tx) => {
     const acc = await tx.account.findUnique({ where: { id: accountId }, include: { track: true } });
     if (!acc) throw new NotFoundError(`账号 ${accountId} 不存在`);
     const today = todayStr();
     const pool = await tx.angle.findMany({
-      where: { trackId: acc.trackId, used: false },
+      where: { trackId: acc.trackId, used: false, scope: { in: scopesFor(pipeline) } },
       orderBy: { seq: 'asc' },
       take: need,
     });
@@ -248,6 +286,11 @@ export async function reserveAnglesForAccount(accountId: number, need: number): 
   });
 }
 
+/** @deprecated 兼容旧调用方：等价于文章产线的角度预留。 */
+export async function reserveAnglesForAccount(accountId: number, need: number): Promise<Angle[]> {
+  return reserveAnglesForPipeline(accountId, need, 'article');
+}
+
 export interface TriggerResult {
   accountId: number;
   account: string;
@@ -256,25 +299,63 @@ export interface TriggerResult {
   reason?: string;
 }
 
-/** 手动触发：为账号生成草稿文章。count 显式指定则忽略今日配额。 */
-export async function createDraftsForAccount(accountId: number, count?: number): Promise<TriggerResult> {
+/**
+ * 手动/调度触发：为账号跑一条产线，生成草稿。
+ * article → LLM 写作（可回退骨架）；comic → 漫画脚本 + 待生图格行。
+ * count 显式指定则忽略今日配额。
+ */
+export async function runPipelineForAccount(
+  accountId: number,
+  pipeline: PipelineKind,
+  count?: number,
+): Promise<TriggerResult> {
   const acc = await prisma.account.findUnique({ where: { id: accountId }, include: { track: true } });
   if (!acc) throw new NotFoundError(`账号 ${accountId} 不存在`);
 
-  const already = await todayArticleCount(accountId);
-  const quota = acc.track.quotaPerDay;
+  const already = await todayPipelineCount(accountId, pipeline);
+  const quota = await getPipelineQuota(acc.trackId, pipeline);
   let need = count != null ? count : Math.max(0, quota - already);
   if (need <= 0) {
     return { accountId, account: acc.name, need: 0, created: [], reason: '今日配额已满' };
   }
 
-  const reserved = await reserveAnglesForAccount(accountId, need);
+  const reserved = await reserveAnglesForPipeline(accountId, need, pipeline);
   if (reserved.length === 0) {
     return { accountId, account: acc.name, need, created: [], reason: '角度池已空，请先扩库' };
   }
 
-  const titlePrefix = await getTitlePrefix();
   const created: TriggerResult['created'] = [];
+
+  if (pipeline === 'comic') {
+    for (const angle of reserved) {
+      try {
+        const r = await createComicDraft(acc, angle, acc.track);
+        // 建稿即开跑插图（后台逐格推进，不阻塞本次触发）：用户打的是「生成漫画」，
+        // 交出去的应该是能预览的成品，而不是一份还要自己再去点一次生图的脚本。
+        kickComicImages(r.articleId);
+        created.push({ id: r.articleId, title: r.title, angleId: angle.id, modelUsed: null, note: `已建 ${r.unitCount} 格分镜，插图生成中（可在文章页看进度）` });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        created.push({ id: 0, title: angle.content, angleId: angle.id, modelUsed: null, note: `漫画脚本失败：${msg.slice(0, 160)}` });
+      }
+    }
+    await prisma.taskRun.create({
+      data: {
+        jobType: 'comic_script',
+        status: 'success',
+        trigger: 'manual',
+        trackId: acc.trackId,
+        accountId: acc.id,
+        runDate: todayStr(),
+        attempt: 1,
+        paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }),
+        resultJson: packJson({ createdIds: created.map((c) => c.id).filter(Boolean) }),
+      },
+    });
+    return { accountId, account: acc.name, need: reserved.length, created };
+  }
+
+  const titlePrefix = await getTitlePrefix();
 
   for (const angle of reserved) {
     const draft = await generateDraft(angle, acc.track, acc);
@@ -285,6 +366,7 @@ export async function createDraftsForAccount(accountId: number, count?: number):
         trackId: acc.trackId,
         accountId: acc.id,
         angleId: angle.id,
+        pipeline: 'article',
         title: rendered.title,
         digest: rendered.digest,
         contentHtml: draft.contentHtml,
@@ -314,12 +396,17 @@ export async function createDraftsForAccount(accountId: number, count?: number):
       accountId: acc.id,
       runDate: todayStr(),
       attempt: 1,
-      paramsJson: packJson({ accountId, count: count ?? null, need: reserved.length }),
+      paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }),
       resultJson: packJson({ createdIds: created.map((c) => c.id), modelUsed: created[0]?.modelUsed ?? null }),
     },
   });
 
   return { accountId, account: acc.name, need: reserved.length, created };
+}
+
+/** @deprecated 兼容旧调用方：等价于文章产线触发。 */
+export async function createDraftsForAccount(accountId: number, count?: number): Promise<TriggerResult> {
+  return runPipelineForAccount(accountId, 'article', count);
 }
 
 async function getTitlePrefix(): Promise<string> {

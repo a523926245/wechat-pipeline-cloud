@@ -13,13 +13,15 @@ import { z } from 'zod';
 import { prisma } from '../../db.ts';
 import { asyncHandler } from '../async-handler.ts';
 import { NotFoundError } from '../../errors.ts';
-import { buildPlan, createDraftsForAccount } from '../../services/planner.ts';
+import { buildPlan, runPipelineForAccount } from '../../services/planner.ts';
 
 const plansRouter = Router();
 
 const triggerSchema = z.object({
   accountId: z.number().int().positive(),
   count: z.number().int().min(1).max(20).optional(),
+  /** 产线（缺省 article，兼容旧前端）。 */
+  pipeline: z.enum(['article', 'comic']).optional(),
 });
 
 /** 今日创作计划（只排产，不建稿）。 */
@@ -41,7 +43,7 @@ plansRouter.post(
     const acc = await prisma.account.findUnique({ where: { id: body.accountId } });
     if (!acc) throw new NotFoundError(`账号 ${body.accountId} 不存在`);
 
-    const result = await createDraftsForAccount(body.accountId, body.count);
+    const result = await runPipelineForAccount(body.accountId, body.pipeline ?? 'article', body.count);
 
     res.status(200).json({
       ok: result.created.length > 0,

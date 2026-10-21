@@ -4,14 +4,26 @@
 
 import { http } from './http.ts';
 import type {
+  AngleDeleteResult,
+  AngleItem,
+  AngleListQuery,
+  AngleListResult,
+  AnglePayload,
+  AngleScopeFilter,
+  AngleUpdatePayload,
   ArticleDetail,
   ArticleListItem,
   ArticleRenderResult,
   BindingMap,
+  ComicGenerateResult,
+  ComicPanelsResult,
+  CoverGenerateResult,
+  CoverPayload,
   CredentialDetail,
   CredentialItem,
   CredentialUpdatePayload,
   CredTestResult,
+  ContentPrefixItem,
   DashboardData,
   EmphasisApplyResult,
   EmphasisPreview,
@@ -19,17 +31,39 @@ import type {
   Health,
   LlmModelPayload,
   LlmModelView,
+  ModelMeta,
   ModelTestResult,
+  OkResult,
+  AccountCreatePayload,
+  AccountDeleteResult,
   PlanResult,
   PushResult,
+  ReviseApplyResult,
+  ReviseMode,
+  RevisePreviewResult,
+  RoleResolveResult,
   SchedulerConfig,
   SchedulerStatus,
+  SystemStatus,
   TickResult,
+  TrackExpandResult,
+  TrackItem,
+  TrackPayload,
+  TrackPipelineItem,
+  TrackUpdatePayload,
   TriggerResult,
 } from '../types.ts';
 
 // ── 系统 ──
 export const getHealth = () => http.get<Health>('/health');
+
+/** 内容标题前缀（文章 / 漫画）。 */
+export const getContentPrefixes = () =>
+  http.get<{ items: ContentPrefixItem[] }>('/content-prefixes');
+
+export const updateContentPrefixes = (
+  payload: Partial<Record<'title_prefix' | 'comic_title_prefix', string>>,
+) => http.put<{ items: ContentPrefixItem[]; message?: string }>('/content-prefixes', payload);
 
 // ── 凭据 ──
 export const listCredentials = () =>
@@ -40,10 +74,75 @@ export const getCredential = (id: number) => http.get<CredentialDetail>(`/creden
 export const updateCredential = (id: number, payload: CredentialUpdatePayload) =>
   http.put<CredentialDetail & { message?: string }>(`/credentials/${id}`, payload);
 
+export const createCredential = (payload: AccountCreatePayload) =>
+  http.post<CredentialDetail & { message?: string }>('/credentials', payload);
+
+export const deleteCredential = (id: number) => http.del<AccountDeleteResult>(`/credentials/${id}`);
+
 export const testCredential = (id: number) => http.post<CredTestResult>(`/credentials/${id}/test`);
+
+// ── 赛道 ──
+export const listTracks = () => http.get<{ total: number; items: TrackItem[] }>('/tracks');
+
+export const createTrack = (payload: TrackPayload) =>
+  http.post<TrackItem & { message?: string }>('/tracks', payload);
+
+export const updateTrack = (id: number, payload: TrackUpdatePayload) =>
+  http.put<Partial<TrackItem> & { message?: string }>(`/tracks/${id}`, payload);
+
+export const deleteTrack = (id: number) => http.del<OkResult & { id: number; name: string }>(`/tracks/${id}`);
+
+/** 扩库。scope 决定这批选题归哪条产线（漫画产线只吃 comic / shared）。 */
+export const expandTrackAngles = (
+  id: number,
+  count?: number,
+  seed?: string,
+  scope?: AngleScopeFilter,
+) => http.post<TrackExpandResult>(`/tracks/${id}/expand`, { count, seed, scope });
+
+/** 读某赛道的产线（文章/漫画）配额与开关。 */
+export const getPipelines = (trackId: number) =>
+  http.get<{ trackId: number; items: TrackPipelineItem[] }>(`/tracks/${trackId}/pipelines`);
+
+/** 改某赛道某产线的配额/开关。 */
+export const updatePipeline = (
+  trackId: number,
+  kind: string,
+  patch: { quotaPerDay?: number; enabled?: boolean },
+) => http.put<TrackPipelineItem & { message: string }>(`/tracks/${trackId}/pipelines/${kind}`, patch);
+
+// ── 选题库 ──
+export const listAngles = (params: AngleListQuery) =>
+  http.get<AngleListResult>('/angles', params as unknown as Record<string, unknown>);
+
+/** 把漫画切片里含 IP 外角色的选题批量退回「文章专用」。 */
+export const reassignOffIpAngles = (trackId: number) =>
+  http.post<{ trackId: number; changed: number; ids: number[]; message: string }>(
+    '/angles/off-ip-to-article',
+    { trackId },
+  );
+
+export const getAngle = (id: number) => http.get<AngleItem>(`/angles/${id}`);
+
+export const createAngle = (payload: AnglePayload) =>
+  http.post<AngleItem & { message?: string }>('/angles', payload);
+
+export const updateAngle = (id: number, payload: AngleUpdatePayload) =>
+  http.put<AngleItem & { message?: string }>(`/angles/${id}`, payload);
+
+export const deleteAngle = (id: number) => http.del<AngleDeleteResult>(`/angles/${id}`);
+
+/** 归还孤儿选题（已用但 0 关联文章）回未用池。 */
+export const releaseAngle = (id: number) =>
+  http.post<{ ok: boolean; id: number; poolUnused: number; message: string }>(
+    `/angles/${id}/release`,
+  );
 
 // ── 模型 ──
 export const listModels = () => http.get<{ total: number; items: LlmModelView[] }>('/models');
+
+/** 候选项与中文标签的单一真源，页面不要自己再写一份枚举文案。 */
+export const getModelMeta = () => http.get<ModelMeta>('/models/meta');
 
 export const createModel = (payload: LlmModelPayload) => http.post<LlmModelView>('/models', payload);
 
@@ -56,18 +155,23 @@ export const testModel = (id: number) => http.post<ModelTestResult>(`/models/${i
 
 export const getBindings = () => http.get<{ bindings: BindingMap }>('/models/bindings');
 
-export const bindRole = (role: string, modelId: number) =>
-  http.put<{ ok: boolean; role: string; modelId: number; modelName: string }>(
+/** modelId 传 null 即解绑；后端会校验能力/协议是否匹配该角色。 */
+export const bindRole = (role: string, modelId: number | null) =>
+  http.put<{ ok: boolean; role: string; modelId: number | null; modelName: string | null }>(
     `/models/bindings/${role}`,
     { modelId },
   );
+
+export const unbindRole = (role: string) => http.del<{ ok: boolean; role: string }>(`/models/bindings/${role}`);
+
+export const resolveRole = (role: string) => http.get<RoleResolveResult>(`/models/resolve/${role}`);
 
 // ── 创作计划 ──
 export const getPlan = (params?: { account?: string; backlogDays?: number }) =>
   http.get<PlanResult>('/plan', params as Record<string, unknown> | undefined);
 
-export const triggerPlan = (accountId: number, count?: number) =>
-  http.post<TriggerResult>('/plan/trigger', { accountId, count });
+export const triggerPlan = (accountId: number, count?: number, pipeline?: 'article' | 'comic') =>
+  http.post<TriggerResult>('/plan/trigger', { accountId, count, pipeline });
 
 // ── 调度 ──
 export const getSchedulerStatus = () => http.get<SchedulerStatus>('/scheduler');
@@ -89,9 +193,18 @@ export const schedulerStop = () =>
 
 // ── 仪表盘 ──
 export const getDashboard = () => http.get<DashboardData>('/dashboard');
+export const getSystemStatus = () => http.get<SystemStatus>('/dashboard/status');
 
 // ── 文章 ──
-export const listArticles = (params?: { status?: string; accountId?: number; limit?: number; offset?: number }) =>
+export const listArticles = (params?: {
+  status?: string;
+  accountId?: number;
+  angleId?: number;
+  /** 产线过滤（article / comic）。 */
+  pipeline?: string;
+  limit?: number;
+  offset?: number;
+}) =>
   http.get<{ total: number; limit: number; offset: number; items: ArticleListItem[] }>(
     '/articles',
     params as Record<string, unknown> | undefined,
@@ -109,12 +222,58 @@ export const createArticle = (payload: {
 
 export const getArticle = (id: number) => http.get<ArticleDetail>(`/articles/${id}`);
 
+/** 删除文章。recycledAngle=true 表示该文章占用的选题角度已归还角度池。 */
+export const deleteArticle = (id: number) =>
+  http.del<{ ok: boolean; id: number; title: string; recycledAngle: boolean }>(`/articles/${id}`);
+
 export const previewArticle = (id: number) => http.get<ArticleRenderResult>(`/articles/${id}/preview`);
 
 export const updateArticleContent = (id: number, contentHtml: string) =>
   http.put<ArticleRenderResult & { status: string }>(`/articles/${id}/content`, { contentHtml });
 
 export const pushArticle = (id: number) => http.post<PushResult>(`/articles/${id}/push`);
+
+// ── 漫画产线 ──
+
+export const getPipelineMeta = () =>
+  http.get<{ pipelines: { kind: string; label: string; desc: string; angleScopes: string[] }[]; angleScopes: { value: string; label: string; desc: string }[] }>(
+    '/pipelines',
+  );
+
+export const createComicDraft = (payload: {
+  accountId: number;
+  angleId: number;
+  unitCount?: number;
+  chain?: string;
+  extra?: string;
+}) => http.post<{ ok: boolean; articleId: number; title: string; unitCount: number }>('/articles/comic/create', payload);
+
+export const listComicPanels = (id: number) =>
+  http.get<ComicPanelsResult>(`/articles/${id}/comic/panels`);
+
+export const generateComicImages = (id: number) =>
+  http.post<ComicGenerateResult>(`/articles/${id}/comic/generate`);
+
+export const regenerateComicPanel = (
+  id: number,
+  seq: number,
+  payload: { prompt?: string; lines?: string } = {},
+) => http.post<{ ok: boolean }>(`/articles/${id}/comic/panels/${seq}/regenerate`, payload);
+
+export const generateCover = (id: number, payload: CoverPayload = {}) =>
+  http.post<CoverGenerateResult>(`/articles/${id}/cover`, payload);
+
+// ── AI 改写 ──
+export const previewRevise = (payload: {
+  contentHtml: string;
+  mode?: ReviseMode;
+  instruction?: string;
+}) => http.post<RevisePreviewResult>('/revise/preview', payload);
+
+export const applyRevise = (
+  id: number,
+  payload: { contentHtml?: string; mode?: ReviseMode; instruction?: string } = {},
+) => http.post<ReviseApplyResult>(`/revise/articles/${id}`, payload);
 
 // ── 强调补全 ──
 export const previewEmphasis = (payload: {

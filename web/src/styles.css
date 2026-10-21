@@ -21,6 +21,8 @@
   --wb-primary-hover: #0d9455;
   --wb-primary-soft: #e8f5ee;
   --wb-danger: #d54941;
+  --wb-danger-soft: #fef2f1;
+  --wb-danger-border: #f7c9c5;
   --wb-warning: #b8801a;
 
   /* 尺度 */
@@ -77,6 +79,77 @@
   --wb-ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 
+/* ── 暗色主题 ──
+   由 <html class="dark"> 激活。Element Plus 暗色变量来自
+   element-plus/theme-chalk/dark/css-vars.css（在 main.ts 中先于本文件引入），
+   故下方 html.dark 能覆盖其默认蓝色主色，改回品牌绿。
+   所有自定义令牌在此统一翻转；视图只引用语义变量，暗色无需逐页改动。 */
+html.dark {
+  color-scheme: dark;
+
+  --wb-bg: #0e1014;
+  --wb-surface: #171a1f;
+  --wb-surface-muted: #1d2128;
+  --wb-text: #e6e8eb;
+  --wb-text-secondary: #aab1bb;
+  --wb-text-muted: #6f7782;
+  --wb-text-strong: #f2f4f6;
+  --wb-border: #2a2f37;
+  --wb-border-strong: #3a4049;
+
+  --wb-primary: #0a7c47;
+  --wb-primary-hover: #11a35f;
+  --wb-primary-soft: rgba(10, 124, 71, 0.18);
+  --wb-primary-soft-2: #13241c;
+  --wb-primary-grad: linear-gradient(135deg, #14b46b 0%, #0a7c47 100%);
+  --wb-nav-active-bg: rgba(10, 124, 71, 0.16);
+  --wb-chip-bg: #232831;
+  --wb-ring: rgba(10, 124, 71, 0.4);
+
+  --wb-danger: #f0726b;
+  --wb-danger-soft: rgba(213, 73, 65, 0.16);
+  --wb-danger-border: rgba(213, 73, 65, 0.4);
+  --wb-warning: #d8a23e;
+
+  --wb-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --wb-shadow-pop: 0 10px 30px rgba(0, 0, 0, 0.5);
+
+  /* 覆盖 EP 暗色默认蓝色主色，保持品牌绿一致 */
+  --el-color-primary: #0a7c47;
+  --el-color-primary-light-3: #1f8f59;
+  --el-color-primary-light-5: #2f9f69;
+  --el-color-primary-light-7: #4fb587;
+  --el-color-primary-light-8: #6ec49c;
+  --el-color-primary-light-9: #11261c;
+  --el-color-primary-dark-2: #0d9455;
+}
+
+/* 暗色下浮起层阴影收敛为深色 */
+html.dark .el-popper,
+html.dark .el-dialog {
+  box-shadow: var(--wb-shadow-pop) !important;
+}
+
+/* 暗色细滚动条 */
+html.dark .main {
+  scrollbar-color: #3a4049 transparent;
+}
+
+html.dark .main::-webkit-scrollbar-thumb {
+  background: #3a4049;
+  border-color: var(--wb-bg);
+}
+
+html.dark .main::-webkit-scrollbar-thumb:hover {
+  background: #4a515c;
+}
+
+/* 主题下拉：当前选项高亮品牌绿 */
+.el-dropdown-menu .el-dropdown-menu__item.is-active {
+  color: var(--wb-primary);
+  font-weight: 600;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -92,8 +165,9 @@ body,
 body {
   background: var(--wb-bg);
   color: var(--wb-text);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
-    'Microsoft YaHei', sans-serif;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   font-size: 14px;
   /* 中文正文需要比英文更宽松的行高 */
   line-height: 1.7;
@@ -182,7 +256,7 @@ body {
 }
 
 .wb-mono {
-  font-family: 'JetBrains Mono', Consolas, Menlo, monospace;
+  font-family: "JetBrains Mono", Consolas, Menlo, monospace;
   font-size: 12px;
 }
 
@@ -197,6 +271,32 @@ body {
 .wb-danger-text {
   color: var(--wb-danger);
   font-weight: 600;
+}
+
+/* ── 布局工具类：减少各视图重复手写 flex ── */
+
+/* 内联筛选表单：承载 el-form inline 的筛选区（下拉 + 输入 + 搜索/重置） */
+.wb-filter-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--wb-space-3);
+  margin-bottom: var(--wb-space-4);
+}
+
+/* 分页条：右对齐、顶部留白 */
+.wb-pager {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: var(--wb-space-3);
+}
+
+/* 表单操作区：按钮右对齐，顶部留白 */
+.wb-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--wb-space-2);
+  margin-top: var(--wb-space-4);
 }
 
 /* ── 卡片：默认扁平，不滥用悬浮 ── */
@@ -236,7 +336,7 @@ body {
   border: 1px solid var(--wb-border);
   border-radius: var(--wb-radius);
   padding: 20px 18px;
-  max-width: 720px;
+  min-width: 720px;
   line-height: 1.75;
   font-size: 16px;
   word-break: break-word;
@@ -302,7 +402,7 @@ body {
 }
 
 .aside .el-menu-item.is-active::before {
-  content: '';
+  content: "";
   position: absolute;
   left: 0;
   top: 50%;
@@ -348,7 +448,7 @@ body {
 }
 
 .el-card.wb-stat::before {
-  content: '';
+  content: "";
   position: absolute;
   top: 0;
   left: 0;
@@ -393,7 +493,9 @@ body {
 
 /* ── 路由切换：轻量淡入上浮，遵循系统减少动效偏好 ── */
 .wb-fade-enter-active {
-  transition: opacity 0.26s var(--wb-ease-out), transform 0.26s var(--wb-ease-out);
+  transition:
+    opacity 0.26s var(--wb-ease-out),
+    transform 0.26s var(--wb-ease-out);
 }
 
 .wb-fade-leave-active {

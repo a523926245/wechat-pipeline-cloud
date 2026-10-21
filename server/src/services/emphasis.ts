@@ -33,6 +33,9 @@ function stripTags(s: string): string {
 /** 给候选句打分，越高越值得强调。 */
 function score(sent: string): number {
   let s = 0;
+  // 提问句不强调：style_dna 明写着「结尾互动提问保持口语松弛」，
+  // 而它偏偏最容易得分（短、带引号），不扣分就会被升级成红字。
+  if (/[？?]/.test(sent)) s -= 6;
   if (/[「『“"].{4,24}[」』”"]/.test(sent)) s += 3; // 引号内多为可带走的口诀
   if (IMPERATIVE.test(sent)) s += 2;
   if (JUDGE.test(sent)) s += 3;
@@ -79,6 +82,42 @@ function keyCount(html: string): number {
   return (html.match(/class="key"/g) ?? []).length;
 }
 
+/** 所有 <strong> 区间的 [起, 止) 下标，用来判断某个插入点是否落在已有强调内部。 */
+function strongSpans(html: string): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const m of html.matchAll(/<strong[^>]*>[\s\S]*?<\/strong>/gi)) {
+    const s = m.index ?? 0;
+    out.push([s, s + m[0].length]);
+  }
+  return out;
+}
+
+/**
+ * 把嵌套的 <strong> 拍平，只保留最外层。
+ *
+ * 2026-10-15 实证：成稿里出现过 `<strong>原来「棒<strong class="key">…</strong>…`
+ * 这种嵌套（模型复述整篇时自己造出来的）。嵌套会被渲染成一半红一半不红的怪样式，
+ * 而这里全靠标签配对定位，一旦嵌套，长度与计数全乱 —— 所以先拍平再补齐。
+ */
+function flattenStrong(html: string): string {
+  let out = '';
+  let last = 0;
+  let depth = 0;
+  for (const m of html.matchAll(/<strong[^>]*>|<\/strong>/gi)) {
+    const pos = m.index ?? 0;
+    const open = !m[0].startsWith('</');
+    if (open) depth += 1;
+    else depth = Math.max(0, depth - 1);
+    // 层内标签（depth>1 的开标签、depth>=1 的闭标签）属于内层，直接删
+    const inner = open ? depth > 1 : depth >= 1;
+    if (inner) {
+      out += html.slice(last, pos);
+      last = pos + m[0].length;
+    }
+  }
+  return out + html.slice(last);
+}
+
 /** 按候选顺序补加粗，返回 (新html, 实际补了几处)。 */
 function addBold(html: string, need: number): [string, number] {
   const cands = collectCandidates(html);
@@ -86,18 +125,21 @@ function addBold(html: string, need: number): [string, number] {
   let added = 0;
   for (const c of cands) {
     if (added >= need) break;
+    // 每次插入都会改动下标，所以区间要重新算（否则会把 <strong> 套进另一个 <strong> 里）
+    const spans = strongSpans(out);
     let idx = 0;
     let done = false;
     while (!done) {
       const pos = out.indexOf(c.sent, idx);
       if (pos < 0) break;
-      const before = out.slice(Math.max(0, pos - 60), pos);
-      // 该处若已被 strong 包裹则跳过
-      if (before.includes('<strong') && !before.includes('</strong>')) {
-        idx = pos + c.sent.length;
+      const end = pos + c.sent.length;
+      const inside = spans.some(([s, e]) => pos < e && end > s);
+      if (inside) {
+        // 该处已被强调过（或与之重叠），换下一处出现位置
+        idx = pos + 1;
         continue;
       }
-      out = out.slice(0, pos) + '<strong>' + c.sent + '</strong>' + out.slice(pos + c.sent.length);
+      out = out.slice(0, pos) + '<strong>' + c.sent + '</strong>' + out.slice(end);
       added += 1;
       done = true;
     }
@@ -105,14 +147,27 @@ function addBold(html: string, need: number): [string, number] {
   return [out, added];
 }
 
+/** 所有 <p> 区间的 [起, 止)，用来避免红字扎在同一段里。 */
+function paraSpans(html: string): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const m of html.matchAll(/<p[^>]*>[\s\S]*?<\/p>/gi)) {
+    const s = m.index ?? 0;
+    out.push([s, s + m[0].length]);
+  }
+  return out;
+}
+
 /** 把最强的普通加粗升级为红色 key。 */
 function promoteKey(html: string, need: number): [string, number] {
   if (need <= 0) return [html, 0];
   const pat = /<strong>(.*?)<\/strong>/gs;
+  const spans = paraSpans(html);
   const best: Array<{ score: number; start: number; end: number; inner: string }> = [];
   for (const m of html.matchAll(pat)) {
-    const inner = stripTags(m[1] ?? '');
-    let sc = score(inner);
+    // 保留原文（含可能的红字/嵌套）：拍平过的输入到这里不会再有嵌套，
+    // 真要剥离标签反而会把已经标好的红字抹掉。
+    const inner = m[1] ?? '';
+    let sc = score(stripTags(inner));
     if (JUDGE.test(inner)) sc += 4;
     best.push({ score: sc, start: m.index ?? 0, end: (m.index ?? 0) + m[0].length, inner });
   }
@@ -120,8 +175,13 @@ function promoteKey(html: string, need: number): [string, number] {
   let out = html;
   let picked = 0;
   let offset = 0;
+  const usedPara = new Set<number>();
   for (const c of best) {
     if (picked >= need) break;
+    // 同一段最多 1 处红字：两处红字挨在一起就成了「整段都在喊」。
+    const pi = spans.findIndex(([s, e]) => c.start >= s && c.start < e);
+    if (pi >= 0 && usedPara.has(pi)) continue;
+    if (pi >= 0) usedPara.add(pi);
     const st = c.start + offset;
     const en = c.end + offset;
     const repl = `<strong class="key">${c.inner}</strong>`;
@@ -156,7 +216,9 @@ export function processEmphasis(
   keyMax = KEY_MAX,
 ): EmphasisResult {
   void keyMax;
-  let out = html;
+  // 先拍平嵌套：模型复述整篇时会造出 <strong>…<strong class="key">…</strong>，
+  // 带着嵌套往下走，计数与插入位置都会错位。
+  let out = flattenStrong(html);
   const cur = emphasisCount(out);
   let need = 0;
   if (cur < minN) {

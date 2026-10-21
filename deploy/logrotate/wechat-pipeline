@@ -1,0 +1,23 @@
+# 应用日志轮转。
+#
+# 安装：sudo cp deploy/logrotate/wechat-pipeline /etc/logrotate.d/wechat-pipeline
+# 自检：sudo logrotate -d /etc/logrotate.d/wechat-pipeline   （-d 是 dry-run，不真切）
+#
+# ⚠️ 必须用 copytruncate，不能让应用重开文件：
+#    src/logger.ts 用 pino.destination() 持有 fd，且**没有注册 SIGHUP 处理器**，
+#    默认的 create 方案（重命名 + 通知进程重开）会让进程继续往已被改名的旧 fd 写，
+#    结果是磁盘照涨、新文件永远是空的。
+#    copytruncate 的代价是极端情况下可能丢几行，对这个量级的日志可以接受。
+
+/opt/wechat-pipeline-cloud/var/logs/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su wpc wpc
+    dateext
+    dateformat -%Y%m%d
+}

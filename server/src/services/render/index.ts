@@ -14,18 +14,37 @@
 
 import { M_B, M_K, M_C, parseArticle, type ParsedArticle } from '../parse/index.ts';
 
-const EM_OPEN = '<strong style="font-weight:700;color:#111;">';
-const KEY_OPEN = '<strong style="font-weight:700;color:rgb(255,76,65);">';
+/**
+ * 排版基调（2026-10-14 参考一篇成品排版稿重定）。
+ *
+ * 三条原则，改样式前先读：
+ * 1. **全部 inline style**。微信编辑器会剥掉 `<style>` 标签与 class，
+ *    任何放在 `<style>` 里或靠 class 驱动的样式在推送后都会失效 —— 预览好看、发出去变裸文。
+ * 2. **单一主色贯穿**。旧版序号用蓝、标题用品牌红、正文用灰，三套颜色互相打架；
+ *    现在标题/序号/分隔线/强调统一走 ACCENT，只靠深浅分两级。
+ * 3. **677px 是微信正文容器宽度**。超过这个宽度在手机端会被压缩，排版节奏失效。
+ */
+const ACCENT = '#B35D3E';
+const ACCENT_DEEP = '#8A4B2A'; // 一级强调：出现次数多，压低亮度避免满屏刺眼
+const INK = '#33302C'; // 正文：暖灰，比纯灰更贴纸感
+
+const EM_OPEN = `<strong style="font-weight:700;color:${ACCENT_DEEP};">`;
+const KEY_OPEN = `<strong style="font-weight:700;color:${ACCENT};">`;
 const EM_CLOSE = '</strong>';
 
+/** 章节之间的分隔线：36×2px 主色块，比 hr 更可控（hr 在微信里样式不定）。 */
+const DIVIDER =
+  '<p style="text-align:center;margin:30px 0;">' +
+  `<span style="display:inline-block;width:36px;height:2px;background:${ACCENT};"></span></p>`;
+
 const P_STYLE =
-  'margin:0 0 16px;line-height:1.85;color:#333;';
+  `margin:0 0 20px;line-height:1.9;color:${INK};letter-spacing:.5px;text-align:justify;`;
 const H2_STYLE =
-  "text-align:center;font-size:22px;font-weight:700;color:rgb(255,76,65);" +
-  "margin:30px 0 14px;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;";
+  `text-align:center;font-size:19px;font-weight:700;color:${ACCENT};` +
+  "margin:34px 0 16px;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;";
 const SECTION_STYLE =
   "font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;" +
-  'font-size:17px;color:#333;padding:4px 2px;';
+  `font-size:16px;color:${INK};padding:4px 2px;max-width:677px;margin:0 auto;`;
 
 /** 把强调标记还原成微信内联样式，并修复未闭合的 <strong>。 */
 export function renderInline(text: string): string {
@@ -53,8 +72,6 @@ export interface RenderOptions {
   digestOverride?: string;
   /** 作者署名，仅用于推送 payload，不影响 contentWechat。 */
   author?: string;
-  /** 封面 media_id，仅用于推送 payload。 */
-  thumbMediaId?: string;
 }
 
 export interface RenderResult {
@@ -80,7 +97,9 @@ export function renderArticle(parsed: ParsedArticle, opts: RenderOptions = {}): 
       h2Index += 1;
       const seq = String(h2Index).padStart(2, '0');
       const t = stripDupSeq(b.text, h2Index);
-      const inner = `<span style="color:rgb(0,82,255);font-style:italic;font-weight:700;">${seq}</span>&nbsp;${t}`;
+      const inner = `<span style="color:${ACCENT};font-style:italic;font-weight:700;">${seq}</span>&nbsp;${t}`;
+      // 章节之间插分隔线，第一节之前不插（正文直接从标题下开始）。
+      if (h2Index > 1) parts.push(DIVIDER);
       parts.push(`<h2 ${H2_STYLE}>${renderInline(inner)}</h2>`);
     } else {
       parts.push(`<p ${P_STYLE}>${renderInline(b.text)}</p>`);
