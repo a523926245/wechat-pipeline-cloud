@@ -65,7 +65,8 @@ function decodeEntities(s: string): string {
 }
 
 const STRONG_RE = /[\x01\x02]/g;
-const ALL_MARK_RE = /[\x01\x02\x03]/g;
+/** 全部强调标记（含闭合）。渲染/统计场景用来剥离标记取纯文本。 */
+export const ALL_MARK_RE = /[\x01\x02\x03]/g;
 
 export function parseArticle(html: string): ParsedArticle {
   const blocks: Block[] = [];

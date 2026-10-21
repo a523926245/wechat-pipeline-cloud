@@ -5,6 +5,11 @@
 // 数据字典真源。
 // 生产用 MySQL（utf8mb4）；本地无 MySQL 时由 scripts/gen-sqlite-schema.mjs
 // 自动生成等价的 SQLite 版本，无需维护两份。
+//
+// 变更记录：
+// 2026-10 新增 Article.coverMediaId / coverUploaded（封面永久素材复用）。
+//   生产上线前必须生成含这两个字段的 baseline migration，否则 publisher 一跑就
+//   Unknown column —— 见 deploy/README.md「上线前置项」。
 
 generator client {
   provider = "prisma-client-js"
@@ -15,11 +20,22 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// 调用协议：决定 services/llm.ts 走哪条 HTTP 通道。
+/// 用枚举而非 String：未知协议只能在运行时炸，枚举让非法值在写入时就被拦下。
+/// 本地 SQLite（gen-sqlite-schema.mjs 自动生成）会把它降级为 String，
+/// 代码侧统一用 services/model-registry.ts 的本地联合类型 Protocol，不 import Prisma 枚举。
+
+/// 能力（四选一）。决定这个模型能绑哪些角色、能调哪个函数。
+
 /// 赛道。账号挂在赛道下，同赛道多账号共享该赛道的角度池。
 model Track {
   id           Int       @id @default(autoincrement())
   name         String
   slug         String    @unique
+  /// @deprecated 产线改造后，**配额的唯一真源是 TrackPipeline.quotaPerDay（kind='article'）**。
+  /// 本字段仅为兼容旧入口（tracks 的建/改赛道、迁移脚本）保留：
+  /// 写入一律走 services/pipeline.ts 的 setPipelineQuota（article 会双写到这里），
+  /// 读取一律走 getPipelineQuota / listPipelines，业务代码不要再直接读它。
   quotaPerDay  Int       @default(2)
   enabled      Boolean   @default(true)
   createdAt    DateTime  @default(now())
@@ -28,7 +44,31 @@ model Track {
   accounts Account[]
   angles   Angle[]
   articles Article[]
+  /// 赛道下的产线（article / comic），各自配额与开关独立。见 TrackPipeline。
+  pipelines TrackPipeline[]
 
+  @@index([enabled])
+}
+
+/// 赛道下的产线。同一账号同一赛道可并行跑多条产线（文章 / 漫画），
+/// 各自配额独立、各自的角度切片独立（Angle.scope）。
+/// kind 用 String 而非 enum：与 SQLite 枚举降级策略一致，且新增产线类型不应改 schema。
+/// 读口径统一走 services/pipeline.ts（缺行回落 Track.quotaPerDay 旧语义）。
+model TrackPipeline {
+  id          Int      @id @default(autoincrement())
+  trackId     Int
+  kind        String
+  quotaPerDay Int      @default(0)
+  /// comic 默认 false：未启用 = 对现有文章产线零影响。
+  enabled     Boolean  @default(false)
+  /// 产线私有配置（单元数/尺寸/金句卡版式/负面词/重跑上限等），见 plan §4。
+  configJson  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  track Track @relation(fields: [trackId], references: [id], onDelete: Cascade)
+
+  @@unique([trackId, kind])
   @@index([enabled])
 }
 
@@ -68,6 +108,9 @@ model WechatToken {
 }
 
 /// 选题角度。同赛道内取一个少一个，抢占用 CAS 保证并发安全。
+/// scope 是产线切片：article 产线消费 [article, shared]，comic 产线消费 [comic, shared]；
+/// used 标记是全局的（先到先得），「偶有重合」的选题手动标 shared 即可两边通取。
+/// 存量行默认 article（避免新产线一上线就把老池吃光）。
 model Angle {
   id        Int       @id @default(autoincrement())
   trackId   Int
@@ -75,6 +118,7 @@ model Angle {
   seq       Int
   theme     String
   content   String
+  scope     String    @default("article")
   used      Boolean   @default(false)
   usedBy    String    @default("")
   usedDate  String?
@@ -86,6 +130,7 @@ model Angle {
   articles Article[]
 
   @@unique([trackId, code])
+  @@index([trackId, scope, used, seq])
   @@index([trackId, used, seq])
   @@index([theme])
 }
@@ -102,12 +147,25 @@ model Article {
   contentWechat   String        @default("")
   contentPath     String        @default("")
   coverPath       String        @default("")
+  /// 封面上传为微信永久素材后的 media_id。publisher 据此复用，避免每次推送都往
+  /// 永久素材库再传一张（公众号永久素材有配额上限）。
+  /// 仅对 coverUploaded 所指的那一次上传有效。
+  coverMediaId    String        @default("")
+  /// coverMediaId 对应的封面，形如 "<accountId>:covers/xxx.png"。
+  /// 与 coverMediaId 配对构成「封面是否已变更」的判据；带 accountId 是因为
+  /// 永久素材 media_id 是账号维度的，换账号后必须重传。
+  coverUploaded   String        @default("")
   mediaId         String        @default("")
   status          String @default("draft")
   pushDate        String
   blocks          Int           @default(0)
   chars           Int           @default(0)
   qualityJson     String?
+  /// 产线标识：'article' | 'comic'（services/pipeline.ts 的 PipelineKind）。
+  /// 默认 article 让存量行全部落位文章产线，零迁移副作用。
+  pipeline        String        @default("article")
+  /// 漫画元数据（仅 pipeline='comic'）：{ styleAnchor, digest?, panelMin, panelMax, ... }
+  comicJson       String?
   idempotencyKey  String        @unique
   note            String        @default("")
   createdAt       DateTime      @default(now())
@@ -118,10 +176,48 @@ model Article {
   // 应用层 services/accounts.deleteAccount 也做了显式级联，双保险。
   account Account? @relation(fields: [accountId], references: [id], onDelete: Cascade)
   angle   Angle?   @relation(fields: [angleId], references: [id], onDelete: SetNull)
+  /// 漫画逐格资产（pipeline='comic' 时才有行）。
+  comicPanels ComicPanel[]
 
   @@index([pushDate, accountId])
   @@index([status])
   @@index([angleId])
+  @@index([pipeline, status])
+  @@index([accountId, pipeline])
+}
+
+/// 漫画逐格资产行级状态机。每格一张场景插图（含中文气泡），
+/// 支持逐格慢生成、单格失败重跑、换账号重传 —— 用行级 status + updatedAt
+/// 构成轮询队列，替代引入任务队列框架。
+/// 金句卡（1080×540 文字卡）不入库：渲染阶段确定性生成，落盘 comics/quote-{seq}.jpg。
+model ComicPanel {
+  id            Int      @id @default(autoincrement())
+  articleId     Int
+  /// 格序 1..N
+  seq           Int
+  /// 该格完整生图提示词（风格前缀+外观锁定+场景+防复制条款），存全量便于复现/单格重跑。
+  prompt        String
+  /// 气泡台词（冗余一份，单格重画不改正文）。
+  lines         String   @default("")
+  /// 相对 CONTENT_DIR 的 POSIX 相对路径，形如 comics/ill-{seq}.png（沿用封面约定）。
+  filePath      String   @default("")
+  /// 正文引用地址（/media/uploadimg 返回的 mmbiz URL）。账号维度。
+  wechatUrl     String   @default("")
+  /// 复用判据 "<accountId>:<filePath>"，与封面 coverUploaded 同款——换账号必须重传。
+  uploadedKey   String   @default("")
+  /// pending | success | failed
+  status        String   @default("pending")
+  bytes         Int      @default(0)
+  attempt       Int      @default(0)
+  errorMsg      String   @default("")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@unique([articleId, seq])
+  @@index([articleId, status])
+  @@index([status, updatedAt])
 }
 
 /// 任务执行记录。排产、写作、生图、推送都走这里，便于监控与重试。
@@ -169,28 +265,39 @@ model RunLog {
   @@index([taskRunId, createdAt])
 }
 
-/// 可配置的 LLM 模型。OpenAI 兼容协议一个 provider 覆盖多家厂商。
+/// 可配置的模型。供应商与协议分离：
+///   vendor   = 谁提供的（开放集合，候选项由 GET /api/models/meta 下发）
+///   protocol = 怎么调（封闭集合，决定代码里的实现分支）
 model LlmModel {
-  id         Int         @id @default(autoincrement())
+  id         Int           @id @default(autoincrement())
   name       String
-  provider   String
+  /// 供应商：openai / deepseek / qwen / zhipu / moonshot / agnes / custom …
+  /// 存 String 而非枚举：它是开放集合，新增厂商不该需要改 schema。
+  vendor     String        @default("custom")
+  protocol   String
   capability String
   baseUrl    String
   modelId    String
   apiKeyEnc  Bytes?
-  apiKeyMask String      @default("")
+  apiKeyMask String        @default("")
+  /// 高级参数。跨库统一用 src/db-json.ts 的 packJson/unpackJson 存取。
+  /// 键按 protocol 约定：
+  ///   对话类：temperature / topP / maxTokens
+  ///   生图类：size(1K|2K|3K|4K) / ratio / responseFormat
   paramsJson String?
-  enabled    Boolean     @default(true)
-  isDefault  Boolean     @default(false)
-  createdAt  DateTime    @default(now())
-  updatedAt  DateTime    @updatedAt
+  enabled    Boolean       @default(true)
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
 
   bindings ModelBinding[]
 
   @@index([capability, enabled])
+  @@index([protocol])
 }
 
-/// 用途绑定：写作 / 修订 / 封面 / 扩库 各用哪个模型。
+/// 用途绑定：写作 / 改写 / 封面 / 扩角度 各用哪个模型。
+/// role 唯一 → 角色:模型 = 1:1；一个模型可被多个角色共用。
+/// 「角色需要什么能力」不在此表达，见 services/model-registry.ts 的 ROLE_SPEC。
 model ModelBinding {
   id       Int       @id @default(autoincrement())
   role     String @unique

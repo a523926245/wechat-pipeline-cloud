@@ -50,15 +50,50 @@ export const HTTP_TIMEOUT_MS = Number.parseInt(process.env.HTTP_TIMEOUT_MS ?? '3
 /** LLM 调用超时（毫秒），比微信接口宽松得多 */
 export const LLM_TIMEOUT_MS = Number.parseInt(process.env.LLM_TIMEOUT_MS ?? '300000', 10);
 
+/**
+ * 漫画生图（阶段二慢任务）的并发/退避/预算参数。
+ *
+ * 单独拎出来是因为这几个值必须靠真机跑才能定：生图 30~40s/张、上游会限流，
+ * 「一次心跳推进几格、同时跑几格、失败后隔多久重试、单次心跳最多烧多久」
+ * 都得能不改动代码就调。全部有默认值，不配也照常工作。
+ */
+function intEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+export const COMIC_IMAGE = {
+  /** 单次推进最多处理多少格（全局扫描模式的格数上限）。 */
+  maxPanelsPerRun: intEnv('COMIC_MAX_PANELS_PER_RUN', 3, 1, 20),
+  /** 同一篇文章内并行生图的格数（>1 才真的并发）。 */
+  concurrency: intEnv('COMIC_PANEL_CONCURRENCY', 2, 1, 6),
+  /** 失败退避基数：第 n 次失败等 base * 2^(n-1) 毫秒。 */
+  retryBaseDelayMs: intEnv('COMIC_RETRY_BASE_DELAY_MS', 20_000, 0, 600_000),
+  /** 退避上限，避免 attempt 很大时等到天荒地老。 */
+  retryMaxDelayMs: intEnv('COMIC_RETRY_MAX_DELAY_MS', 300_000, 1_000, 3_600_000),
+  /** 单次调度心跳给阶段二（生图）的时间预算；用完下次心跳继续，状态机幂等不会漏格。 */
+  tickBudgetMs: intEnv('COMIC_TICK_BUDGET_MS', 240_000, 10_000, 1_800_000),
+  /**
+   * 自动推进把预算用尽、但仍有格没画完时，隔多久自动续跑一轮。
+   * 目的是「一篇漫画一定能自己画完」，不让用户看到 5/6 卡住还要手动点。
+   */
+  continueDelayMs: intEnv('COMIC_CONTINUE_DELAY_MS', 15_000, 1_000, 600_000),
+} as const;
+
 export function ensureDir(p: string): string {
   if (!existsSync(p)) mkdirSync(p, { recursive: true });
   return p;
 }
 
-export function ensureContentDirs(): { articles: string; covers: string } {
+export function ensureContentDirs(): { articles: string; covers: string; comics: string } {
   const articles = ensureDir(join(CONTENT_DIR, 'articles'));
   const covers = ensureDir(join(CONTENT_DIR, 'covers'));
-  return { articles, covers };
+  // 漫画产线产物：ill-{seq}.png 场景插图 + quote-{seq}.jpg 金句卡
+  const comics = ensureDir(join(CONTENT_DIR, 'comics'));
+  return { articles, covers, comics };
 }
 
 /**

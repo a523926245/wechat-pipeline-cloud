@@ -28,7 +28,8 @@ import { CredentialError, WechatApiError } from '../errors.ts';
 import { HTTP_TIMEOUT_MS } from '../config.ts';
 import { logger } from '../logger.ts';
 
-const API_BASE = 'https://api.weixin.qq.com/cgi-bin';
+/** 仅在冒烟脚本里注入假上游；不设时行为与原先完全一致。 */
+const API_BASE = process.env.WECHAT_API_BASE ?? 'https://api.weixin.qq.com/cgi-bin';
 /** token 过期前的安全缓冲：提前 5 分钟就视为失效去刷新，避免用到临期 token。 */
 const TOKEN_SAFETY_MS = 5 * 60 * 1000;
 
@@ -227,6 +228,29 @@ export class WechatClient {
       );
     }
     return mediaId;
+  }
+
+  /**
+   * 上传图文正文插图（/media/uploadimg），返回可直接嵌入正文的 mmbiz URL。
+   *
+   * 与 uploadImage（永久素材）的区别：**不占用永久素材配额**（公众号素材库有上限，
+   * 漫画一次 6-12 张图，走永久素材一年就吃满）；官方专为正文插图设计。
+   * 返回的 url 供 ComicPanel.wechatUrl 使用；复用判据由调用方 uploadedKey 维护。
+   */
+  async uploadContentImage(imagePath: string): Promise<string> {
+    const buf = await readFile(imagePath);
+    const blob = new Blob([buf], { type: mimeOf(imagePath) });
+    const fd = new FormData();
+    fd.append('media', blob, basename(imagePath));
+    const data = await this.call('/media/uploadimg', fd, true);
+    const url = typeof data.url === 'string' ? data.url : undefined;
+    if (!url) {
+      throw new WechatApiError(
+        typeof data.errcode === 'number' ? data.errcode : -1,
+        `正文插图上传未返回 url: ${JSON.stringify(data).slice(0, 300)}`,
+      );
+    }
+    return url;
   }
 
   /** 新建草稿到草稿箱，返回 media_id。 */

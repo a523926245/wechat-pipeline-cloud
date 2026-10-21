@@ -1,0 +1,79 @@
+{
+  "_comment": "漫画产线模板资产（来源：quote-comic-illustrator / family-ip-illustrator 两个本地 skill 的实测沉淀）。styles 的 {n} 会被替换为出场人数；characters 为家庭 IP 外观锁定短语（写提示词时按需拼接）；negativePrompt 恒整串传给生图模型。",
+  "styles": {
+    "soft_watercolor": "Soft watercolor illustration style, gentle color washes, warm pastel tones, delicate thin outlines, dreamy cozy atmosphere, pure white background, WeChat public account article illustration, 16:9 horizontal, only characters and speech bubbles in the frame, NO article titles or scene numbers inside the image (titles go above the image in the WeChat editor), speech bubbles with Chinese dialogue text ARE allowed and encouraged as part of the scene composition, strictly use the specified IP characters with locked appearances and outfits, realistic human proportions, non-chibi, EXACTLY {n} CHARACTERS ONLY, NO duplicate characters, NO extra copies of people, NO extra limbs, NO extra hands, each character has exactly two normal arms and two normal hands, clean anatomy, clear spatial positioning for each character",
+    "guoman_flat": "Clean modern Chinese comic illustration style, flat coloring, thin black outline strokes, low saturation soft color palette, pure white background, WeChat public account article illustration, 16:9 horizontal, only characters and speech bubbles in the frame, NO article titles or scene numbers inside the image (titles go above the image in the WeChat editor), speech bubbles with Chinese dialogue text ARE allowed and encouraged as part of the scene composition, strictly use the specified IP characters with locked appearances and outfits, realistic human proportions, non-chibi, EXACTLY {n} CHARACTERS ONLY, NO duplicate characters, NO extra copies of people, NO extra limbs, NO extra hands, each character has exactly two normal arms and two normal hands, clean anatomy, clear spatial positioning for each character"
+  },
+  "defaultStyle": "soft_watercolor",
+  "characters": {
+    "father": "a father with neat short black hair and square gentle face wearing light gray collar shirt, beige knit vest, dark casual pants and casual leather shoes",
+    "mother": "a mother with black long wavy curly hair and gentle round face wearing off-white polo-collar knit top, flowy casual pants and shallow flat shoes",
+    "son12": "a 12-year-old son with black short tousled hair and a youthful boyish face (NEVER an adult face, boyish juvenile features only) wearing blue sports vest over gray short-sleeve shirt, blue sports shorts and sports shoes",
+    "son9": "a 9-year-old son with black short hair and round childish face wearing fluorescent green short-sleeve T-shirt, black shorts and yellow house slippers, black digital watch on left wrist"
+  },
+  "_characters_note": "角色库来自家庭 IP 资产（skill: quote-comic-illustrator/templates/scenes.md §家庭IP角色库）：四口之家 = 爸爸(34)/妈妈/12岁哥哥/9岁弟弟，外貌穿搭身高锁死。系统层面不另做角色管理，改角色改这里（或对齐 skill 资产）。",
+  "characterLabels": {
+    "father": "爸爸",
+    "mother": "妈妈",
+    "son12": "12岁哥哥",
+    "son9": "9岁弟弟"
+  },
+  "_offIp_note": "IP 外角色词表：选题里出现这些称谓 = 画面画不出来（IP 只有四口之家），会造成「标题写奶奶、画面是妈妈」的图文不符。扩库时用它约束不生成，选题库里用它标记并退回文章专用（文章线不受画面限制）。",
+  "offIpWords": [
+    "爷爷",
+    "奶奶",
+    "公公",
+    "婆婆",
+    "外公",
+    "外婆",
+    "姥爷",
+    "姥姥",
+    "姑姑",
+    "姑父",
+    "叔叔",
+    "婶婶",
+    "舅舅",
+    "舅妈",
+    "阿姨",
+    "姨父",
+    "老师",
+    "同学",
+    "同桌",
+    "邻居",
+    "同事",
+    "亲戚",
+    "保姆",
+    "月嫂",
+    "教练",
+    "医生",
+    "护士",
+    "保安",
+    "物业",
+    "路人",
+    "陌生人"
+  ],
+  "bubbleClause": " EXACTLY ONE speech bubble in the entire image, its text written only once, no other bubble anywhere.",
+  "excludeClause": "除气泡文字外画面无任何其他文字，无水印，无签名。",
+  "negativePrompt": "comic panel borders, grid dividers, four-panel comic, article titles inside image, scene labels, numbered headings in image, distorted facial features, extra irrelevant characters, deformed hands and feet, extra limbs, extra hands, inconsistent art style, messy overlapping anatomy, extra speech bubbles, extra text, letters, watermark, signature, duplicate characters, English words or labels rendered inside any speech bubble, prompt tokens visible as text in the image",
+  "narrativeChains": {
+    "progressive": "递进链（现象 → 原因 → 方法 → 升华）：适用观点/反思文（育儿反思、认知改变、情感共鸣）。N=6 拆法：单元1现象-家长侧行为（描述普遍行为，戳中日常）→ 单元2现象-孩子侧反应（现象拆两个侧面）→ 单元3原因（揭示深层机制，制造「原来如此」）→ 单元4方法A-止损（先停掉错误做法）→ 单元5方法B-替代（给出正向做法，可执行、有转向感）→ 单元6升华（情感/价值观收束，值得截图转发）。N=4 用原序现象→原因→方法→升华；N=5 去掉现象的其中一个侧面。可选节拍「误诊」：原因层与方法层之间可插一格「你以为是 X，其实是 Y」，先点破常见误判再给真实机制，让「原来如此」的爽感提前到方法之前（与标题公式库「原来式」搭配效果最佳）。硬约束：标题链必须按所选逻辑递进，禁止 N 句互不相关；末单元必须有值得截图转发的升华感。",
+    "checklist": "清单链（痛点引入 → 原理解读 → 并列列举 → 总结升华）：适用科普/好物/干货清单文，也适用于并列特质/行为清单（主力结构）。N=6 拆法：单元1痛点/误区（打破错误认知，指出父母常见的花钱/费力误区）→ 单元2原理解读（建立科学依据，解释背后的核心机制）→ 单元3~5并列列举（天然可伸缩：N=6 时列 3 条，每条独占一个单元，按类别/维度分点、结构并列）→ 单元6总结升华（回归日常与长期主义；同段给未命中读者留台阶）。三条硬约束：①排序必须有隐性递进——并列单元之间要有从表到里/从个人到关系/从当下到未来的方向感，禁止随机排列，最后一个并列单元是「最高维」的那一项，负责把清单引向升华；②降级兜底——总结升华单元的阐释里必须给「未完全命中」的读者一个台阶，句式参考「如果只中了 X 条，也没关系，说明你正在……」；③互动回扣——发布备注的提问必须回扣清单本身（「这几个你占了几个」），把清单变成读者的自测清单。",
+    "contrast": "对比链（错误做法 → 严重后果 → 正确做法 → 对比反转）：适用辟谣/反常识/纠错文。N=6 拆法：单元1错误做法A（引发共鸣，很多父母天天在做）→ 单元2错误做法B（另一种常见误区）→ 单元3严重后果（危机感顶点，带来不可逆的伤害）→ 单元4正确做法（给出出路，简单易行、反差明显）→ 单元5落地细节（具体到一句话/一个动作）→ 单元6对比反转（两种做法的长期对照，强化认知）。硬约束：错误做法与正确做法必须形成明确反差；严重后果需具体不可逆，禁止空泛恐吓；末单元必须是两种做法的长期对比而非重复正确做法。",
+    "scene": "场景链（场景1 → 场景2 → 场景3 → 感悟）：适用故事/日常漫画文（家庭日常、故事连载、情境漫画）。N=6 拆法：单元1场景1-故事开端（日常冲突/温馨瞬间）→ 单元2场景2-故事发展（冲突升级/认知碰撞）→ 单元3场景3-矛盾激化 → 单元4场景4-转折/解决 → 单元5场景5-新的日常状态 → 单元6感悟（从故事提炼养育感悟，压轴）。暗线约束三条缺一不可：①共享情绪关键词——所有场景围绕同一个核心情绪词（如「崩溃」「安心」「愧疚」）展开，禁止情绪漂移成流水账；②隐性因果——后一场景必须是前一场景的深化或验证（冲突升级/认知碰撞/行为结果），场景之间有因果链，不是并列的三件事；③闭环回扣——末单元感悟必须回扣首场景的具体画面或台词，形成首尾闭环（范式：故事里长辈的一个做法，在结尾被孩子原样复刻——他人的爱被看见、被传递）。",
+    "timeline": "时间链（阶段1 → 阶段2 → 阶段3 → 关键期总结）：适用成长/阶段/分龄文（成长记录、分龄教育、关键期提醒）。N=6 拆法：单元1阶段1-初现端倪（描述该阶段特征）→ 单元2阶段2-矛盾发展（描述该阶段痛点）→ 单元3阶段3特征 → 单元4阶段3痛点/矛盾顶点 → 单元5干预重点（此刻父母该做的）→ 单元6关键期总结（不可逆性 + 呼吁把握当下，压轴）。硬约束：阶段之间必须有明确的时间/发展顺序与不可逆性线索；末单元必须强调关键期不可逆并呼吁把握当下，禁止泛泛收尾。",
+    "示范链": "示范链（金句开场 → 要诀①示范 → 要诀②示范 → … → 收尾金句）：适用育儿实操/生活技巧/习惯养成/干货行动文——不讲故事、不制造焦虑，开门见山给可照做的做法，每条配一个「演给你看」的示范场景。N=6 拆法：单元1金句开场（抛出主张、引发认同；反常识或强共鸣金句大标题 + 一幅温馨定格画面，含一来一回对话）→ 单元2要诀①示范（编号 + 四~八字行动口诀，如「①放下手机，认真陪」）→ 单元3要诀②示范（编号 + 行动口诀，如「②每天留10分钟专属时间」）→ 单元4要诀③示范 → 单元5要诀④示范 → 单元6要诀⑤示范或收尾金句（一句行动号召，与单元1首尾呼应）。每单元内容形状：短口诀标题 + 2~3 句大白话（怎么做、为什么有效，一句一个意思）+ 示范画面（人物把这条做法「演」出来；对话气泡只放一来一回，不超过两句）。与清单链的区别：清单链是「痛点→原理→并列→升华」的论证结构；示范链没有痛点铺垫、没有原理段、没有升华收尾——直接给做法，每条自带示范场景，语气像朋友掏心窝的叮嘱。"
+  },
+  "defaultChain": "progressive",
+  "quoteCard": {
+    "width": 1080,
+    "height": 540,
+    "background": "#ffffff",
+    "titleColor": "#2c3e50",
+    "titleSize": 68,
+    "titleWeight": 700,
+    "descColor": "#7f8c8d",
+    "descSize": 46,
+    "titleDescGap": 50,
+    "fontFamily": "CheeseFont"
+  }
+}
