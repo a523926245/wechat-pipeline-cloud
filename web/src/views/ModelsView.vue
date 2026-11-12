@@ -21,9 +21,11 @@ import type { FormInstance, FormRules } from "element-plus";
 import { computed, nextTick, onMounted, reactive, ref } from "vue";
 
 import RowActions, { type RowAction } from "../components/RowActions.vue";
+import BatchBar from "../components/BatchBar.vue";
 import { errMsg } from "../api/http.ts";
 import {
   bindRole,
+  bulkDeleteModels,
   createModel,
   deleteModel,
   getBindings,
@@ -34,6 +36,7 @@ import {
   updateModel,
 } from "../api/index.ts";
 import StateError from "../components/StateError.vue";
+import { useBatchDelete } from "../composables/useBatchDelete.ts";
 import type {
   BindingMap,
   LlmModelPayload,
@@ -157,6 +160,8 @@ const dialog = reactive({
   visible: false,
   saving: false,
   editingId: 0,
+  /** 编辑态展示当前已存 Key 掩码，让用户确认「留空=不修改」不是「Key 丢了」 */
+  keyMask: "",
   form: {
     name: "",
     vendor: "custom",
@@ -251,6 +256,7 @@ function emptyForm(): ModelForm {
 
 function openCreate() {
   dialog.editingId = 0;
+  dialog.keyMask = "";
   dialog.form = emptyForm();
   advOpen.value = [];
   dialog.visible = true;
@@ -261,6 +267,7 @@ function openEdit(row: LlmModelView) {
   const p = (row.paramsJson ?? {}) as Record<string, unknown>;
   const hasAdv = Boolean(p.size || p.temperature || p.maxTokens);
   dialog.editingId = row.id;
+  dialog.keyMask = row.apiKeyMask || "";
   advOpen.value = hasAdv ? ["adv"] : [];
   dialog.form = {
     name: row.name,
@@ -330,8 +337,9 @@ async function save() {
     paramsJson.size = form.size;
     paramsJson.ratio = form.ratio;
   } else {
-    if (form.temperature !== null) paramsJson.temperature = form.temperature;
-    if (form.maxTokens !== null) paramsJson.maxTokens = form.maxTokens;
+    // 显式传 null = 删除该参数（后端 paramsJson 合并语义）；不传会把旧值一直留着
+    paramsJson.temperature = form.temperature;
+    paramsJson.maxTokens = form.maxTokens;
   }
 
   const payload: LlmModelPayload & { apiKey?: string } = {
@@ -344,8 +352,8 @@ async function save() {
     paramsJson,
     enabled: form.enabled,
   };
-  // 编辑时留空表示不改动 Key
-  if (form.apiKey) payload.apiKey = form.apiKey;
+  // 编辑时留空/纯空白表示不改动 Key（trim 后非空才发——防误存空格/换行覆盖旧 Key）
+  if (form.apiKey.trim()) payload.apiKey = form.apiKey.trim();
 
   dialog.saving = true;
   try {
@@ -364,6 +372,33 @@ async function save() {
     dialog.saving = false;
   }
 }
+
+/**
+ * 批量删除：与单条删除同一套语义（先解绑角色再删模型，避免悬空外键）。
+ * 提示要点明「绑着角色的模型删了会让对应环节失去模型」——这是删完之后才发现的坑。
+ */
+const modelTableRef = ref<{ clearSelection: () => void } | null>(null);
+
+const batch = useBatchDelete<LlmModelView>({
+  idOf: (row) => row.id,
+  api: bulkDeleteModels,
+  tableRef: modelTableRef,
+  impact: (rows) => {
+    const bound = rows.filter((r) => (r.boundRoles ?? []).length > 0);
+    const parts: string[] = [];
+    parts.push(`将删除 ${rows.length} 个模型配置，删除后不可恢复。`);
+    if (bound.length > 0) {
+      const roles = [...new Set(bound.flatMap((r) => r.boundRoles ?? []))];
+      parts.push(
+        `其中 ${bound.length} 个模型正被角色绑定（${roles.join('、')}），绑定会一并解除，` +
+          '这些环节之后需要重新指定模型才能工作。',
+      );
+    }
+    return parts.join('\n');
+  },
+  title: '批量删除模型',
+  reload: load,
+});
 
 async function remove(row: LlmModelView) {
   try {
@@ -632,10 +667,26 @@ function onModelCommand(cmd: string, row: LlmModelView) {
     <el-card shadow="never">
       <template #header>模型列表</template>
 
+      <!-- 批量操作条：有勾选时才出现 -->
+      <BatchBar
+        :count="batch.count.value"
+        :loading="batch.deleting.value"
+        @delete="batch.runBatchDelete()"
+        @clear="batch.clearSelection()"
+      />
+
       <!-- 宽度约定：数字/状态列固定 width；文本列用 min-width + show-overflow-tooltip——
            min-width 列会按比例分摊表格剩余宽度（自适应撑满），只有挤不下时才出省略号。
            不显示 ID：模型按名称识别，省一列给更有信息量的调用参数。 -->
-      <el-table :data="models" size="default">
+      <el-table
+        ref="modelTableRef"
+        :data="models"
+        size="default"
+        row-key="id"
+        @selection-change="batch.onSelectionChange"
+      >
+        <!-- reserve-selection：翻页后仍保留勾选（配合 row-key） -->
+        <el-table-column type="selection" width="46" reserve-selection />
         <el-table-column
           prop="name"
           label="名称"
@@ -831,8 +882,13 @@ function onModelCommand(cmd: string, row: LlmModelView) {
             v-model="dialog.form.apiKey"
             type="password"
             show-password
+            autocomplete="new-password"
             :placeholder="dialog.editingId ? '留空表示不修改' : 'sk-...'"
           />
+          <!-- 当前掩码可见：确认「留空=不修改」而不是 Key 丢了；autocomplete 防浏览器自动填充误覆盖 -->
+          <div v-if="dialog.editingId && dialog.keyMask" class="wb-muted key-mask-hint">
+            当前已存 Key：<span class="wb-mono">{{ dialog.keyMask }}</span>，留空表示不修改
+          </div>
         </el-form-item>
 
         <el-form-item label="启用">

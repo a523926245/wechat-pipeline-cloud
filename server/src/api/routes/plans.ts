@@ -11,11 +11,19 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../db.ts';
+import { assertAccountAccess, isAdmin, requirePrincipal } from '../../services/ownership.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { requirePermission } from '../permissions.ts';
 import { NotFoundError } from '../../errors.ts';
 import { buildPlan, runPipelineForAccount } from '../../services/planner.ts';
 
 const plansRouter = Router();
+
+// P2 RBAC：看计划=data:view，手动触发排产=content:generate
+plansRouter.use((req, res, next) => {
+  const perm = req.method === 'GET' ? 'data:view' : 'content:generate';
+  return requirePermission(perm)(req, res, next);
+});
 
 const triggerSchema = z.object({
   accountId: z.number().int().positive(),
@@ -30,7 +38,12 @@ plansRouter.get(
   asyncHandler(async (req, res) => {
     const target = typeof req.query.account === 'string' ? req.query.account : undefined;
     const backlogDays = req.query.backlogDays ? Number(req.query.backlogDays) : 3;
-    const plan = await buildPlan(target, Number.isFinite(backlogDays) ? backlogDays : 3);
+    const principal = requirePrincipal(req);
+    const plan = await buildPlan(
+      target,
+      Number.isFinite(backlogDays) ? backlogDays : 3,
+      isAdmin(principal) ? null : principal.userId,
+    );
     res.json(plan);
   }),
 );
@@ -40,7 +53,8 @@ plansRouter.post(
   '/trigger',
   asyncHandler(async (req, res) => {
     const body = triggerSchema.parse(req.body);
-    const acc = await prisma.account.findUnique({ where: { id: body.accountId } });
+    const acc = await prisma.oAAccount.findUnique({ where: { id: body.accountId } });
+    assertAccountAccess(requirePrincipal(req), acc, body.accountId);
     if (!acc) throw new NotFoundError(`账号 ${body.accountId} 不存在`);
 
     const result = await runPipelineForAccount(body.accountId, body.pipeline ?? 'article', body.count);

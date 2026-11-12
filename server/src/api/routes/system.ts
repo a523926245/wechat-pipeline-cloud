@@ -11,8 +11,25 @@ import { checkDb, prisma } from '../../db.ts';
 import { BadRequestError } from '../../errors.ts';
 import { ANGLE_SCOPE_META, PIPELINES, PIPELINE_SPEC } from '../../services/pipeline.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { requirePermission } from '../permissions.ts';
 
 export const systemRouter: Router = Router();
+
+// P2 RBAC：health/version 公开（guard 已放行、无 principal，这里也要豁免）；
+// 前缀设置写入=admin；其余（pipelines/读前缀）登录即可。
+// ⚠️ 两个坑：①本 router 挂在 /api 前缀下，use() 会拦到所有 /api/*——必须限定本 router
+// 自己的路径，否则误伤 credentials 等路由（曾把 member 的 PUT 打成 403 system:manage）；
+// ②Express 的 use(path, fn) 会剥掉匹配前缀再进 fn，req.path 已不是原路径——判路径
+// 必须用 req.originalUrl（曾把 /health 判成「未登录 403」）。
+systemRouter.use(
+  ['/health', '/version', '/pipelines', '/content-prefixes'],
+  (req, res, next) => {
+    const p = (req.originalUrl.split('?')[0] ?? '').replace(/^\/api/, '');
+    if (p === '/health' || p === '/version') return next();
+    if (req.method === 'PUT') return requirePermission('system:manage')(req, res, next);
+    return requirePermission('data:view')(req, res, next);
+  },
+);
 
 systemRouter.get(
   '/health',

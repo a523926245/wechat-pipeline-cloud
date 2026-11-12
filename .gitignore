@@ -27,8 +27,19 @@ web/.vite/
 *.sqlite
 *.sqlite3
 
+# local database backups: same data as dev.db, never publish them
+*.db.bak-*
+*.db.bak
+
 # server runtime state: holds AES master key + temp scratch files
 server/var/
+
+# local experiment archives (sample articles, prompt dumps, A/B html)
+var/_archive/
+var/verify/
+
+# one-off config backups (seeds live in config/style_dna.json)
+config/*.bak*.json
 
 # workbuddy local tooling state (not project source)
 .workbuddy/

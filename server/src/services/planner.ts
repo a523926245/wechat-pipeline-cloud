@@ -98,10 +98,13 @@ const CRED_STATUS_REASON: Record<string, string> = {
 export async function buildPlan(
   targetAccount?: string,
   backlogDays = 3,
+  // P3 归属过滤（高危点：本函数是 dashboard 与 /api/plan 双消费者，两处调用都必须传）
+  ownerUserId?: number | null,
 ): Promise<PlanResult> {
+  const accWhere = ownerUserId != null ? { ownerUserId } : {};
   const tracks = await prisma.track.findMany({
     include: {
-      accounts: { orderBy: { name: 'asc' } },
+      accounts: { where: accWhere, orderBy: { name: 'asc' } },
       angles: { where: { used: false }, orderBy: { seq: 'asc' } },
       articles: { orderBy: { createdAt: 'desc' }, take: 8, select: { createdAt: true, title: true } },
       pipelines: true,
@@ -267,7 +270,7 @@ export async function reserveAnglesForPipeline(
 ): Promise<Angle[]> {
   if (need <= 0) return [];
   return prisma.$transaction(async (tx) => {
-    const acc = await tx.account.findUnique({ where: { id: accountId }, include: { track: true } });
+    const acc = await tx.oAAccount.findUnique({ where: { id: accountId }, include: { track: true } });
     if (!acc) throw new NotFoundError(`账号 ${accountId} 不存在`);
     const today = todayStr();
     const pool = await tx.angle.findMany({
@@ -279,7 +282,14 @@ export async function reserveAnglesForPipeline(
     if (ids.length > 0) {
       await tx.angle.updateMany({
         where: { id: { in: ids } },
-        data: { used: true, usedBy: acc.name, usedDate: today },
+        // P3：结构化归属（usedBy 保留作展示标签）——跨客户防重复的「谁抢到归谁」标记
+        data: {
+          used: true,
+          usedBy: acc.name,
+          usedDate: today,
+          usedById: acc.ownerUserId,
+          usedByAccountId: acc.id,
+        },
       });
     }
     return pool;
@@ -309,7 +319,7 @@ export async function runPipelineForAccount(
   pipeline: PipelineKind,
   count?: number,
 ): Promise<TriggerResult> {
-  const acc = await prisma.account.findUnique({ where: { id: accountId }, include: { track: true } });
+  const acc = await prisma.oAAccount.findUnique({ where: { id: accountId }, include: { track: true } });
   if (!acc) throw new NotFoundError(`账号 ${accountId} 不存在`);
 
   const already = await todayPipelineCount(accountId, pipeline);
@@ -321,7 +331,22 @@ export async function runPipelineForAccount(
 
   const reserved = await reserveAnglesForPipeline(accountId, need, pipeline);
   if (reserved.length === 0) {
-    return { accountId, account: acc.name, need, created: [], reason: '角度池已空，请先扩库' };
+    // 跨赛道错配诊断：报错只说「扩库」会让人扩错赛道的题（2026-11-11 实测踩过：
+    // 题在【育儿】、账号在【星座】，用户以为扩完就能写）。把话说全。
+    const others = await prisma.angle.findMany({
+      where: { used: false, trackId: { not: acc.trackId } },
+      select: { track: { select: { name: true } } },
+    });
+    const byTrack = new Map<string, number>();
+    for (const o of others) byTrack.set(o.track.name, (byTrack.get(o.track.name) ?? 0) + 1);
+    const otherText = [...byTrack.entries()].map(([n, c]) => `【${n}】${c} 条`).join('、');
+    const kindText = pipeline === 'comic' ? '漫画' : '文章';
+    const reason =
+      `角度池已空：账号「${acc.name}」属【${acc.track.name}】赛道，该赛道没有可用的${kindText}选题。` +
+      (byTrack.size > 0
+        ? `注意：未用选题在 ${otherText} ——那是别的赛道的池子，本账号吃不到。请给【${acc.track.name}】扩库（${kindText}切片），或把账号改绑到对应赛道。`
+        : '请先到「赛道管理 → 选题库」给该赛道扩库。');
+    return { accountId, account: acc.name, need, created: [], reason };
   }
 
   const created: TriggerResult['created'] = [];

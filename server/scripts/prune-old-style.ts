@@ -135,7 +135,7 @@ async function main(): Promise<void> {
       if (t.status !== 'pushed' && t.angleId != null) {
         const back = await tx.angle.updateMany({
           where: { id: t.angleId },
-          data: { used: false, usedBy: '', usedDate: null },
+          data: { used: false, usedBy: '', usedDate: null, usedById: null, usedByAccountId: null },
         });
         if (back.count > 0) recycledAngles += 1;
       }

@@ -6,14 +6,17 @@ import { useRoute, useRouter } from "vue-router";
 
 import { errMsg } from "../api/http.ts";
 import {
+  bulkDeleteArticles,
   deleteArticle,
   getArticle,
   listArticles,
   previewArticle,
   pushArticle,
 } from "../api/index.ts";
+import BatchBar from "../components/BatchBar.vue";
 import StateError from "../components/StateError.vue";
 import RowActions, { type RowAction } from "../components/RowActions.vue";
+import { useBatchDelete } from "../composables/useBatchDelete.ts";
 import type {
   ArticleDetail,
   ArticleListItem,
@@ -91,6 +94,51 @@ async function load() {
 
 onMounted(load);
 watch([status, angle, pipeline, page], load);
+
+/**
+ * 批量删除：与单条删除同一套语义（永久删除；未推送文章占用的选题角度会归还角度池）。
+ * 提示里要点明「哪些会归还角度」——归还后同一选题可能被再次使用。
+ */
+const articleTableRef = ref<{ clearSelection: () => void } | null>(null);
+
+const batch = useBatchDelete<ArticleListItem>({
+  idOf: (row) => row.id,
+  api: bulkDeleteArticles,
+  tableRef: articleTableRef,
+  impact: (rows) => {
+    const pushed = rows.filter((r) => r.status === "pushed").length;
+    const parts: string[] = ["文章删除后不可恢复。"];
+    if (pushed > 0) {
+      parts.push(
+        `其中 ${pushed} 篇已推送到公众号草稿箱，删除只影响本系统内的副本，微信侧不受影响。`,
+      );
+    }
+    const notPushed = rows.length - pushed;
+    if (notPushed > 0) {
+      parts.push(
+        `其余 ${notPushed} 篇占用的选题角度会归还角度池，可能被再次用于新文章。`,
+      );
+    }
+    return parts.join("\n");
+  },
+  title: "批量删除文章",
+  reload: async (res) => {
+    const remain = items.value.length - res.deleted;
+    if (remain <= 0 && page.value > 1) {
+      setQuery({ page: page.value - 1 });
+    } else {
+      await load();
+    }
+  },
+});
+
+/**
+ * 换筛选条件（不是翻页）时清空勾选。
+ * reserve-selection 会让勾选跨数据刷新保留，换筛选后旧勾选指向另一个结果集，留着会删到看不见的文章。
+ */
+watch([status, angle, pipeline], () => {
+  batch.clearSelection();
+});
 
 function setQuery(patch: Record<string, string | number | undefined>) {
   const query: Record<string, string> = {};
@@ -280,7 +328,24 @@ function onArticleCommand(cmd: string, row: ArticleListItem) {
         </el-form-item>
       </el-form>
 
-      <el-table v-if="items.length" :data="items" size="default">
+      <!-- 批量操作条：有勾选时才出现 -->
+      <BatchBar
+        :count="batch.count.value"
+        :loading="batch.deleting.value"
+        @delete="batch.runBatchDelete()"
+        @clear="batch.clearSelection()"
+      />
+
+      <el-table
+        v-if="items.length"
+        ref="articleTableRef"
+        :data="items"
+        size="default"
+        row-key="id"
+        @selection-change="batch.onSelectionChange"
+      >
+        <!-- reserve-selection：翻页后仍保留勾选（配合 row-key） -->
+        <el-table-column type="selection" width="46" reserve-selection />
         <el-table-column prop="id" label="ID" width="60" />
         <el-table-column label="标题" min-width="260" show-overflow-tooltip>
           <template #default="{ row }">

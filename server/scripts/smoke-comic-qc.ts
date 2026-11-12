@@ -10,6 +10,8 @@
  * 跑法（需隔离 DB）：DATABASE_URL=file:./var/smoke-comic-qc.db npm run smoke:comic-qc
  */
 
+// 冒烟旁路：本脚本带裸 fetch/静态请求，跳过 /api 鉴权（生产环境无效）。
+process.env.SMOKE_NO_AUTH = '1';
 import { createServer } from 'node:http';
 
 import { createApp } from '../src/app.ts';

@@ -91,7 +91,7 @@ export function ensureDir(p: string): string {
 export function ensureContentDirs(): { articles: string; covers: string; comics: string } {
   const articles = ensureDir(join(CONTENT_DIR, 'articles'));
   const covers = ensureDir(join(CONTENT_DIR, 'covers'));
-  // 漫画产线产物：ill-{seq}.png 场景插图 + quote-{seq}.jpg 金句卡
+  // 漫画产线产物：ill-{seq}.png 场景插图 + quote-{articleId}-{seq}.jpg 金句卡（按文章隔离）
   const comics = ensureDir(join(CONTENT_DIR, 'comics'));
   return { articles, covers, comics };
 }

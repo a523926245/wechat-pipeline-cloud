@@ -90,11 +90,14 @@ export interface CreateAccountInput {
   appid: string;
   secret: string;
   author?: string;
+  /** 归属系统用户（P3）。null=未归属（admin 建号/兼容旧调用）。 */
+  ownerUserId?: number | null;
 }
 
 /**
  * 新建账号。凭据落库前一律加密，状态与启用由 decideCredStatus 自动判定。
  * 赛道不存在 → 404；AppID 已被占用 → 409。
+ * P3：member 建号挂 ownerUserId 并受 maxOAAccounts 配额约束。
  */
 export async function createAccount(input: CreateAccountInput) {
   const track = await prisma.track.findUnique({
@@ -103,14 +106,31 @@ export async function createAccount(input: CreateAccountInput) {
   });
   if (!track) throw new NotFoundError(`赛道 ${input.trackId} 不存在`);
 
-  const dup = await prisma.account.findUnique({ where: { appid: input.appid } });
+  const dup = await prisma.oAAccount.findUnique({ where: { appid: input.appid } });
   if (dup) throw new ConflictError(`AppID ${input.appid} 已被账号「${dup.name}」占用`);
+
+  // 配额：member 建号数 ≤ maxOAAccounts（admin/未归属不受限）
+  if (input.ownerUserId != null) {
+    const user = await prisma.user.findUnique({
+      where: { id: input.ownerUserId },
+      select: { maxOAAccounts: true, username: true },
+    });
+    if (user) {
+      const used = await prisma.oAAccount.count({ where: { ownerUserId: input.ownerUserId } });
+      if (used >= user.maxOAAccounts) {
+        throw new ConflictError(
+          `账号数已达上限（${used}/${user.maxOAAccounts}），请联系管理员提升配额`,
+        );
+      }
+    }
+  }
 
   const { status, enabled } = decideCredStatus(input.appid, input.secret);
 
-  return prisma.account.create({
+  return prisma.oAAccount.create({
     data: {
       trackId: input.trackId,
+      ownerUserId: input.ownerUserId ?? null,
       name: input.name,
       appid: input.appid,
       secretEnc: encryptSecret(input.secret),
@@ -137,11 +157,23 @@ export interface DeleteAccountResult {
  *  2. 该账号名下文章全部删除（应用层显式级联，与 schema 的 onDelete:Cascade 双保险）
  *  3. TaskRun 的 accountId 置空，避免留下指向不存在账号的孤儿字段
  * 微信侧已发内容不受影响（只写草稿箱，且这里不动微信接口）。
+ *
+ * P3 服务层兜底：传入 expectedOwnerId（非 null 时）必须匹配 account.ownerUserId，
+ * 不匹配按 404 处理（防入口层漏校验时被横向越权删号删文）。
  */
-export async function deleteAccount(id: number): Promise<DeleteAccountResult> {
+export async function deleteAccount(
+  id: number,
+  expectedOwnerId: number | null = null,
+): Promise<DeleteAccountResult> {
   return prisma.$transaction(async (tx) => {
-    const acc = await tx.account.findUnique({ where: { id }, select: { id: true, name: true } });
+    const acc = await tx.oAAccount.findUnique({
+      where: { id },
+      select: { id: true, name: true, ownerUserId: true },
+    });
     if (!acc) throw new NotFoundError(`账号 ${id} 不存在`);
+    if (expectedOwnerId != null && acc.ownerUserId !== expectedOwnerId) {
+      throw new NotFoundError(`账号 ${id} 不存在`);
+    }
 
     const articles = await tx.article.findMany({
       where: { accountId: id },
@@ -161,7 +193,8 @@ export async function deleteAccount(id: number): Promise<DeleteAccountResult> {
     if (angleIds.length > 0) {
       const r = await tx.angle.updateMany({
         where: { id: { in: angleIds } },
-        data: { used: false, usedBy: '', usedDate: null },
+        // P3：结构化归属字段一起清（usedBy 展示标签同步清空）
+        data: { used: false, usedBy: '', usedDate: null, usedById: null, usedByAccountId: null },
       });
       recycledAngles = r.count;
     }
@@ -176,7 +209,7 @@ export async function deleteAccount(id: number): Promise<DeleteAccountResult> {
 
     await tx.taskRun.updateMany({ where: { accountId: id }, data: { accountId: null } });
 
-    await tx.account.delete({ where: { id } });
+    await tx.oAAccount.delete({ where: { id } });
 
     return { id: acc.id, name: acc.name, deletedArticles, recycledAngles };
   });

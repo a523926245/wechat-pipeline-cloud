@@ -39,6 +39,8 @@ export interface ComicTemplates {
   offIpWords?: string[];
   bubbleClause: string;
   excludeClause: string;
+  /** 场景旁白禁令：紧跟 Scene 之后。防「旁白被画成第二个大气泡」高频穿帮（可缺省，代码内置兜底）。 */
+  sceneClause?: string;
   negativePrompt: string;
   narrativeChains: Record<string, string>;
   defaultChain: string;
@@ -406,6 +408,10 @@ function sanitizeBubble(bubble: unknown): string {
   return clip(b, 20);
 }
 
+/** templates 缺 sceneClause 字段时的兜底（旧配置文件兼容）。 */
+const FALLBACK_SCENE_CLAUSE =
+  'Scene is composition reference only: NEVER write it into the image as text, caption, sign or an extra speech bubble; the only text allowed in the image is the quoted bubble line below.';
+
 /** 确定性拼装单格最终提示词。 */
 function buildUnitPrompt(tpl: ComicTemplates, styleKey: string, u: {
   characters: string[];
@@ -427,7 +433,8 @@ function buildUnitPrompt(tpl: ComicTemplates, styleKey: string, u: {
     // 人数确定性条款：模型把同一角色画两次（如两个小儿子）是高频穿帮，显式钉死人数与「每人只出现一次」
     `Exactly ${n} character${n > 1 ? 's' : ''} from the list appear in the image, each appearing exactly once; never draw the same character twice, and no extra people beyond the list.`,
     u.spatial ? `Spatial: ${u.spatial}.` : '',
-    `Scene: ${clip(u.scene, 400)}.`,
+    // Scene 紧挨气泡指令，模型倾向把整段旁白也画成第二个大气泡（错字+违和），必须显式钉死「旁白不入画」
+    `Scene: ${clip(u.scene, 400)}. ${tpl.sceneClause ?? FALLBACK_SCENE_CLAUSE}`,
     u.bubble
       ? `画面${u.bubblePos || '右上方'}有一个圆润的白色手绘对话气泡，气泡尾巴指向说话者，气泡内只有一行黑色手写风格中文字：「${u.bubble}」。文字清晰、居中。${tpl.excludeClause}`
       : '',

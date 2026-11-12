@@ -15,10 +15,16 @@ import { z } from 'zod';
 import { prisma } from '../../db.ts';
 import { BadRequestError, ConflictError, NotFoundError } from '../../errors.ts';
 import { anglePoolStats, expandAnglesForTrack } from '../../services/angles.ts';
+import { deleteTrackById } from '../../services/track-delete.ts';
 import { ensureSeeded, isPipelineKind, listPipelines, setPipelineQuota } from '../../services/pipeline.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { bulkDeleteSchema, runBulkDelete } from '../bulk-delete.ts';
+import { requirePermission } from '../permissions.ts';
 
 export const tracksRouter: Router = Router();
+
+// P2 RBAC：本路由统一权限点
+tracksRouter.use(requirePermission('system:manage'));
 
 const idParam = z.coerce.number().int().positive();
 
@@ -220,24 +226,32 @@ tracksRouter.put(
   }),
 );
 
+/**
+ * 批量删除赛道。
+ *
+ * 复用 services/track-delete.ts 的「赛道下有账号则拒绝」规则：
+ * 批量时**不放宽**这条规则——有账号的那条会被跳过并说明原因，其余照删。
+ *
+ * 路由顺序：'/bulk-delete' 必须排在 '/:id' 之前（按项目约定固定路径前置）。
+ */
+tracksRouter.post(
+  '/bulk-delete',
+  asyncHandler(async (req, res) => {
+    const { ids } = bulkDeleteSchema.parse(req.body ?? {});
+    const result = await runBulkDelete(ids, async (id) => {
+      await deleteTrackById(id);
+      return {};
+    }, '赛道');
+    res.json(result);
+  }),
+);
+
 tracksRouter.delete(
   '/:id',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
-    const t = await prisma.track.findUnique({ where: { id }, select: { id: true, name: true } });
-    if (!t) throw new NotFoundError(`赛道 ${id} 不存在`);
-
-    const accountCount = await prisma.account.count({ where: { trackId: id } });
-    if (accountCount > 0) {
-      throw new ConflictError(
-        `赛道「${t.name}」下还有 ${accountCount} 个账号，请先删除或改绑到其他赛道，再删除本赛道`,
-        { accountCount },
-      );
-    }
-
-    // Angle 由 onDelete:Cascade 自动清理；Article.trackId 置空变"未归属"（内容不删）
-    await prisma.track.delete({ where: { id } });
-    res.json({ ok: true, id, name: t.name, message: `已删除赛道「${t.name}」` });
+    const r = await deleteTrackById(id);
+    res.json({ ok: true, id: r.id, name: r.name, message: `已删除赛道「${r.name}」` });
   }),
 );
 

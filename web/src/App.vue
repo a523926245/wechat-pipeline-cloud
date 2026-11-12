@@ -2,26 +2,33 @@
 import {
   DataAnalysis,
   Document,
+  Edit,
+  EditPen,
   Expand,
   Files,
   Fold,
   List,
   MagicStick,
+  Memo,
   Moon,
+  Operation,
   Refresh,
+  Setting,
   Sunny,
   Timer,
   User,
+  UserFilled,
 } from '@element-plus/icons-vue';
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
 
 import BrandLogo from './components/BrandLogo.vue';
-import { getHealth, getModelMeta, getPipelineMeta, getSystemStatus } from './api/index.ts';
+import { getHealth, getModelMeta, getPipelineMeta, getSystemStatus, logout } from './api/index.ts';
 import { errMsg } from './api/http.ts';
 import { roleText, setModelLabels, setPipelineLabels } from './utils/format.ts';
 import { useTheme } from './composables/useTheme.ts';
-import type { Health, SystemStatus } from './types.ts';
+import { useAuth } from './composables/useAuth.ts';
+import type { Health, SystemStatus, UserRole } from './types.ts';
 
 const route = useRoute();
 
@@ -32,16 +39,86 @@ const health = ref<Health | null>(null);
 const healthErr = ref('');
 const collapsed = ref(false);
 const status = ref<SystemStatus | null>(null);
+// 登录态：模块级单例（useAuth），LoginView 登录成功后刷新 → 菜单/顶栏即时更新，无需手动刷新页面
+const { loadAuth, userRole, userName } = useAuth();
 
-const menuItems = [
-  { path: '/', label: '仪表盘', icon: DataAnalysis },
-  { path: '/plan', label: '创作计划', icon: List },
-  { path: '/scheduler', label: '自动调度', icon: Timer },
-  { path: '/articles', label: '文章', icon: Document },
-  { path: '/accounts', label: '账号管理', icon: User },
-  { path: '/tracks', label: '赛道管理', icon: Files },
-  { path: '/models', label: '模型配置', icon: MagicStick },
-];
+const ROLE_TEXT: Record<UserRole, string> = { admin: '管理员', member: '客户', guest: '游客' };
+
+/**
+ * 二级菜单（创作 / 运营 / 系统管理）+ 顶层仪表盘。
+ * 按角色显隐（P2 RBAC）：admin 全量；member 隐去系统管理；guest 只读（仪表盘/文章）。
+ * 组内成员全部被过滤掉时整组隐藏。
+ */
+interface MenuItem {
+  path: string;
+  label: string;
+  icon: unknown;
+  roles: UserRole[];
+}
+interface MenuGroup {
+  key: string;
+  label: string;
+  icon: unknown;
+  items: MenuItem[];
+}
+
+const menuGroups = computed<MenuGroup[]>(() => {
+  const groups: MenuGroup[] = [
+    {
+      key: 'create',
+      label: '创作',
+      icon: Edit,
+      items: [
+        { path: '/plan', label: '创作计划', icon: List, roles: ['admin', 'member'] },
+        { path: '/articles', label: '文章', icon: Document, roles: ['admin', 'member', 'guest'] },
+      ],
+    },
+    {
+      key: 'ops',
+      label: '运营',
+      icon: Operation,
+      items: [
+        { path: '/scheduler', label: '自动调度', icon: Timer, roles: ['admin', 'member'] },
+        { path: '/accounts', label: '账号管理', icon: User, roles: ['admin', 'member'] },
+      ],
+    },
+    {
+      key: 'system',
+      label: '系统管理',
+      icon: Setting,
+      items: [
+        { path: '/tracks', label: '赛道管理', icon: Files, roles: ['admin'] },
+        { path: '/style-prompts', label: '文风配置', icon: EditPen, roles: ['admin'] },
+        { path: '/prefixes', label: '标题前缀', icon: Memo, roles: ['admin'] },
+        { path: '/models', label: '模型配置', icon: MagicStick, roles: ['admin'] },
+        { path: '/users', label: '用户管理', icon: UserFilled, roles: ['admin'] },
+      ],
+    },
+  ];
+  return groups
+    .map((g) => ({ ...g, items: g.items.filter((it) => it.roles.includes(userRole.value)) }))
+    .filter((g) => g.items.length > 0);
+});
+
+/** 仪表盘常驻顶层（所有角色可见）。 */
+const dashboardItem: MenuItem = {
+  path: '/',
+  label: '仪表盘',
+  icon: DataAnalysis,
+  roles: ['admin', 'member', 'guest'],
+};
+
+/** 默认展开的分组（非收起态下让当前所在组处于展开态）。 */
+const openGroups = computed(() => menuGroups.value.map((g) => g.key));
+
+async function doLogout() {
+  try {
+    await logout();
+  } catch {
+    /* 登出失败也照样回登录页 */
+  }
+  window.location.href = '/login';
+}
 
 async function loadHealth() {
   try {
@@ -117,6 +194,7 @@ onMounted(() => {
   void loadModelMeta();
   void loadPipelineMeta();
   void loadStatus();
+  void loadAuth();
   syncCollapsed();
   window.addEventListener('resize', syncCollapsed);
 });
@@ -127,6 +205,12 @@ onUnmounted(() => {
 
 const pageTitle = computed(() => (route.meta.title as string | undefined) ?? '控制台');
 const pageDesc = computed(() => (route.meta.desc as string | undefined) ?? '');
+
+/**
+ * 独立页（登录/注册）：不套侧边栏与头部，整页只渲染自己。
+ * meta.bare 标记，登录页是全屏居中布局，套壳反而局促。
+ */
+const isBarePage = computed(() => route.meta.bare === true);
 
 /**
  * 菜单高亮：下钻页（/tracks/3/angles、/articles/12）不属于任何顶层菜单项，
@@ -153,9 +237,19 @@ const backend = computed(() => {
 </script>
 
 <template>
-  <a class="wb-skip-link" href="#wb-main">跳到主要内容</a>
+  <!-- 独立页（登录/注册）：无侧边栏、无头部，整页渲染 -->
+  <template v-if="isBarePage">
+    <router-view v-slot="{ Component }">
+      <transition name="wb-fade" mode="out-in">
+        <component :is="Component" />
+      </transition>
+    </router-view>
+  </template>
 
-  <el-container class="shell">
+  <template v-else>
+    <a class="wb-skip-link" href="#wb-main">跳到主要内容</a>
+
+    <el-container class="shell">
     <el-aside class="aside" :class="{ 'aside--collapsed': collapsed }">
       <div class="brand">
         <BrandLogo :with-wordmark="!collapsed" />
@@ -167,12 +261,24 @@ const backend = computed(() => {
           :collapse="collapsed"
           :collapse-transition="false"
           :default-active="activeMenu"
+          :default-openeds="openGroups"
           class="menu"
         >
-          <el-menu-item v-for="it in menuItems" :key="it.path" :index="it.path">
-            <el-icon><component :is="it.icon" /></el-icon>
-            <template #title>{{ it.label }}</template>
+          <el-menu-item :index="dashboardItem.path">
+            <el-icon><component :is="dashboardItem.icon" /></el-icon>
+            <template #title>{{ dashboardItem.label }}</template>
           </el-menu-item>
+
+          <el-sub-menu v-for="g in menuGroups" :key="g.key" :index="g.key">
+            <template #title>
+              <el-icon><component :is="g.icon" /></el-icon>
+              <span>{{ g.label }}</span>
+            </template>
+            <el-menu-item v-for="it in g.items" :key="it.path" :index="it.path">
+              <el-icon><component :is="it.icon" /></el-icon>
+              <template #title>{{ it.label }}</template>
+            </el-menu-item>
+          </el-sub-menu>
         </el-menu>
       </nav>
 
@@ -237,6 +343,18 @@ const backend = computed(() => {
             </template>
           </el-dropdown>
           <el-button :icon="Refresh" size="small" text @click="refreshAll">刷新状态</el-button>
+          <el-dropdown trigger="click" aria-label="用户菜单" @command="(c: string) => { if (c === 'logout') doLogout(); }">
+            <el-button size="small" text>
+              <el-icon><User /></el-icon>&nbsp;{{ userName || '未登录' }}
+              <el-tag size="small" effect="plain" class="role-tag">{{ ROLE_TEXT[userRole] }}</el-tag>
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item disabled>{{ userName }}（{{ ROLE_TEXT[userRole] }}）</el-dropdown-item>
+                <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
       </el-header>
 
@@ -249,6 +367,7 @@ const backend = computed(() => {
       </el-main>
     </el-container>
   </el-container>
+  </template>
 </template>
 
 <style scoped>
@@ -305,6 +424,58 @@ const backend = computed(() => {
 .menu {
   border-right: none;
   flex: 1;
+  --el-menu-item-height: 40px;
+  --el-menu-sub-menu-title-height: 40px;
+}
+
+/* 顶层条目与分组标题统一胶囊样式 */
+.menu :deep(.el-menu-item),
+.menu :deep(.el-sub-menu__title) {
+  margin: 2px 10px;
+  border-radius: var(--wb-radius-sm);
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.menu :deep(.el-menu-item:hover),
+.menu :deep(.el-sub-menu__title:hover) {
+  background: var(--wb-primary-soft-2);
+}
+
+.menu :deep(.el-menu-item.is-active) {
+  background: var(--wb-primary-soft);
+  color: var(--wb-primary);
+  font-weight: 600;
+}
+
+/* 一级（分组）标题：比子项大一号 + 加粗 + 主文字色——层级从「字大」体现，
+   不再用「字小弱化」的反向做法（曾导致一级比二级还小、没有存在感）。 */
+.menu :deep(.el-sub-menu__title) {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--wb-text);
+  letter-spacing: 0.02em;
+}
+
+/* 分组内有激活项：整行品牌高亮，与激活条目同一套视觉语言
+   （不挂 is-opened——默认全展开时会三个组一起亮，反而花）。 */
+.menu :deep(.el-sub-menu.is-active > .el-sub-menu__title) {
+  background: var(--wb-primary-soft);
+  color: var(--wb-primary);
+  font-weight: 600;
+}
+
+/* 二级子条目：略缩进、字号略小，层级一眼可辨 */
+.menu :deep(.el-sub-menu .el-menu-item) {
+  padding-left: 46px !important;
+  height: 36px;
+  line-height: 36px;
+  font-size: 13px;
+}
+
+/* 折叠态：条目紧凑、留出图标列对齐（Element Plus 折叠时自带 el-menu--collapse 类） */
+.menu.el-menu--collapse :deep(.el-sub-menu__title),
+.menu.el-menu--collapse :deep(.el-menu-item) {
+  margin: 2px 6px;
 }
 
 /* nav 是侧边栏的 flex 子元素，必须由它撑开剩余高度，

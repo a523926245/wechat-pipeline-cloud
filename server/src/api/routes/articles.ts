@@ -18,11 +18,17 @@ import { unpackJson } from '../../db-json.ts';
 import { BadRequestError, NotFoundError } from '../../errors.ts';
 import { parseArticle } from '../../services/parse/index.ts';
 import { renderArticle } from '../../services/render/index.ts';
+import { buildLocalComicPreview } from '../../services/render/comic.ts';
 import { pushArticleToDraft } from '../../services/publisher.ts';
 import { lintArticle } from '../../services/lint.ts';
 import { generateCoverForArticle } from '../../services/cover.ts';
 import { toRelativeCoverPath } from '../../services/content-path.ts';
+import { assertAccountAccess, assertArticleAccess, isAdmin, requirePrincipal } from '../../services/ownership.ts';
+import { deleteArticleById } from '../../services/article-delete.ts';
+import { loadTrackRule } from '../../services/style-prompts.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { bulkDeleteSchema, runBulkDelete } from '../bulk-delete.ts';
+import { requirePermission } from '../permissions.ts';
 import { createComicDraft } from '../../services/comic/write.ts';
 import {
   isComicGenerating,
@@ -32,6 +38,15 @@ import {
 } from '../../services/comic/panels.ts';
 
 export const articlesRouter: Router = Router();
+
+// P2 RBAC：按 method+path 分发权限点（member 不改稿 → PUT 走 content:revise 仅 admin）
+articlesRouter.use((req, res, next) => {
+  const p = req.path;
+  if (req.method === 'GET') return requirePermission('data:view')(req, res, next);
+  if (/^\/\d+\/push$/.test(p)) return requirePermission('content:push')(req, res, next);
+  if (req.method === 'PUT') return requirePermission('content:revise')(req, res, next);
+  return requirePermission('content:generate')(req, res, next);
+});
 
 const idParam = z.coerce.number().int().positive();
 
@@ -82,8 +97,10 @@ const comicCreateSchema = z.object({
 articlesRouter.post(
   '/comic/create',
   asyncHandler(async (req, res) => {
+    const principal = requirePrincipal(req);
     const body = comicCreateSchema.parse(req.body);
-    const account = await prisma.account.findUnique({ where: { id: body.accountId } });
+    const account = await prisma.oAAccount.findUnique({ where: { id: body.accountId } });
+    assertAccountAccess(principal, account, body.accountId);
     if (!account) throw new NotFoundError(`账号 ${body.accountId} 不存在`);
     const angle = await prisma.angle.findUnique({ where: { id: body.angleId } });
     if (!angle) throw new NotFoundError(`选题 ${body.angleId} 不存在`);
@@ -172,12 +189,13 @@ articlesRouter.post(
   asyncHandler(async (req, res) => {
     const body = createSchema.parse(req.body);
 
-    // 账号必须真实存在，否则文章会挂到一个已被删除的账号上、永远推不出去。
+    // 账号必须真实存在且归属当前用户（P3），否则文章会挂到他人账号上。
     if (body.accountId != null) {
-      const acc = await prisma.account.findUnique({
+      const acc = await prisma.oAAccount.findUnique({
         where: { id: body.accountId },
-        select: { id: true },
+        select: { id: true, ownerUserId: true },
       });
+      assertAccountAccess(requirePrincipal(req), acc, body.accountId);
       if (!acc) throw new NotFoundError(`账号 ${body.accountId} 不存在`);
     }
 
@@ -240,11 +258,14 @@ articlesRouter.get(
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 100) : 20;
     const offset = Number.isFinite(offsetRaw) ? Math.max(offsetRaw, 0) : 0;
 
+    const principal = requirePrincipal(req);
     const where: Record<string, unknown> = {};
     if (status) where.status = status;
     if (accountId && Number.isFinite(accountId)) where.accountId = accountId;
     if (angleId && Number.isFinite(angleId)) where.angleId = angleId;
     if (pipeline) where.pipeline = pipeline;
+    // P3 归属过滤：member 只见自己账号名下的文章
+    if (!isAdmin(principal)) where.account = { ownerUserId: principal.userId ?? -1 };
 
     const [rows, total] = await Promise.all([
       prisma.article.findMany({
@@ -270,7 +291,7 @@ articlesRouter.get(
 
     const accIds = [...new Set(rows.map((r) => r.accountId).filter((x): x is number => x != null))];
     const accs = accIds.length
-      ? await prisma.account.findMany({ where: { id: { in: accIds } }, select: { id: true, name: true } })
+      ? await prisma.oAAccount.findMany({ where: { id: { in: accIds } }, select: { id: true, name: true } })
       : [];
     const nameById = new Map(accs.map((a) => [a.id, a.name] as const));
 
@@ -298,7 +319,8 @@ articlesRouter.get(
   '/:id',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
-    const a = await prisma.article.findUnique({ where: { id } });
+    const a = await prisma.article.findUnique({ where: { id }, include: { account: { select: { ownerUserId: true } }, track: { select: { name: true } } } });
+    assertArticleAccess(requirePrincipal(req), a, id);
     if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
     res.json({
       id: a.id,
@@ -330,34 +352,42 @@ articlesRouter.get(
  * 删除单篇文章。角度回收语义与 deleteAccount 一致：
  *  - 未送达微信（draft/updated/failed）的文章，其占用的角度归还池中，可再次选题；
  *  - 已推送（pushed）的不归还，否则同一选题会被再写一遍。
+ *
+ * 语义实现放在 services/article-delete.ts：批量删除复用同一份规则，避免两边漂移。
  */
 articlesRouter.delete(
   '/:id',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
-    const result = await prisma.$transaction(async (tx) => {
-      const a = await tx.article.findUnique({
-        where: { id },
-        select: { id: true, title: true, status: true, angleId: true },
-      });
-      if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
-
-      let recycledAngle = false;
-      if (a.status !== 'pushed' && a.angleId != null) {
-        // 用 updateMany 而非 update：选题可能已被手动删除（那时 angleId 会先被置空，
-        // 但并发读到旧值时 update 会抛 P2025 变成 500）。updateMany 找不到就影响 0 行。
-        const back = await tx.angle.updateMany({
-          where: { id: a.angleId },
-          data: { used: false, usedBy: '', usedDate: null },
-        });
-        recycledAngle = back.count > 0;
-      }
-
-      await tx.article.delete({ where: { id } });
-      return { id: a.id, title: a.title, recycledAngle };
-    });
-
+    const principal = requirePrincipal(req);
+    const result = await deleteArticleById(id, principal);
     res.json({ ok: true, ...result });
+  }),
+);
+
+/**
+ * 批量删除文章。
+ *
+ * 与单条删除共用 services/article-delete.ts 的角度回收规则。
+ * 逐条独立执行：一条失败不影响其余，失败原因原样返回给前端展示。
+ *
+ * 路由顺序：'/bulk-delete' 是字母路径，必须排在 '/:id(\\d+)' 之前
+ * （虽然数字约束本身也能挡住，但按项目约定固定路径一律前置）。
+ */
+articlesRouter.post(
+  '/bulk-delete',
+  asyncHandler(async (req, res) => {
+    const { ids } = bulkDeleteSchema.parse(req.body ?? {});
+    const principal = requirePrincipal(req);
+    const result = await runBulkDelete(
+      ids,
+      async (id) => {
+        const r = await deleteArticleById(id, principal);
+        return { recycledAngles: r.recycledAngle ? 1 : 0 };
+      },
+      '文章',
+    );
+    res.json(result);
   }),
 );
 
@@ -366,7 +396,8 @@ articlesRouter.get(
   '/:id/preview',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
-    const a = await prisma.article.findUnique({ where: { id } });
+    const a = await prisma.article.findUnique({ where: { id }, include: { account: { select: { ownerUserId: true } }, track: { select: { name: true } } } });
+    assertArticleAccess(requirePrincipal(req), a, id);
     if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
     const { parsed, rendered } = await build(a.contentHtml, {});
 
@@ -377,20 +408,37 @@ articlesRouter.get(
       const pending = await prisma.comicPanel.count({
         where: { articleId: id, status: { not: 'success' } },
       });
-      const ready = pending === 0 && !!a.contentWechat;
+      // 已落库的推送产物（微信图床 URL）优先，维持「预览 = 推送产物」
+      let contentWechat: string | null = pending === 0 && a.contentWechat ? a.contentWechat : null;
+      const comicReady = contentWechat !== null;
+      let message = '';
+      if (pending === 0 && contentWechat === null) {
+        // 全格成功但尚未上传（本地开发常见：出口 IP 不在微信白名单，上传撞 40164）→
+        // 用本地文件组同序「金句卡 + 插图」序列：预览立即可见，推送时仍替换为图床 URL
+        const local = await buildLocalComicPreview(a);
+        if (local.ok) {
+          contentWechat = local.html;
+          message = '本地预览：图片为本地文件（未上传微信），推送时自动替换为图床链接';
+        } else {
+          message = local.message;
+        }
+      } else if (!comicReady) {
+        message = `插图未就绪（还差 ${pending} 格），当前显示的是台词脚本`;
+      }
       res.json({
         id: a.id,
         title: a.title,
         digest: a.digest,
-        contentWechat: ready ? a.contentWechat : rendered.contentWechat,
+        contentWechat: contentWechat ?? rendered.contentWechat,
         h2Count: parsed.h2Count,
         pCount: parsed.pCount,
         charCount: parsed.charCount,
         boldCount: parsed.boldCount,
         warnings: parsed.warnings,
-        comicReady: ready,
+        // comicReady 语义不变：是否为落库的推送产物（本地预览=false，推送门禁不受影响）
+        comicReady,
         comicPending: pending,
-        message: ready ? '' : `插图未就绪（还差 ${pending} 格），当前显示的是台词脚本`,
+        message,
       });
       return;
     }
@@ -406,7 +454,7 @@ articlesRouter.get(
       boldCount: parsed.boldCount,
       warnings: parsed.warnings,
       // 成稿体检：与推送门禁同一套规则，改稿页据此提示「现在能不能推、还差什么」。
-      lint: a.pipeline === 'comic' ? null : lintArticle(a.contentHtml, parsed),
+      lint: a.pipeline === 'comic' ? null : lintArticle(a.contentHtml, parsed, a.track?.name ?? '', (await loadTrackRule(a.track?.name ?? '')).checks),
     });
   }),
 );
@@ -419,9 +467,12 @@ articlesRouter.get(
   '/:id/lint',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
-    const a = await prisma.article.findUnique({ where: { id } });
+    const a = await prisma.article.findUnique({ where: { id }, include: { account: { select: { ownerUserId: true } }, track: { select: { name: true } } } });
+    assertArticleAccess(requirePrincipal(req), a, id);
     if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
-    const lint = a.pipeline === 'comic' ? null : lintArticle(a.contentHtml);
+    const trackName = a.track?.name ?? '';
+    const lint =
+      a.pipeline === 'comic' ? null : lintArticle(a.contentHtml, undefined, trackName, (await loadTrackRule(trackName)).checks);
     res.json({ id: a.id, pipeline: a.pipeline, lint });
   }),
 );
@@ -432,7 +483,8 @@ articlesRouter.put(
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
     const body = updateContentSchema.parse(req.body);
-    const a = await prisma.article.findUnique({ where: { id } });
+    const a = await prisma.article.findUnique({ where: { id }, include: { account: { select: { ownerUserId: true } }, track: { select: { name: true } } } });
+    assertArticleAccess(requirePrincipal(req), a, id);
     if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
 
     const { parsed, rendered } = await build(body.contentHtml, {});
@@ -473,7 +525,7 @@ articlesRouter.put(
       boldCount: parsed.boldCount,
       status: updated.status,
       warnings: parsed.warnings,
-      lint: a.pipeline === 'comic' ? null : lintArticle(body.contentHtml, parsed),
+      lint: a.pipeline === 'comic' ? null : lintArticle(body.contentHtml, parsed, a.track?.name ?? '', (await loadTrackRule(a.track?.name ?? '')).checks),
     });
   }),
 );
@@ -487,6 +539,9 @@ articlesRouter.post(
   '/:id/push',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
+    // P3 入口层归属校验（pushArticleToDraft 服务层另有兜底）
+    const pa = await prisma.article.findUnique({ where: { id }, select: { accountId: true, account: { select: { ownerUserId: true } } } });
+    assertArticleAccess(requirePrincipal(req), { accountId: pa?.accountId ?? null, account: pa?.account ?? null }, id);
     const result = await pushArticleToDraft(id);
     res.status(200).json(result);
   }),
@@ -510,6 +565,8 @@ articlesRouter.post(
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
     const body = coverSchema.parse(req.body ?? {});
+    const pa = await prisma.article.findUnique({ where: { id }, select: { accountId: true, account: { select: { ownerUserId: true } } } });
+    assertArticleAccess(requirePrincipal(req), { accountId: pa?.accountId ?? null, account: pa?.account ?? null }, id);
     const result = await generateCoverForArticle(id, body);
     res.status(200).json(result);
   }),

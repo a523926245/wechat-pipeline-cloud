@@ -1,0 +1,53 @@
+# CI：双端 typecheck/build + 冒烟（串行——共享同一个 SQLite，绝不并行跑 smoke）。
+# smoke:models 会清模型表，CI 里模型表为空可直接跑；真实环境参考 README 恢复说明。
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - run: npm run schema:sqlite
+      - run: npm run sqlite:generate
+      - run: npm run sqlite:push
+      - run: npm run typecheck
+      # 冒烟必须串行（SQLite 单写者）；SMOKE_NO_AUTH 由各脚本自行设置
+      - run: npm run smoke:auth
+      - run: npm run smoke:users
+      - run: npm run smoke:ownership
+      - run: npm run smoke:lint
+      - run: npm run smoke:angles
+      - run: npm run smoke:style
+      - run: npm run smoke:migrate
+      - run: npm run smoke:cover
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      # build 内含 vue-tsc；单独 typecheck 一次让报错更早出现（两步串行，勿并行）
+      - run: npm run typecheck
+      - run: npm run build

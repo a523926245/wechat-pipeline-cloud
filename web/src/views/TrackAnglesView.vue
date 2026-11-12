@@ -29,6 +29,7 @@ import { useRoute, useRouter } from "vue-router";
 
 import { errMsg } from "../api/http.ts";
 import {
+  bulkDeleteAngles,
   createAngle,
   deleteAngle,
   expandTrackAngles,
@@ -39,13 +40,11 @@ import {
   releaseAngle,
   updateAngle,
 } from "../api/index.ts";
+import BatchBar from "../components/BatchBar.vue";
 import StateError from "../components/StateError.vue";
 import RowActions, { type RowAction } from "../components/RowActions.vue";
-import type {
-  AngleItem,
-  AngleScopeFilter,
-  AngleUsedFilter,
-} from "../types.ts";
+import { useBatchDelete } from "../composables/useBatchDelete.ts";
+import type { AngleItem, AngleScopeFilter, AngleUsedFilter } from "../types.ts";
 import { angleScopeText } from "../utils/format.ts";
 
 /** 用途选项：与后端 Angle.scope 一一对应，文案由 /api/pipelines 下发（有兜底）。 */
@@ -146,7 +145,12 @@ const reassigning = ref(false);
 async function loadOffIpCount() {
   if (invalidId.value) return;
   try {
-    const res = await listAngles({ trackId: trackId.value, scope: "comic", offIp: true, limit: 1 });
+    const res = await listAngles({
+      trackId: trackId.value,
+      scope: "comic",
+      offIp: true,
+      limit: 1,
+    });
     offIpComicCount.value = res.total;
   } catch {
     offIpComicCount.value = 0;
@@ -393,6 +397,53 @@ async function remove(row: AngleItem) {
 }
 
 /**
+ * 批量删除：与单条删除同一套语义（删除即从池中移除，关联文章只解绑、正文保留）。
+ * 提示要说清「有多少条正在被文章用着」——这是删除后不可逆的部分。
+ */
+const angleTableRef = ref<{ clearSelection: () => void } | null>(null);
+
+const batch = useBatchDelete<AngleItem>({
+  idOf: (row) => row.id,
+  api: bulkDeleteAngles,
+  tableRef: angleTableRef,
+  impact: (rows) => {
+    const usedCount = rows.filter((r) => r.used).length;
+    const linked = rows.reduce((s, r) => s + (r.articleCount ?? 0), 0);
+    const parts: string[] = [];
+    if (usedCount > 0) {
+      parts.push(`其中 ${usedCount} 条已被文章占用，删除后这些选题将从池中消失（不可恢复）。`);
+    }
+    if (linked > 0) {
+      parts.push(
+        `关联的 ${linked} 篇文章只会解除选题关联，正文与配图不受影响。`,
+      );
+    }
+    if (parts.length === 0) parts.push("删除后不可恢复。");
+    return parts.join("\n");
+  },
+  title: "批量删除选题",
+  reload: async (res) => {
+    // 删空当前页时回退一页，否则停在空页
+    const remain = items.value.length - res.deleted;
+    if (remain <= 0 && page.value > 1) {
+      setQuery({ page: page.value - 1 });
+    } else {
+      await load();
+    }
+  },
+});
+
+/**
+ * 换筛选条件（不是翻页）时清空勾选。
+ *
+ * reserve-selection 会让勾选跨数据刷新保留——翻页时这是想要的（跨页攒一批），
+ * 但换筛选后旧勾选指向的是另一个结果集，留着会让用户删到看不见的选题。
+ */
+watch([used, keyword, scope], () => {
+  batch.clearSelection();
+});
+
+/**
  * 归还孤儿选题：已用但 0 关联文章（典型：已推送的文章被删后按设计不自动归还）。
  * 手动确认后重置回未用池，让该选题可再次被排产选用。
  */
@@ -456,7 +507,11 @@ function angleActions(row: AngleItem): RowAction[] {
     });
   }
   if (cur !== "comic") {
-    actions.push({ command: "scope:comic", label: "设为漫画专用", loading: busy });
+    actions.push({
+      command: "scope:comic",
+      label: "设为漫画专用",
+      loading: busy,
+    });
   }
   if (cur !== "article") {
     actions.push({
@@ -520,7 +575,9 @@ function onAngleCommand(cmd: string, row: AngleItem) {
       </div>
       <div class="wb-page-actions">
         <el-button :icon="Refresh" @click="load">刷新</el-button>
-        <el-button :icon="MagicStick" @click="openExpand">AI 扩充选题</el-button>
+        <el-button :icon="MagicStick" @click="openExpand"
+          >AI 扩充选题</el-button
+        >
         <el-button @click="backToTracks">返回赛道</el-button>
         <el-button type="primary" :icon="Plus" @click="openCreate"
           >新增选题</el-button
@@ -538,10 +595,16 @@ function onAngleCommand(cmd: string, row: AngleItem) {
       title="漫画产线选题体检"
     >
       <span class="wb-secondary">
-        有 {{ offIpComicCount }} 条漫画选题含 IP 外人物（奶奶 / 婆婆 / 老师等）。
-        漫画画面只由「爸爸 / 妈妈 / 哥哥 / 弟弟」出演，这类选题会被硬画成爸妈，导致图文不符。
+        有 {{ offIpComicCount }} 条漫画选题含 IP 外人物（奶奶 / 婆婆 /
+        老师等）。 漫画画面只由「爸爸 / 妈妈 / 哥哥 /
+        弟弟」出演，这类选题会被硬画成爸妈，导致图文不符。
       </span>
-      <el-button link type="primary" :loading="reassigning" @click="reassignOffIp">
+      <el-button
+        link
+        type="primary"
+        :loading="reassigning"
+        @click="reassignOffIp"
+      >
         一键退回文章专用
       </el-button>
     </el-alert>
@@ -578,7 +641,11 @@ function onAngleCommand(cmd: string, row: AngleItem) {
           </el-select>
         </el-form-item>
         <el-form-item label="用途" class="wb-filter-item">
-          <el-select v-model="scopeInput" placeholder="全部" style="width: 120px">
+          <el-select
+            v-model="scopeInput"
+            placeholder="全部"
+            style="width: 120px"
+          >
             <el-option label="全部" value="all" />
             <el-option
               v-for="s in SCOPE_OPTIONS"
@@ -605,9 +672,27 @@ function onAngleCommand(cmd: string, row: AngleItem) {
         </el-form-item>
       </el-form>
 
+      <!-- 批量操作条：有勾选时才出现 -->
+      <BatchBar
+        :count="batch.count.value"
+        :loading="batch.deleting.value"
+        @delete="batch.runBatchDelete()"
+        @clear="batch.clearSelection()"
+      />
+
       <!-- 宽度约定：数字/状态列固定 width；文本列用 min-width + show-overflow-tooltip——
            min-width 列会按比例分摊表格剩余宽度（自适应撑满），只有挤不下时才出省略号 -->
-      <el-table v-if="total" :data="items" size="default">
+      <el-table
+        v-if="total"
+        ref="angleTableRef"
+        :data="items"
+        size="default"
+        row-key="id"
+        @selection-change="batch.onSelectionChange"
+      >
+        <!-- reserve-selection：翻页后仍保留勾选（配合 row-key），
+             这样可以「第 1 页勾 5 条 → 第 3 页再勾 5 条 → 一次删 10 条」 -->
+        <el-table-column type="selection" width="46" reserve-selection />
         <el-table-column prop="id" label="ID" width="62" />
         <el-table-column label="主题" width="110" show-overflow-tooltip>
           <template #default="{ row }">
@@ -619,11 +704,11 @@ function onAngleCommand(cmd: string, row: AngleItem) {
         <el-table-column
           prop="content"
           label="选题内容"
-          min-width="260"
+          min-width="300"
           show-overflow-tooltip
         />
         <!-- 用途决定这条选题归哪条产线：漫画线只吃「漫画专用/共享」 -->
-        <el-table-column label="用途" width="96">
+        <el-table-column label="用途" width="200">
           <template #default="{ row }">
             <el-tag
               :type="scopeTagType(row.scope)"
@@ -771,7 +856,8 @@ function onAngleCommand(cmd: string, row: AngleItem) {
             </el-radio>
           </el-radio-group>
           <div class="wb-muted scope-hint">
-            漫画产线只吃「漫画专用 / 共享」；想让漫画线用上这批选题，选这两项之一。
+            漫画产线只吃「漫画专用 /
+            共享」；想让漫画线用上这批选题，选这两项之一。
           </div>
         </el-form-item>
       </el-form>

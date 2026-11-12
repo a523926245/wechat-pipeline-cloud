@@ -105,7 +105,7 @@ async function main(): Promise<void> {
       continue;
     }
 
-    const data = {
+    const data: Record<string, unknown> = {
       name: spec.name,
       vendor: spec.vendor,
       protocol: spec.protocol,
@@ -119,6 +119,15 @@ async function main(): Promise<void> {
     };
 
     const found = await prisma.llmModel.findFirst({ where: { modelId: spec.modelId } });
+    if (found) {
+      // ⚠️ 不覆写库里已有的非空 Key（2026-11-11 教训：本脚本曾把用户在界面改过的 Key
+      // 静默回写成 env 令牌——「密匙被覆盖」）。env 令牌只在库里 Key 为空时才补。
+      if (found.apiKeyEnc && found.apiKeyEnc.length > 0) {
+        delete data.apiKeyEnc;
+        delete data.apiKeyMask;
+        console.log('  保留界面已配置的 API Key（不回写 env 令牌）');
+      }
+    }
     const model = found
       ? await prisma.llmModel.update({ where: { id: found.id }, data })
       : await prisma.llmModel.create({ data: data as never });

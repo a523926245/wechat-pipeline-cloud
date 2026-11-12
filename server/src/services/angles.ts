@@ -25,7 +25,9 @@ import { BadRequestError, NotFoundError } from '../errors.ts';
 import { logger } from '../logger.ts';
 import { assertRoleUsable, chatComplete } from './llm.ts';
 import { findOffIpWords, ipCharacterBrief, loadComicTemplates } from './comic/script.ts';
+import { loadGlobalPrompt } from './style-prompts.ts';
 import type { AngleScope } from './pipeline.ts';
+import { ruleFor } from './track-rules.ts';
 
 /** 生成 scope=x 的选题时，会被同一产线同时看到的切片（用来决定「喂哪些现有选题给模型避重」）。 */
 function visibleScopes(scope: AngleScope): AngleScope[] {
@@ -41,6 +43,8 @@ export interface ExpandResult {
   added: number;
   /** 因与现有选题或本批次内重复而跳过的条数 */
   skippedDuplicate: number;
+  /** 因违反正能量守门（心理标签/纯困境结尾）被确定性过滤的条数 */
+  skippedOffensive: number;
   /** 模型返回的原始条数（可能少于请求数） */
   generated: number;
   /** 本批入库的角度切片（article / comic / shared）。 */
@@ -157,12 +161,44 @@ function scopeBrief(scope: AngleScope): string {
   );
 }
 
+/**
+ * 星座赛道的选题形态：**刻意与其它赛道不同**。
+ *
+ * 为什么要单独一套：通用规则要求「每条结尾留一个指向方法的钩子（怎么/如何/怎么办）」，
+ * 这条规则在育儿/职场/教育是对的（读者来是为了解决问题），在星座赛道是错的——
+ * 它会把选题逼成「XX座遇到某个职场困境，该怎么办」的**问题咨询式**题目。
+ * 实测星座角度库里的 9 条全是这一形态（老板误判、团队进度、向父母坦白、室友边界…），
+ * 于是成稿也全是职场沟通文：星座只是标题里的一个标签，正文在讲 PPT 和微信消息。
+ *
+ * 星座读者要的是「被说中」与「好玩」，不是「来问怎么办」。所以钩子换成：
+ * 反差、误解、具体行为切片、或一个能对号入座的选择题。
+ */
+const ZODIAC_ANGLE_RULES = [
+  '',
+  '⚠️ **星座赛道专用规则（覆盖上面的通用选题补充）**：',
+  '1. **不写「问题咨询式」题目**。禁止「遇到X该怎么办」「如何向Y解释」「怎么平衡Z」这种句式。',
+  '   星座读者不是来解决问题的，是来被说中的、来看热闹的。',
+  '2. 题面必须**挂在星座/星象上**：出现星座名（水逆期、土星回归、新月、满月、火象…）或某个具体星座。',
+  '3. 题面要有**一个具体的画面或行为切片**，不是性格形容词。',
+  '   ✅「水逆第三天，他把已读不回包装成了在忙」　❌「水逆期间容易情绪混乱」',
+  '4. 钩子换成以下四种之一（替代通用规则里的「怎么/如何/怎么办」）：',
+  '   - 反差型：都说XX座怎样，其实他们……',
+  '   - 误解型：被误解最深的那一点是……',
+  '   - 行为切片型：XX座在[具体场景]下的反应是……',
+  '   - 对号入座型：你是哪一种？',
+  '5. 禁止把职场/课业/绩效/升职写成需要「高情商沟通」才能解决的情境。',
+  '   星座可以谈工作，但要谈**这个星座在职场里的样子**，不是谈「怎么跟老板沟通」。',
+  '6. theme 用星座/天象/关系场景词（水逆、上升、月亮、双鱼、加班、消息、闺蜜），',
+  '   不要用职场黑话（汇报、绩效、向上管理）。',
+].join('\n');
+
 function buildMessages(
   trackName: string,
   count: number,
   existing: string[],
   seed: string | undefined,
   scope: AngleScope,
+  globalPrompt: string,
 ): { role: 'system' | 'user'; content: string }[] {
   const avoid =
     existing.length > 0
@@ -172,6 +208,23 @@ function buildMessages(
       : '\n\n该赛道目前还没有任何选题，请从零开始给出第一批。';
 
   const seedPart = seed?.trim() ? `\n\n本批希望侧重这些方向（供参考，不必逐条对应）：${seed.trim()}` : '';
+
+  // 创作总纲（文风配置页可改）：题库素材同样必须正能量——不贩卖焦虑、落点指向方法或成长。
+  // 2026-11-11 用户要求「素材库-题库的素材也要是正能量的」，与写稿共用同一份总纲。
+  // 同日二次硬化：产出仍出现纯困境结尾与心理标签（「分离焦虑」等），补硬约束 + 确定性过滤。
+  const charter = globalPrompt.trim()
+    ? `\n\n创作总纲（选题必须满足，与写稿同一份总纲）：\n${globalPrompt.trim()}` +
+      '\n选题补充：题面可以有真实冲突或两难，但**必须能落到方法、希望或成长**——' +
+      '不选「不这么做孩子就完了」式恐吓题，不选只放大痛苦却没有出路的题。' +
+      '每条的结尾必须留一个指向方法的钩子（怎么开口/怎么办/如何化解这类问法），' +
+      '不许停在僵局或纯负面情绪上；theme 主题词用具体场景或关系词，' +
+      '禁止心理病理标签（焦虑症、分离焦虑、抑郁、创伤等）。'
+    : '\n\n创作总纲（选题必须满足）：正能量——不贩卖焦虑、不放大痛苦；' +
+      '题面可以有冲突，但要能落到方法、希望或成长，结尾必须留指向方法的钩子。';
+
+  // 选题形态由 `r:{赛道}.angleMode` 决定，代码里不再有赛道名判断。
+  // zodiac：通用 charter 的「方法钩子」要求会把选题逼成问题咨询式，单独换一套。
+  const charterFinal = ruleFor(trackName).angleMode === 'zodiac' ? charter + ZODIAC_ANGLE_RULES : charter;
 
   return [
     {
@@ -184,6 +237,7 @@ function buildMessages(
       role: 'user',
       content:
         `赛道主题：${trackName}` +
+        charterFinal +
         avoid +
         seedPart +
         `\n\n用途要求：${scopeBrief(scope)}` +
@@ -193,9 +247,75 @@ function buildMessages(
         `\n1. 每条 content 一句话，20~60 字，要有可感知的具体场景（人物、动作、处境），并暗含冲突、反差或两难，不要写成空泛的道理` +
         `\n2. 各条之间角度必须不同，不得换汤不换药` +
         `\n3. 严禁与上面「已有选题」重复或高度相似` +
-        `\n4. 只输出这 ${count} 条，不要多也不要少，不要编号以外的内容`,
+        `\n4. 每条结尾必须留一个指向方法的钩子（「怎么…」「如何…」「怎么办」「该不该…」这类问法），不许停在僵局或纯情绪上` +
+        `\n5. theme 主题词用具体场景或关系词（如二胎/手机/开家长会），禁止心理病理标签（焦虑症、分离焦虑、抑郁、创伤等）` +
+        `\n6. 只输出这 ${count} 条，不要多也不要少，不要编号以外的内容`,
     },
   ];
+}
+
+/**
+ * 选题正能量守门（确定性过滤，提示词约束之外的第二道闸）。
+ * 2026-11-11 用户复核「不贩卖焦虑」发现产出混入纯困境结尾与心理标签，补此闸：
+ *   ① theme 含心理病理标签 → 拒收（改用场景/关系词）
+ *   ② 结尾（末 24 字）没有方法钩子 → 拒收（停在僵局/纯情绪=只放大痛苦没出路）
+ * 返回拒收原因；合规返回 null。
+ */
+const BANNED_THEME_RE = /(焦虑症|分离焦虑|抑郁|创伤|心理障碍|人格障碍|成瘾|自残|自杀|惊恐|强迫症)/;
+const METHOD_HOOK_RE = /(怎么|如何|怎么办|办法|该不该|要不要|怎样|试试|开口|沟通|化解|收场|下一步|出路|和解|挽回|改善|面对|处理|安慰|拒绝|商量)/;
+
+/**
+ * 星座赛道的钩子：**不要求**「怎么/如何/怎么办」。
+ *
+ * 通用规则要求方法钩子，是为了防止选题停在纯困境（育儿/职场读者来是为了解决问题）。
+ * 星座赛道的钩子换成反差/误解/行为切片/对号入座——见 ZODIAC_ANGLE_RULES。
+ *
+ * ⚠️ 这里**不再**用「反差词白名单」做正向判定：实测那个做法很脆
+ * （「最先把话说完了」这类好角度被误杀，而「怕被误解为挑剔」这种坏角度漏过）。
+ * 确定性守门只拦**形态错误**（问题咨询式 / 疑问句 / 没有星座锚），
+ * 「有没有反差与行为切片」交给提示词——那是模型能执行、代码不能判的部分。
+ */
+/** 问题咨询式：星座赛道里这类题会直接产出「职场沟通文」。 */
+const CONSULT_QUESTION_RE =
+  /(怎么办|该如何|如何|该怎么|怎么(?:办|做|破|处理|开口|沟通|应对|解决|平衡|收拾|圆场|解释|表达)|该不该|要不要)/;
+/** 星座/星象锚：题目必须挂在星座上，否则写出来是别的赛道。 */
+const ZODIAC_ANCHOR_RE = /(星座|水逆|逆行|满月|新月|上升|下降|太阳|月亮|金星|火星|水星|木星|土星|天王星|海王星|冥王星|守护星|宫位|相位|落陷|元素|火象|风象|水象|土象|白羊|金牛|双子|巨蟹|狮子|处女|天秤|天蝎|射手|摩羯|水瓶|双鱼)/;
+/** 星座题目太短 = 一个干巴巴的标签（没有画面），不是选题。 */
+const ZODIAC_MIN_LEN = 12;
+
+/**
+ * 选题守门。
+ *
+ * @param trackName 赛道名：按 `r:{赛道}.angleMode` 选择守门形态（zodiac 走星座规则）。
+ */
+export function topicRejectReason(
+  c: { theme?: string; content?: string },
+  trackName = '',
+): string | null {
+  const theme = (c.theme ?? '').trim();
+  const content = (c.content ?? '').trim();
+  if (!content) return '内容为空';
+  if (BANNED_THEME_RE.test(theme)) return `theme 含心理病理标签：${theme}`;
+
+  if (ruleFor(trackName).angleMode === 'zodiac') {
+    if (CONSULT_QUESTION_RE.test(content)) {
+      return '星座选题不许写成问题咨询式（怎么办/如何…）：星座读者要的是被说中，不是来求解';
+    }
+    if (/[？?]\s*$/.test(content)) {
+      return '星座选题不许用疑问句收尾（那是提问，不是选题）';
+    }
+    if (!ZODIAC_ANCHOR_RE.test(content)) {
+      return '星座选题必须挂在星座/星象上（缺星座名或天象词）';
+    }
+    if (content.length < ZODIAC_MIN_LEN) {
+      return `星座选题太短（${content.length} 字 < ${ZODIAC_MIN_LEN}）：要有一个具体画面，不是一个性格标签`;
+    }
+    return null;
+  }
+
+  const tail = content.slice(-24);
+  if (!METHOD_HOOK_RE.test(tail)) return '结尾没有方法钩子（停在僵局/纯情绪）';
+  return null;
 }
 
 /**
@@ -239,9 +359,12 @@ export async function expandAnglesForTrack(
     .slice(0, FEEDBACK_LIMIT)
     .map((a) => a.content);
 
+  // 创作总纲（文风配置页）：题库扩库与写稿共用同一份正能量约束。
+  const globalPrompt = await loadGlobalPrompt();
+
   const raw = await chatComplete(
     model,
-    buildMessages(track.name, want, existing, seed, scope),
+    buildMessages(track.name, want, existing, seed, scope, globalPrompt),
     { temperature: 0.9, maxTokens: 4000 },
   );
 
@@ -261,8 +384,16 @@ export async function expandAnglesForTrack(
     scope: string;
   }[] = [];
   let skippedDuplicate = 0;
+  let skippedOffensive = 0;
 
   for (const c of candidates) {
+    // 正能量守门：拒收纯困境结尾/心理标签题（比提示词更硬，模型不听话时兜底）
+    const reject = topicRejectReason(c, track.name);
+    if (reject) {
+      skippedOffensive += 1;
+      logger.warn({ trackId, theme: c.theme, reason: reject }, '选题被正能量守门拒收');
+      continue;
+    }
     const key = normalize(c.content);
     if (!key || seen.has(key)) {
       skippedDuplicate += 1;
@@ -291,7 +422,7 @@ export async function expandAnglesForTrack(
   ]);
 
   logger.info(
-    { trackId, track: track.name, model: model.name, scope, requested: want, added: rows.length, skippedDuplicate },
+    { trackId, track: track.name, model: model.name, scope, requested: want, added: rows.length, skippedDuplicate, skippedOffensive },
     '选题扩库完成',
   );
 
@@ -301,6 +432,7 @@ export async function expandAnglesForTrack(
     requested: want,
     added: rows.length,
     skippedDuplicate,
+    skippedOffensive,
     generated: candidates.length,
     scope,
     scopeUnused,
@@ -365,7 +497,7 @@ export async function releaseAngle(id: number): Promise<AngleReleaseResult> {
 
   await prisma.angle.update({
     where: { id },
-    data: { used: false, usedBy: '', usedDate: null },
+    data: { used: false, usedBy: '', usedDate: null, usedById: null, usedByAccountId: null },
   });
 
   const poolUnused = await prisma.angle.count({ where: { trackId: a.trackId, used: false } });
@@ -392,6 +524,9 @@ export interface AngleItem {
   used: boolean;
   usedBy: string;
   usedDate: string | null;
+  /** P3 结构化归属：谁（用户/账号）用掉的。 */
+  usedById: number | null;
+  usedByAccountId: number | null;
   source: string;
   /** 引用了该选题的文章数，删除提示要用 */
   articleCount: number;
@@ -456,6 +591,8 @@ type AngleRow = {
   used: boolean;
   usedBy: string;
   usedDate: string | null;
+  usedById: number | null;
+  usedByAccountId: number | null;
   source: string;
   createdAt: Date;
   updatedAt: Date;
@@ -476,6 +613,9 @@ function toItem(a: AngleRow): AngleItem {
     used: a.used,
     usedBy: a.usedBy,
     usedDate: a.usedDate,
+    // P3 结构化归属：谁（用户/账号）用掉的——管理排查与跨客户查重用
+    usedById: a.usedById ?? null,
+    usedByAccountId: a.usedByAccountId ?? null,
     source: a.source,
     articleCount: a._count.articles,
     offIp: findOffIpWords(`${a.theme ?? ''}${a.content ?? ''}`).length > 0,

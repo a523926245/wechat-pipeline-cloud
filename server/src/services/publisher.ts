@@ -26,6 +26,7 @@ import { packJson } from '../db-json.ts';
 import { todayKey } from '../lib/day.ts';
 import { logger } from '../logger.ts';
 import { lintArticle, lintSummary, type LintReport } from './lint.ts';
+import { loadTrackRule } from './style-prompts.ts';
 import { ensureComicAssetsReady } from './render/comic.ts';
 
 export type PushReason = 'no_account' | 'cred_not_ok' | 'empty_content' | 'lint_failed';
@@ -52,7 +53,12 @@ export interface PushResult {
  * 网络/微信错误不会抛出，全部收敛为 `ok:false` 的结果对象，便于调度器批量处理。
  */
 export async function pushArticleToDraft(articleId: number): Promise<PushResult> {
-  const a = await prisma.article.findUnique({ where: { id: articleId } });
+  // 带出 track.name：星座赛道要跑星座专属体检（像不像星座文章、教科书腔、跨星座复读）。
+  // 赛道名进体检而不是进代码分支，是为了让「星座规则」只存在于 style_dna.json 一处。
+  const a = await prisma.article.findUnique({
+    where: { id: articleId },
+    include: { track: { select: { name: true } } },
+  });
   if (!a) throw new NotFoundError(`文章 ${articleId} 不存在`);
 
   if (!a.accountId) {
@@ -64,7 +70,7 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
     };
   }
 
-  const account = await prisma.account.findUnique({ where: { id: a.accountId } });
+  const account = await prisma.oAAccount.findUnique({ where: { id: a.accountId } });
   if (!account) throw new NotFoundError(`账号 ${a.accountId} 不存在`);
 
   if (account.credStatus !== 'ok') {
@@ -107,7 +113,9 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
   // ── 成稿体检门禁（仅文章产线；漫画正文是图片序列，结构规则不同）──
   // 放在凭据校验之后：先确认「能推」，再判断「值不值得推」，免得白跑一次体检。
   if (a.pipeline !== 'comic' && a.contentHtml.trim()) {
-    const lint = lintArticle(a.contentHtml);
+    // 赛道专项检查按 `r:{赛道}` 配置走（不再是代码里的赛道名分支）。
+    const trackName = a.track?.name ?? '';
+    const lint = lintArticle(a.contentHtml, undefined, trackName, (await loadTrackRule(trackName)).checks);
     if (!lint.ok) {
       logger.warn(
         { articleId: a.id, errors: lint.errors.map((e) => e.code) },

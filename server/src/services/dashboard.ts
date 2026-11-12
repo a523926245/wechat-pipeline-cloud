@@ -228,7 +228,10 @@ export function groupByPipeline(rows: DashboardData['today']['byAccount']): Pipe
   });
 }
 
-export async function getDashboard(): Promise<DashboardData> {
+export async function getDashboard(ownerUserId?: number | null): Promise<DashboardData> {
+  // P3 归属过滤：ownerUserId 传入时只统计该用户自己的账号与名下文章；undefined/null=admin 全量
+  const accWhere = ownerUserId != null ? { ownerUserId } : {};
+  const artWhere = ownerUserId != null ? { account: { ownerUserId } } : {};
   const degraded: string[] = [];
   const today = todayStr();
   const dateObj = new Date();
@@ -246,14 +249,14 @@ export async function getDashboard(): Promise<DashboardData> {
       const [tracks, accounts, angleTotal, angleUnused, artTotal, artDraft, artPushed, artFailed, todayRows] =
         await Promise.all([
           prisma.track.count(),
-          prisma.account.findMany({ select: { enabled: true, credStatus: true } }),
+          prisma.oAAccount.findMany({ where: accWhere, select: { enabled: true, credStatus: true } }),
           prisma.angle.count(),
           prisma.angle.count({ where: { used: false } }),
-          prisma.article.count(),
-          prisma.article.count({ where: { status: 'draft' } }),
-          prisma.article.count({ where: { status: 'pushed' } }),
-          prisma.article.count({ where: { status: 'failed' } }),
-          prisma.article.findMany({ select: { createdAt: true } }),
+          prisma.article.count({ where: artWhere }),
+          prisma.article.count({ where: { ...artWhere, status: 'draft' } }),
+          prisma.article.count({ where: { ...artWhere, status: 'pushed' } }),
+          prisma.article.count({ where: { ...artWhere, status: 'failed' } }),
+          prisma.article.findMany({ where: artWhere, select: { createdAt: true } }),
         ]);
 
       const artToday = todayRows.filter((r) => dayKeyOf(r.createdAt) === today).length;
@@ -277,7 +280,7 @@ export async function getDashboard(): Promise<DashboardData> {
   const plan = await safe(
     'plan',
     null as Awaited<ReturnType<typeof buildPlan>> | null,
-    () => buildPlan(),
+    () => buildPlan(undefined, 3, ownerUserId),
     degraded,
   );
 
@@ -316,8 +319,18 @@ export async function getDashboard(): Promise<DashboardData> {
   const health = await safe('health', EMPTY_HEALTH, healthBlock, degraded);
 
   // ── 最近动态 ──
+  // P3：member 的动态只看自己账号的（TaskRun.accountId 无 FK，先取我的账号 id 集）
+  const myAccIds =
+    ownerUserId != null
+      ? (await prisma.oAAccount.findMany({ where: { ownerUserId }, select: { id: true } })).map((a) => a.id)
+      : null;
+
   const recentRuns = await safe('recentRuns', [] as DashboardData['recentRuns'], async () => {
-    const rows = await prisma.taskRun.findMany({ orderBy: { createdAt: 'desc' }, take: 12 });
+    const rows = await prisma.taskRun.findMany({
+      where: myAccIds ? { accountId: { in: myAccIds } } : {},
+      orderBy: { createdAt: 'desc' },
+      take: 12,
+    });
     return rows.map((r) => ({
       id: r.id,
       jobType: r.jobType,
@@ -331,7 +344,11 @@ export async function getDashboard(): Promise<DashboardData> {
   }, degraded);
 
   const recentLogs = await safe('recentLogs', [] as DashboardData['recentLogs'], async () => {
-    const rows = await prisma.runLog.findMany({ orderBy: { createdAt: 'desc' }, take: 15 });
+    const rows = await prisma.runLog.findMany({
+      where: myAccIds ? { taskRun: { accountId: { in: myAccIds } } } : {},
+      orderBy: { createdAt: 'desc' },
+      take: 15,
+    });
     return rows.map((r) => ({
       id: r.id,
       level: r.level,
@@ -343,6 +360,7 @@ export async function getDashboard(): Promise<DashboardData> {
 
   const recentArticles = await safe('recentArticles', [] as DashboardData['recentArticles'], async () => {
     const rows = await prisma.article.findMany({
+      where: artWhere,
       orderBy: { createdAt: 'desc' },
       take: 10,
       select: {
@@ -356,7 +374,7 @@ export async function getDashboard(): Promise<DashboardData> {
     });
     const accIds = [...new Set(rows.map((r) => r.accountId).filter((x): x is number => x != null))];
     const accs = accIds.length
-      ? await prisma.account.findMany({ where: { id: { in: accIds } }, select: { id: true, name: true } })
+      ? await prisma.oAAccount.findMany({ where: { id: { in: accIds } }, select: { id: true, name: true } })
       : [];
     const nameById = new Map(accs.map((a) => [a.id, a.name] as const));
     return rows.map((r) => ({
