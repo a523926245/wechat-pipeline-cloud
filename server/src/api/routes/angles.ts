@@ -28,8 +28,13 @@ import {
   updateAngle,
 } from '../../services/angles.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { bulkDeleteSchema, runBulkDelete } from '../bulk-delete.ts';
+import { requirePermission } from '../permissions.ts';
 
 export const anglesRouter: Router = Router();
+
+// P2 RBAC：本路由统一权限点
+anglesRouter.use(requirePermission('system:manage'));
 
 const ID_PATH = '/:id(\\d+)';
 const idParam = z.coerce.number().int().positive();
@@ -110,6 +115,30 @@ anglesRouter.post(
   asyncHandler(async (req, res) => {
     const body = z.object({ trackId: z.number().int().positive() }).parse(req.body ?? {});
     res.json(await reassignOffIpAngles(body.trackId));
+  }),
+);
+
+/**
+ * 批量删除选题。
+ *
+ * 复用 services/angles.ts 的 deleteAngle（同一套「解除文章关联后删选题」语义），
+ * 逐条独立执行：一条失败不影响其余，失败原因原样返回。
+ *
+ * 路由顺序：'/bulk-delete' 是字母路径，必须排在 '/:id(\\d+)' 之前。
+ */
+anglesRouter.post(
+  '/bulk-delete',
+  asyncHandler(async (req, res) => {
+    const { ids } = bulkDeleteSchema.parse(req.body ?? {});
+    const result = await runBulkDelete(
+      ids,
+      async (id) => {
+        const r = await deleteAngle(id);
+        return { unlinkedArticles: r.unlinkedArticles };
+      },
+      '选题',
+    );
+    res.json(result);
   }),
 );
 

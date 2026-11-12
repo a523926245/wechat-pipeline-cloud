@@ -17,6 +17,8 @@
  * 跑法：npm run smoke:p2（SQLite 单写者，必须与其他 smoke 串行）
  */
 
+// 冒烟旁路：本脚本带裸 fetch/静态请求，跳过 /api 鉴权（生产环境无效）。
+process.env.SMOKE_NO_AUTH = '1';
 import { createApp } from '../src/app.ts';
 import { prisma } from '../src/db.ts';
 import { COMIC_IMAGE } from '../src/config.ts';

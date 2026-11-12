@@ -29,7 +29,9 @@ import { runPipelineForAccount } from './planner.ts';
 import { processComicImages } from './comic/panels.ts';
 import { pushArticleToDraft } from './publisher.ts';
 
-/** 调度相关设置键。值以字符串存 Setting.v（与现有约定一致）。 */
+/** 调度相关设置键。值以字符串存 Setting.v（与现有约定一致）。
+ *  P4 后：scheduler_enabled 仍是**全局总开关**；scheduler_write_time/scheduler_push_enabled
+ *  降级为「无主账号（ownerUserId=null）」的兜底值 + 旧配置兼容，每用户看 User.automationMode/writeTime。 */
 const K_ENABLED = 'scheduler_enabled';
 const K_WRITE_TIME = 'scheduler_write_time';
 const K_PUSH_ENABLED = 'scheduler_push_enabled';
@@ -39,11 +41,28 @@ const DEFAULT_WRITE_TIME = '06:00';
 /** 合法的 HH:mm（小时 00-23、分钟 00-59）。仅校验 `\d{2}:\d{2}` 会把 25:99 这类值放行，导致永不触发。 */
 export const WRITE_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
+/** 每客户自动化模式（P4）。群发红线 AUTO_PUBLISH 与本开关解耦，永不动。 */
+export type AutomationMode = 'manual' | 'auto_draft' | 'auto_draft_push';
+
+export const AUTOMATION_MODES: AutomationMode[] = ['manual', 'auto_draft', 'auto_draft_push'];
+
+export const AUTOMATION_MODE_LABEL: Record<AutomationMode, string> = {
+  manual: '纯手动（只手动出稿/推送）',
+  auto_draft: '自动写稿（到点入库，人工审后手动推）',
+  auto_draft_push: '自动写稿 + 自动推草稿箱（全自动）',
+};
+
+/** 校验并归一化 automation_mode。非法值一律回落 manual（最安全）。 */
+export function normalizeAutomationMode(v: string | null | undefined): AutomationMode {
+  return (AUTOMATION_MODES as string[]).includes(v ?? '') ? (v as AutomationMode) : 'manual';
+}
+
 export interface SchedulerConfig {
+  /** 全局总开关（Setting.scheduler_enabled）。关了谁的 mode 都不动。 */
   enabled: boolean;
-  /** 每日写稿时间点，HH:mm（服务器本地时区）。 */
+  /** 无主账号（ownerUserId=null）的兜底写稿时间点。每用户看 User.writeTime。 */
   writeTime: string;
-  /** 是否级联推送草稿箱。并行期默认 false（dry-run）。 */
+  /** 无主账号的兜底是否级联推送。每用户看 User.automationMode。 */
   pushEnabled: boolean;
 }
 
@@ -142,7 +161,7 @@ export interface TickResult {
 
 /** 查询当前可排产账号（已启用且凭据就绪）。 */
 async function listReadyAccounts() {
-  return prisma.account.findMany({
+  return prisma.oAAccount.findMany({
     where: { enabled: true, credStatus: 'ok' },
     include: { track: true },
     orderBy: { id: 'asc' },
@@ -165,6 +184,38 @@ async function todayPipelineCounts(accountIds: number[]): Promise<Map<string, nu
     map.set(k, (map.get(k) ?? 0) + 1);
   }
   return map;
+}
+
+/**
+ * 每账号的自动化口径（P4 核心）：按账号 owner 查 User.automationMode/writeTime；
+ * 无主账号（ownerUserId=null，历史/冒烟）回落旧 Setting 三键（enabled+push_enabled 推导 mode）。
+ */
+export async function resolveAutomationForAccounts(
+  accounts: Array<{ id: number; ownerUserId: number | null }>,
+): Promise<Map<number, { mode: AutomationMode; writeTime: string }>> {
+  const out = new Map<number, { mode: AutomationMode; writeTime: string }>();
+  const ownerIds = [...new Set(accounts.map((a) => a.ownerUserId).filter((x): x is number => x != null))];
+  const users = ownerIds.length
+    ? await prisma.user.findMany({ where: { id: { in: ownerIds } }, select: { id: true, automationMode: true, writeTime: true } })
+    : [];
+  const byId = new Map(users.map((u) => [u.id, u] as const));
+  const legacy = await getSchedulerConfig();
+  for (const a of accounts) {
+    const u = a.ownerUserId != null ? byId.get(a.ownerUserId) : undefined;
+    if (u) {
+      out.set(a.id, {
+        mode: normalizeAutomationMode(u.automationMode),
+        writeTime: WRITE_TIME_RE.test(u.writeTime ?? '') ? u.writeTime : DEFAULT_WRITE_TIME,
+      });
+    } else {
+      // 无主账号：旧语义兜底（enabled 已在外层总开关判过，这里推导 push 与否）
+      out.set(a.id, {
+        mode: legacy.pushEnabled ? 'auto_draft_push' : 'auto_draft',
+        writeTime: legacy.writeTime,
+      });
+    }
+  }
+  return out;
 }
 
 /** 写一条运行日志到库，便于仪表盘查看最近动态。 */
@@ -205,33 +256,48 @@ export async function tick(force = false): Promise<TickResult> {
     return { ...base, reason: '调度未启用（scheduler_enabled=0）' };
   }
 
-  const dueMinutes = parseHm(cfg.writeTime);
-  const nowMinutes = now.getHours() * 60 + now.getMinutes();
-  const due = force || nowMinutes >= dueMinutes;
-  if (!due) {
-    return { ...base, reason: `未到写稿时间（${cfg.writeTime}）` };
-  }
-
   const accounts = await listReadyAccounts();
   if (accounts.length === 0) {
     await logRun('warn', 'scheduler', '无可排产账号（需已启用且凭据状态 ok）');
     return { ...base, due: true, reason: '无可排产账号（请先在凭据配置完成并连通测试）' };
   }
 
+  // P4：每账号按 owner 的 automation_mode/writeTime 分流（单进程 tick 服务全部用户）。
+  const automation = await resolveAutomationForAccounts(accounts);
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+
   // 产线维度 targets：外层账号、内层产线（PIPELINES 顺序）→ 同一账号先文章后漫画。
+  // manual 的账号不进 targets（纯手动）；auto_draft/auto_draft_push 都自动写稿。
   const counts = await todayPipelineCounts(accounts.map((a) => a.id));
-  const targets: { accountId: number; account: string; pipeline: 'article' | 'comic' }[] = [];
+  const targets: { accountId: number; account: string; pipeline: 'article' | 'comic'; push: boolean }[] = [];
+  let anyDue = false;
   for (const a of accounts) {
+    const auto = automation.get(a.id) ?? { mode: 'manual' as AutomationMode, writeTime: DEFAULT_WRITE_TIME };
+    if (auto.mode === 'manual') continue;
+    const due = force || nowMinutes >= parseHm(auto.writeTime);
+    if (!due) continue;
+    anyDue = true;
     for (const kind of PIPELINES) {
       if (!(await isPipelineEnabled(a.trackId, kind))) continue;
       const quota = await getPipelineQuota(a.trackId, kind);
       if ((counts.get(`${a.id}:${kind}`) ?? 0) < quota) {
-        targets.push({ accountId: a.id, account: a.name, pipeline: kind });
+        targets.push({
+          accountId: a.id,
+          account: a.name,
+          pipeline: kind,
+          push: auto.mode === 'auto_draft_push',
+        });
       }
     }
   }
   if (targets.length === 0) {
-    return { ...base, due: true, reason: '今日配额已满（所有账号均已产出当日篇数）' };
+    return {
+      ...base,
+      due: anyDue,
+      reason: anyDue
+        ? '今日配额已满（所有到点账号均已产出当日篇数）'
+        : '无到点的自动化账号（manual 不参与，或各账号未到自己的写稿时间）',
+    };
   }
 
   const run = await withLock(LOCK_PLAN, LOCK_TIMEOUT_SEC, async () => {
@@ -263,11 +329,13 @@ export async function tick(force = false): Promise<TickResult> {
       }
     }
 
-    // 推送：只推 contentWechat 非空的（漫画半成品自动跳过，不刷错误）。
-    if (cfg.pushEnabled) {
+    // 推送（P4）：只对 mode=auto_draft_push 的账号推（per-account 分流，替代旧全局 pushEnabled）。
+    // 只推 contentWechat 非空的（漫画半成品自动跳过，不刷错误）。
+    const pushAccIds = [...new Set(targets.filter((t) => t.push).map((t) => t.accountId))];
+    if (pushAccIds.length > 0) {
       const today = todayStr();
       const pending = await prisma.article.findMany({
-        where: { status: 'draft', accountId: { in: targets.map((t) => t.accountId) } },
+        where: { status: 'draft', accountId: { in: pushAccIds } },
         orderBy: { id: 'asc' },
       });
       const todays = pending.filter((x) => dayKeyOf(x.createdAt) === today && !!x.contentWechat);

@@ -13,12 +13,16 @@ import { z } from 'zod';
 
 import { prisma } from '../../db.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { requirePermission } from '../permissions.ts';
 import { NotFoundError } from '../../errors.ts';
 import { reviseHtml } from '../../services/revise.ts';
 import { parseArticle } from '../../services/parse/index.ts';
 import { renderArticle } from '../../services/render/index.ts';
 
 const reviseRouter = Router();
+
+// P2 RBAC：本路由统一权限点
+reviseRouter.use(requirePermission('content:revise'));
 
 const idParam = z.coerce.number().int().positive();
 

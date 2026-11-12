@@ -404,16 +404,31 @@ export interface TriggerResult {
 
 // ── 调度 ──
 
+/** 每客户自动化模式（P4）：manual=纯手动 / auto_draft=自动写稿 / auto_draft_push=自动写稿+推草稿箱。
+ *  群发红线 AUTO_PUBLISH 与本开关解耦，永不自动。 */
+export type AutomationMode = 'manual' | 'auto_draft' | 'auto_draft_push';
+
 export interface SchedulerConfig {
+  /** 全局总开关（仅管理员可改）。 */
   enabled: boolean;
+  /** 无主账号兜底写稿时间。每用户看 my.writeTime。 */
   writeTime: string;
+  /** 无主账号兜底是否推草稿箱。每用户看 my.automationMode。 */
   pushEnabled: boolean;
+}
+
+/** 我的每客户自动化配置。 */
+export interface MyAutomation {
+  automationMode: AutomationMode;
+  writeTime: string;
 }
 
 export interface SchedulerStatus {
   running: boolean;
   intervalMs: number;
   config: SchedulerConfig;
+  my: MyAutomation;
+  modeOptions?: Array<{ value: AutomationMode; label: string }>;
   lastTick: TickResult | null;
 }
 
@@ -712,4 +727,85 @@ export interface EmphasisApplyResult {
   title: string;
   digest: string;
   contentWechat: string;
+}
+
+// ── 文风配置 ──
+
+/** 文风配置项。key：'global' | '{赛道名}' | 'v:global:{dim}' | 'v:{赛道}:{dim}'。 */
+export interface StylePromptItem {
+  key: string;
+  kind: 'global' | 'track' | 'variant';
+  prompt: string;
+  updatedAt: string;
+}
+
+/** 出厂默认值（「恢复默认」用）。variants 的键即配置 key（v:...）。 */
+export interface StylePromptDefaults {
+  global: string;
+  /** 系统提示词（`sys:{赛道}`）：`## system` + `## tail` 两节，含 `{{变量}}`。 */
+  systems: Record<string, string>;
+  tracks: Record<string, string>;
+  variants: Record<string, string>;
+  /** 写作规范（`s:{赛道}`）：段落形态 / 强调标注 / 句式补充 / 去AI味（预留）。 */
+  specs: Record<string, string>;
+  /** 机器规则（`r:{赛道}`）：体检项与选题形态，JSON 文本。 */
+  rules: Record<string, string>;
+}
+
+/** 系统用户角色（与 ModelRole 区分：那是模型用途绑定）。admin>member>guest 只读。 */
+export type UserRole = 'admin' | 'member' | 'guest';
+
+/** 登录/状态返回的用户概要（不含口令）。 */
+export interface AuthUser {
+  id: number | null;
+  username: string;
+  role: UserRole;
+  status?: 'pending' | 'active' | 'disabled';
+  expiresAt?: string | null;
+  /** 冒烟旁路 = smoke，正常登录 = session（管理令牌已退场）。 */
+  via?: 'session' | 'smoke';
+}
+
+/** 鉴权状态（GET /api/auth/status）。不返回令牌本身。 */
+export interface AuthStatus {
+  authRequired: boolean;
+  loggedIn: boolean;
+  user: AuthUser | null;
+}
+
+/** 用户管理列表项（admin，GET /api/users）。 */
+export interface UserAdminItem {
+  id: number;
+  username: string;
+  role: UserRole;
+  status: 'pending' | 'active' | 'disabled';
+  expiresAt: string | null;
+  maxOAAccounts: number;
+  createdAt: string;
+  oaAccountCount: number;
+}
+
+/** 批量删除里单条失败的明细。reason 直接展示给用户，不做二次加工。 */
+export interface BulkDeleteFailure {
+  id: number;
+  reason: string;
+}
+
+/**
+ * 批量删除结果（POST /api/<资源>/bulk-delete）。
+ *
+ * 逐条独立执行：一条失败不阻断其余，所以要同时给成功数与失败明细。
+ */
+export interface BulkDeleteResult {
+  ok: boolean;
+  /** 去重后的请求条数 */
+  total: number;
+  /** 成功删除的条数 */
+  deleted: number;
+  /** 失败明细（逐条带原因） */
+  failed: BulkDeleteFailure[];
+  /** 附加统计：如级联删了几篇文章、归还了几个选题 */
+  details: Record<string, number>;
+  /** 面向用户的一句话总结 */
+  message: string;
 }

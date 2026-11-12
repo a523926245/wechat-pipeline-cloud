@@ -52,8 +52,9 @@
     "路人",
     "陌生人"
   ],
-  "bubbleClause": " EXACTLY ONE speech bubble in the entire image, its text written only once, no other bubble anywhere.",
-  "excludeClause": "除气泡文字外画面无任何其他文字，无水印，无签名。",
+  "bubbleClause": " EXACTLY ONE speech bubble in the entire image, its text written only once, no other bubble anywhere. Its content must be EXACTLY the quoted line above — never the scene description.",
+  "excludeClause": "画面中唯一允许出现的文字就是这个气泡内「」中的那一行台词；场景旁白绝不入画（不得变成第二个气泡、字幕或标牌）。无水印，无签名。",
+  "sceneClause": "场景旁白仅供构图参考，严禁把它当成台词画进画面：不得出现第二个对话气泡、字幕、标牌或任何承载旁白的文字；整幅画面除下方气泡指令「」中的那一行台词外，不得出现任何其他文字。",
   "negativePrompt": "comic panel borders, grid dividers, four-panel comic, article titles inside image, scene labels, numbered headings in image, distorted facial features, extra irrelevant characters, deformed hands and feet, extra limbs, extra hands, inconsistent art style, messy overlapping anatomy, extra speech bubbles, extra text, letters, watermark, signature, duplicate characters, English words or labels rendered inside any speech bubble, prompt tokens visible as text in the image",
   "narrativeChains": {
     "progressive": "递进链（现象 → 原因 → 方法 → 升华）：适用观点/反思文（育儿反思、认知改变、情感共鸣）。N=6 拆法：单元1现象-家长侧行为（描述普遍行为，戳中日常）→ 单元2现象-孩子侧反应（现象拆两个侧面）→ 单元3原因（揭示深层机制，制造「原来如此」）→ 单元4方法A-止损（先停掉错误做法）→ 单元5方法B-替代（给出正向做法，可执行、有转向感）→ 单元6升华（情感/价值观收束，值得截图转发）。N=4 用原序现象→原因→方法→升华；N=5 去掉现象的其中一个侧面。可选节拍「误诊」：原因层与方法层之间可插一格「你以为是 X，其实是 Y」，先点破常见误判再给真实机制，让「原来如此」的爽感提前到方法之前（与标题公式库「原来式」搭配效果最佳）。硬约束：标题链必须按所选逻辑递进，禁止 N 句互不相关；末单元必须有值得截图转发的升华感。",

@@ -20,6 +20,11 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// 系统用户角色（与 ModelRole 是两回事：那个是模型用途绑定）。
+/// admin=全权+用户管理；member=客户（管自己的公众号/自动化/数据）；guest=只读（默认注册角色）。
+
+/// 系统用户状态。开放注册+管理员审批：pending →（审批）active；disabled=封禁。
+
 /// 调用协议：决定 services/llm.ts 走哪条 HTTP 通道。
 /// 用枚举而非 String：未知协议只能在运行时炸，枚举让非法值在写入时就被拦下。
 /// 本地 SQLite（gen-sqlite-schema.mjs 自动生成）会把它降级为 String，
@@ -41,7 +46,7 @@ model Track {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
-  accounts Account[]
+  accounts OAAccount[]
   angles   Angle[]
   articles Article[]
   /// 赛道下的产线（article / comic），各自配额与开关独立。见 TrackPipeline。
@@ -72,10 +77,14 @@ model TrackPipeline {
   @@index([enabled])
 }
 
-/// 公众号账号。AppSecret 加密存储，API 层只暴露 secretMask。
-model Account {
+/// 公众号账号（OAAccount，与系统用户 User 区分）。AppSecret 加密存储，API 层只暴露 secretMask。
+/// 模型名改自 Account（2026-11 多用户改造），@@map("Account") 稳住表名——旧库零数据迁移。
+/// ownerUserId = 归属系统用户（轻量归属，非租户）：NULL=未归属（历史/冒烟数据，仅 admin 可管）。
+model OAAccount {
   id          Int        @id @default(autoincrement())
   trackId     Int
+  /// 归属系统用户；SetNull：删用户不删公众号资产（归为未归属，待 admin 认领）。
+  ownerUserId Int?
   name        String
   appid       String     @unique
   secretEnc   Bytes?
@@ -87,10 +96,52 @@ model Account {
   updatedAt   DateTime   @updatedAt
 
   track   Track         @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  owner   User?         @relation(fields: [ownerUserId], references: [id], onDelete: SetNull)
   tokens  WechatToken[]
   articles Article[]
 
   @@index([trackId, enabled])
+  @@index([ownerUserId])
+  @@map("Account")
+}
+
+/// 系统登录用户（区别于公众号账号 OAAccount）。开放注册+管理员审批；预留订阅付费自动开通口子。
+/// expiresAt=订阅有效期钩子（可空=不过期；到期降只读）；maxOAAccounts=可绑公众号数上限。
+/// automationMode/writeTime=每客户自动化开关（P4）：manual=纯手动 / auto_draft=自动写稿 /
+/// auto_draft_push=自动写稿+推草稿箱。群发红线与本开关解耦（AUTO_PUBLISH=false 永不动）。
+model User {
+  id            Int        @id @default(autoincrement())
+  username      String     @unique
+  passwordHash  String
+  role          String   @default("guest")
+  status        String @default("pending")
+  expiresAt     DateTime?
+  maxOAAccounts Int        @default(1)
+  /// 每客户自动化模式。default manual=最安全（不自动动手）。
+  automationMode String    @default("manual")
+  /// 每客户的每日写稿时间点 HH:mm（服务器本地时区）。
+  writeTime     String     @default("06:00")
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  oaAccounts OAAccount[]
+  sessions   UserSession[]
+
+  @@index([status, role])
+}
+
+/// 登录会话（per-user，替代单管理令牌；管理令牌降为 break-glass）。
+/// httpOnly cookie 只存 session id，服务端查库校验——可随时吊销。
+model UserSession {
+  id        String   @id
+  userId    Int
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 /// access_token 缓存。本机流水线每次运行都重新取 token，上云必须缓存（微信有调用频率限制）。
@@ -102,7 +153,7 @@ model WechatToken {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
-  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  account OAAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
 
   @@index([expiresAt])
 }
@@ -120,7 +171,12 @@ model Angle {
   content   String
   scope     String    @default("article")
   used      Boolean   @default(false)
+  /// 展示用占用标签（账号名，兼容旧数据与导出）。结构化归属见 usedById/usedByAccountId。
   usedBy    String    @default("")
+  /// 占用者：系统用户 id（跨客户防重复的归属标记，谁抢到归谁）。
+  usedById  Int?
+  /// 占用者：公众号账号 id（区分同用户多号）。
+  usedByAccountId Int?
   usedDate  String?
   source    String    @default("")
   createdAt DateTime  @default(now())
@@ -174,7 +230,7 @@ model Article {
   track   Track?   @relation(fields: [trackId], references: [id], onDelete: SetNull)
   // 删账号即删其名下文章：避免产生永远推不出去的孤儿文章。
   // 应用层 services/accounts.deleteAccount 也做了显式级联，双保险。
-  account Account? @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  account OAAccount? @relation(fields: [accountId], references: [id], onDelete: Cascade)
   angle   Angle?   @relation(fields: [angleId], references: [id], onDelete: SetNull)
   /// 漫画逐格资产（pipeline='comic' 时才有行）。
   comicPanels ComicPanel[]
@@ -189,7 +245,7 @@ model Article {
 /// 漫画逐格资产行级状态机。每格一张场景插图（含中文气泡），
 /// 支持逐格慢生成、单格失败重跑、换账号重传 —— 用行级 status + updatedAt
 /// 构成轮询队列，替代引入任务队列框架。
-/// 金句卡（1080×540 文字卡）不入库：渲染阶段确定性生成，落盘 comics/quote-{seq}.jpg。
+/// 金句卡（1080×540 文字卡）不入库：渲染阶段确定性生成，落盘 comics/quote-{articleId}-{seq}-v{VER}.jpg（按文章隔离）。
 model ComicPanel {
   id            Int      @id @default(autoincrement())
   articleId     Int
@@ -317,4 +373,20 @@ model Setting {
   readonly  Boolean  @default(false)
   desc      String   @default("")
   updatedAt DateTime @updatedAt
+}
+
+/// 文风配置：创作总纲 + 各赛道文体 prompt 的单一真源（「文风配置」页可改）。
+/// 写稿（services/writer.ts）与题库扩库（services/angles.ts）都从这里读——
+/// 改配置即改文风/题库口径，不用改代码。key='global' 是创作总纲（正能量等全局约束），
+/// 其余 key 为赛道名（育儿/教育/职场/星座/激励…），kind 随之为 global | track。
+/// 覆盖顺序：库里的行 > config/style_dna.json 的 tracks 兜底 > 无赛道层。
+model StylePrompt {
+  id        Int      @id @default(autoincrement())
+  key       String   @unique
+  kind      String   @default("track")
+  prompt    String
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@index([kind])
 }

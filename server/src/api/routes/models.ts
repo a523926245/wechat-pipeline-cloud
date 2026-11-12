@@ -18,6 +18,8 @@ import { z } from 'zod';
 
 import { prisma } from '../../db.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { bulkDeleteSchema, runBulkDelete } from '../bulk-delete.ts';
+import { requirePermission } from '../permissions.ts';
 import { BadRequestError, NotFoundError } from '../../errors.ts';
 import { encryptSecret, maskSecret } from '../../lib/crypto.ts';
 import { packJson, unpackJson } from '../../db-json.ts';
@@ -42,6 +44,14 @@ import {
 } from '../../services/model-registry.ts';
 
 const modelsRouter = Router();
+
+// P2 RBAC：/meta 是前端标签下发（登录即可）；模型配置本体 admin only
+modelsRouter.use((req, res, next) => {
+  if (req.method === 'GET' && req.path === '/meta') {
+    return requirePermission('data:view')(req, res, next);
+  }
+  return requirePermission('system:manage')(req, res, next);
+});
 
 /** 通配段带数字约束：即使将来有人把子路径插错位置，"bindings" 也不会被当成 id。 */
 const ID_PATH = '/:id(\\d+)';
@@ -90,8 +100,9 @@ function refineProtocolCapability(
     }
   }
 
+  // null = 删除该参数（合并语义），跳过校验
   const size = v.paramsJson?.size;
-  if (size !== undefined && !(IMAGE_SIZES as readonly unknown[]).includes(size)) {
+  if (size !== undefined && size !== null && !(IMAGE_SIZES as readonly unknown[]).includes(size)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['paramsJson', 'size'],
@@ -99,13 +110,23 @@ function refineProtocolCapability(
     });
   }
   const ratio = v.paramsJson?.ratio;
-  if (ratio !== undefined && !(IMAGE_RATIOS as readonly unknown[]).includes(ratio)) {
+  if (ratio !== undefined && ratio !== null && !(IMAGE_RATIOS as readonly unknown[]).includes(ratio)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['paramsJson', 'ratio'],
       message: `宽高比只能是 ${IMAGE_RATIOS.join(' / ')}`,
     });
   }
+}
+
+/** 剔除对象里的 null/undefined 值（「传 null = 删除该参数」语义用）。 */
+function stripNulls(v: Record<string, unknown> | undefined | null): Record<string, unknown> | null {
+  if (!v) return null;
+  const out: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(v)) {
+    if (val !== null && val !== undefined) out[k] = val;
+  }
+  return out;
 }
 
 const baseSchema = z.object({
@@ -295,7 +316,9 @@ modelsRouter.post(
   '/',
   asyncHandler(async (req, res) => {
     const body = createSchema.parse(req.body);
-    const apiKeyEnc = body.apiKey ? encryptSecret(body.apiKey) : Buffer.alloc(0);
+    // 空白 Key 视同未填（与「留空=不修改」口径一致，防误存空格/换行）
+    const apiKey = body.apiKey.trim();
+    const apiKeyEnc = apiKey ? encryptSecret(apiKey) : Buffer.alloc(0);
     const created = await prisma.llmModel.create({
       data: {
         name: body.name,
@@ -305,8 +328,8 @@ modelsRouter.post(
         baseUrl: body.baseUrl,
         modelId: body.modelId,
         apiKeyEnc,
-        apiKeyMask: body.apiKey ? maskSecret(body.apiKey) : '',
-        paramsJson: packJson(body.paramsJson ?? null),
+        apiKeyMask: apiKey ? maskSecret(apiKey) : '',
+        paramsJson: packJson(stripNulls(body.paramsJson) ?? null),
         enabled: body.enabled,
       },
     });
@@ -341,16 +364,55 @@ modelsRouter.put(
     if (body.baseUrl !== undefined) data.baseUrl = body.baseUrl;
     if (body.modelId !== undefined) data.modelId = body.modelId;
     if (body.enabled !== undefined) data.enabled = body.enabled;
-    if (body.paramsJson !== undefined) data.paramsJson = packJson(body.paramsJson);
-    // apiKey 传空串表示不修改
-    if (body.apiKey !== undefined && body.apiKey.length > 0) {
-      data.apiKeyEnc = encryptSecret(body.apiKey);
-      data.apiKeyMask = maskSecret(body.apiKey);
+    // paramsJson 是**合并**语义：只覆盖传入的键，未传的键（如 gradioApiName/genWidth）保留；
+    // 传 null 的键表示删除（清空温度等可选参数）。
+    // 同款覆写 bug 教训（2026-11-11）：整包替换会让界面表单外的参数静默丢失，MCP 模型直接坏。
+    if (body.paramsJson !== undefined) {
+      // ⚠️ existing.paramsJson 在库里是 JSON 字符串，必须 unpackJson 解开再合并
+      const existingParams = unpackJson<Record<string, unknown>>(existing.paramsJson) ?? {};
+      const merged = { ...existingParams, ...body.paramsJson };
+      data.paramsJson = packJson(stripNulls(merged));
+    }
+    // apiKey 留空/空白=不修改（UI 约定）；只有非空才覆写密文
+    if (typeof body.apiKey === 'string' && body.apiKey.trim() !== '') {
+      const apiKey = body.apiKey.trim();
+      data.apiKeyEnc = encryptSecret(apiKey);
+      data.apiKeyMask = maskSecret(apiKey);
     }
 
     const updated = await prisma.llmModel.update({ where: { id }, data });
     const bs = await prisma.modelBinding.findMany({ where: { modelId: id }, select: { role: true } });
     res.json(toView(updated, bs.map((b) => b.role)));
+  }),
+);
+
+/**
+ * 批量删除模型。
+ *
+ * 复用单条删除的「先解绑再删」逻辑，避免留下悬空外键。
+ * 逐条独立执行：一条失败不影响其余，失败原因原样返回。
+ *
+ * 路由顺序：'/bulk-delete' 是字母路径，必须排在 '/:id(\\d+)' 之前
+ * （虽然 ID_PATH 的数字约束本身也能挡住，但按项目约定固定路径一律前置）。
+ */
+modelsRouter.post(
+  '/bulk-delete',
+  asyncHandler(async (req, res) => {
+    const { ids } = bulkDeleteSchema.parse(req.body ?? {});
+    const result = await runBulkDelete(
+      ids,
+      async (id) => {
+        const existing = await prisma.llmModel.findUnique({ where: { id } });
+        if (!existing) throw new NotFoundError(`模型 ${id} 不存在`);
+        const bs = await prisma.modelBinding.count({ where: { modelId: id } });
+        // 解除绑定后再删，避免悬空外键
+        await prisma.modelBinding.deleteMany({ where: { modelId: id } });
+        await prisma.llmModel.delete({ where: { id } });
+        return { unboundRoles: bs };
+      },
+      '模型',
+    );
+    res.json(result);
   }),
 );
 

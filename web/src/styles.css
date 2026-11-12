@@ -24,6 +24,7 @@
   --wb-danger-soft: #fef2f1;
   --wb-danger-border: #f7c9c5;
   --wb-warning: #b8801a;
+  --wb-warning-soft: #fdf6e7;
 
   /* 尺度 */
   --wb-radius: 10px;
@@ -110,6 +111,7 @@ html.dark {
   --wb-danger-soft: rgba(213, 73, 65, 0.16);
   --wb-danger-border: rgba(213, 73, 65, 0.4);
   --wb-warning: #d8a23e;
+  --wb-warning-soft: rgba(216, 162, 62, 0.16);
 
   --wb-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
   --wb-shadow-pop: 0 10px 30px rgba(0, 0, 0, 0.5);

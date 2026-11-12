@@ -7,6 +7,7 @@ import { useRouter } from 'vue-router';
 
 import { errMsg } from '../api/http.ts';
 import {
+  bulkDeleteTracks,
   createTrack,
   deleteTrack,
   expandTrackAngles,
@@ -15,8 +16,10 @@ import {
   updatePipeline,
   getPipelines,
 } from '../api/index.ts';
+import BatchBar from '../components/BatchBar.vue';
 import StateError from '../components/StateError.vue';
 import RowActions, { type RowAction } from '../components/RowActions.vue';
+import { useBatchDelete } from '../composables/useBatchDelete.ts';
 import { pipelineDesc, pipelineTagType, pipelineText } from '../utils/format.ts';
 import type { AngleScopeFilter, TrackItem } from '../types.ts';
 
@@ -330,6 +333,42 @@ function openExpandFor(trackId: number, trackName: string, kind: string) {
   expandDialog.visible = true;
 }
 
+/**
+ * 批量删除：与单条删除同一套规则——**赛道下还有账号时拒绝删除**。
+ *
+ * 批量里不放宽这条规则：有账号的那条会被跳过并说明原因，其余照删。
+ * 前端提前把「有账号」的赛道标出来，让用户点之前就知道哪几条删不掉。
+ */
+const trackTableRef = ref<{ clearSelection: () => void } | null>(null);
+
+const batch = useBatchDelete<TrackItem>({
+  idOf: (row) => row.id,
+  api: bulkDeleteTracks,
+  tableRef: trackTableRef,
+  impact: (rows) => {
+    const blocked = rows.filter((r) => r.accountCount > 0);
+    const parts: string[] = [];
+    parts.push(
+      `将删除 ${rows.length} 个赛道，其名下的选题会一并清除；已生成的文章会保留但变成「未归属」。`,
+    );
+    if (blocked.length > 0) {
+      parts.push(
+        `其中 ${blocked.length} 个赛道下还有账号（${blocked.map((r) => r.name).join('、')}），` +
+          '这些赛道会被跳过，需先删除或改绑这些账号。',
+      );
+    }
+    parts.push('此操作不可恢复。');
+    return parts.join('\n');
+  },
+  title: '批量删除赛道',
+  reload: load,
+});
+
+/** 赛道下还有账号时不可勾选：单条删除也是 409 拒绝，勾了只会白等一次失败。 */
+function canSelectTrack(row: TrackItem): boolean {
+  return row.accountCount === 0;
+}
+
 /** 行操作菜单项，供 RowActions 组件渲染。 */
 function trackActions(row: TrackItem): RowAction[] {
   return [
@@ -385,14 +424,24 @@ function onTrackCommand(cmd: string, row: TrackItem) {
     />
 
     <el-card shadow="never">
+      <!-- 批量操作条：有勾选时才出现 -->
+      <BatchBar
+        :count="batch.count.value"
+        :loading="batch.deleting.value"
+        @delete="batch.runBatchDelete()"
+        @clear="batch.clearSelection()"
+      />
+
       <!-- 宽度约定：数字/状态列固定 width；文本列用 min-width + show-overflow-tooltip——
            min-width 列会按比例分摊表格剩余宽度（自适应撑满），只有挤不下时才出省略号 -->
       <el-table
+        ref="trackTableRef"
         :data="items"
         size="default"
         row-key="id"
         :expand-row-keys="expandedKeys"
         @expand-change="onExpandChange"
+        @selection-change="batch.onSelectionChange"
       >
         <!-- 层级：赛道 → 产线。展开区就是产线操作台（配额/开关/可用选题/扩题） -->
         <el-table-column type="expand" width="42">
@@ -503,6 +552,8 @@ function onTrackCommand(cmd: string, row: TrackItem) {
             </div>
           </template>
         </el-table-column>
+        <!-- 有账号的赛道不可勾选：删不掉（单条删除也是 409），勾了只会白等一次失败 -->
+        <el-table-column type="selection" width="46" reserve-selection :selectable="canSelectTrack" />
         <el-table-column prop="id" label="ID" width="62" />
         <el-table-column prop="name" label="赛道" min-width="180" show-overflow-tooltip />
         <el-table-column

@@ -1,0 +1,46 @@
+# 开发/自托管快速起：app + MySQL。
+#   cp deploy/app.env.example .env  → 填好 DATABASE_URL/APP_SECRET_KEY 后：
+#   docker compose up -d
+#   docker compose exec app node --experimental-strip-types scripts/seed-admin.ts
+#
+# ⚠️ 生产建议按 deploy/README.md 用 systemd + Nginx（有 TLS 与 logrotate）。
+# ⚠️ APP_SECRET_KEY 一旦写入数据就不能更换（换钥前必须解密迁移，见 SECURITY.md）。
+
+services:
+  db:
+    image: mysql:8.0
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: wechat_pipeline
+      MYSQL_USER: wechat
+      MYSQL_PASSWORD: change_me_strong
+      MYSQL_ROOT_PASSWORD: change_me_root_strong
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pchange_me_root_strong"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 8787
+      DATABASE_URL: mysql://wechat:change_me_strong@db:3306/wechat_pipeline?connection_limit=10
+      # 生成：openssl rand -base64 32 ；写入数据后不可更换
+      APP_SECRET_KEY: change_me_generate_with_openssl_rand_-base64_32
+      CONTENT_DIR: /app/var/content
+      CONFIG_DIR: /app/config
+    ports:
+      - "8787:8787"
+    volumes:
+      - content-data:/app/var/content
+
+volumes:
+  db-data:
+  content-data:

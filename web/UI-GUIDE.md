@@ -72,6 +72,49 @@
   显示「有未保存改动」标记 + 保存按钮（无改动时禁用），避免改完忘了保存或刷新丢失。
 - 展开状态受控（`expandedKeys`）：点箭头（`expand-change`）与点行菜单走同一份状态。
 
+## 5.3 批量操作（勾选 + 批量删除）
+
+有删除动作的列表页**都要支持批量删除**（选题库 / 文章 / 账号 / 赛道 / 模型）。
+统一用 `composables/useBatchDelete.ts` + `components/BatchBar.vue`，不要每页各写一套。
+
+- **表格三件套**（缺一不可）：
+  1. `<el-table row-key="id">` —— `row-key` 是跨页勾选的前提；
+  2. `<el-table-column type="selection" width="46" reserve-selection />` —— `reserve-selection`
+     让勾选在翻页后保留；
+  3. `@selection-change="batch.onSelectionChange"` —— 把选中行交给 composable。
+- **表格上方放 `<BatchBar>`**（有勾选时才出现）：显示「已选 N 项」+ 批量删除 + 取消选择。
+- **换筛选条件要清空勾选**：EP 的 `reserve-selection` 换筛选后**不会**自动清，
+  旧勾选指向另一个结果集，留着会删到用户看不见的行。
+  页面里 `watch(筛选条件, () => batch.clearSelection())`。
+- **`clearSelection()` 要同时清 EP 内部状态**：只清 composable 里的数组不够，
+  EP 内部还留着那些行，下次 render 勾选框仍显示"已勾"。composable 已处理
+  （需把表格实例通过 `tableRef` 传进去）。
+- **确认弹窗必须讲清影响面**：用 composable 的 `impact(rows)` 回调，按资源写具体数字
+  （删账号要说"会连带删掉名下文章"，删选题要说"多少条正在被文章用着"）。
+- **部分失败要逐条告知**：后端逐条独立执行，可能一部分成功一部分失败。
+  不能只弹"操作成功"——composable 已统一处理（失败项 id + 原因）。
+- **删除按钮用 `type="danger"`**，且**删除期间禁用**（`deleting` 状态）防重复提交。
+- 表格有展开行（`type="expand"`）时，selection 列放在展开列**之后**。
+
+## 5.4 配置页（左导航 + 单面板 + 未保存保护）
+
+配置项会随赛道/模型增长，**不要把所有表单竖排铺开**——超过三四项就变成一屏文本框，找东西全靠滚。
+文风配置页（`StylePromptsView`）是样板：
+
+- **两栏骨架**：左侧 `236px` 固定导航（`position: sticky`，带筛选框），右侧单面板；
+  某一项内部字段多时再分 `el-tabs`，不做长页滚动。窄屏 `<992px` 回退单列。
+- **缓冲区 + 快照双份**：`buf` 可随意改，`saved` 存服务端值，`isDirty = buf[k] !== saved[k]`。
+  ⚠️ `saved[k]` 对没落库的 key 是 `undefined`，必须先补成 `''`，否则空配置会被误判成有改动。
+- **dirty 信号要三处齐备**：顶部汇总条（N 处未保存 + 全部保存 + 放弃改动）、
+  导航项/Tab 上的小圆点、面板底部的状态文字。只给一处，用户换个面板就看不见了。
+- **离开保护**：`onBeforeRouteLeave` + `beforeunload` 拦一次，文案写清有几处没保存；
+  另外支持 `Ctrl/Cmd + S` 保存当前面板（配 `preventDefault`）。
+- **底部操作条 `position: sticky; bottom: 0`**：列表/条目很长时保存按钮不用往上翻。
+- **「一行一条」的库不要用整块 textarea**：抽成行编辑器（`components/VariantLinesEditor.vue`），
+  行序即语义顺序，支持增删/上移/下移，对外仍拼回纯文本。
+  前端校验正则必须与后端解析函数**逐字同源**，否则前端说合规、后端解析失败。
+- **「恢复默认」只填缓冲区**，不直接写库，且要二次确认——直接覆盖用户的编辑内容是不可逆操作。
+
 ## 6. 主题
 - 主色 `--el-color-primary: #0a7c47`（微信品牌绿），**禁止改动**，否则破坏全站一致性。
 - 新增语义色只允许加在 `styles.css` 的 `:root`，禁止在组件 scoped 样式里写死色值。

@@ -9,7 +9,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-import type { Account, Angle, Track } from '@prisma/client';
+import type { OAAccount, Angle, Track } from '@prisma/client';
 
 import { prisma } from '../../db.ts';
 import { packJson } from '../../db-json.ts';
@@ -35,7 +35,7 @@ async function getComicTitlePrefix(): Promise<string> {
  * 为账号生成一篇漫画草稿（只建稿件与格行，不生图）。
  */
 export async function createComicDraft(
-  account: Account,
+  account: OAAccount,
   angle: Angle,
   track: Track,
   opts: ScriptOptions = {},

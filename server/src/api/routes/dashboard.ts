@@ -6,9 +6,14 @@
 import { Router } from 'express';
 
 import { asyncHandler } from '../async-handler.ts';
+import { requirePermission } from '../permissions.ts';
+import { isAdmin, requirePrincipal } from '../../services/ownership.ts';
 import { getDashboard, getSystemStatus } from '../../services/dashboard.ts';
 
 const dashboardRouter = Router();
+
+// P2 RBAC：本路由统一权限点
+dashboardRouter.use(requirePermission('data:view'));
 
 /** 轻量状态：模型绑定 + 健康，供全局侧边栏常驻显示（不拉排产/动态等重区块）。 */
 dashboardRouter.get(
@@ -20,8 +25,10 @@ dashboardRouter.get(
 
 dashboardRouter.get(
   '/',
-  asyncHandler(async (_req, res) => {
-    const data = await getDashboard();
+  asyncHandler(async (req, res) => {
+    // P3：member 只看自己账号/文章的聚合；admin 全量
+    const principal = requirePrincipal(req);
+    const data = await getDashboard(isAdmin(principal) ? null : principal.userId);
     res.json(data);
   }),
 );

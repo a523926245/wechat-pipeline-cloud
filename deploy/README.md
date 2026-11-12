@@ -85,7 +85,35 @@ sudo cp /opt/wechat-pipeline-cloud/deploy/logrotate/wechat-pipeline /etc/logrota
 
 ---
 
-## 三、迁移基线（第 8 步，必读）
+## 三、初始化管理员账号（部署后必做）
+
+开放注册**永远造不出 admin**，首个管理员只能用种子脚本（幂等，重复跑不覆盖）。
+**顺序**：必须在 MySQL schema 同步（`prisma db push` / 迁移）之后。生产推荐显式 `--pass`
+（不指定则随机口令**只打印一次**，生产易丢）：
+
+```bash
+# systemd 部署：以 wpc 用户 + 生产环境变量执行
+sudo -u wpc bash -c 'set -a; . /etc/wechat-pipeline-cloud/app.env; set +a; \
+  cd /opt/wechat-pipeline-cloud/server && \
+  node --experimental-strip-types scripts/seed-admin.ts -- --pass "你的强口令"'
+
+# Docker 部署
+docker compose exec app node --experimental-strip-types scripts/seed-admin.ts -- --pass "你的强口令"
+```
+
+首次登录验证一次。**忘记口令救济**（服务器 shell 权限即救济权）：
+
+```bash
+# 同上环境加载方式，加 -- --reset-pass（重置口令并顺带激活被停用的账号）
+node --experimental-strip-types scripts/seed-admin.ts -- --reset-pass
+```
+
+说明：管理令牌机制已退场（2026-11-11），`--reset-pass` 就是唯一的应急后门；目前无自助
+改密界面，口令直接用 `--pass` 设好最省事。
+
+---
+
+## 四、迁移基线（第 8 步，必读）
 
 仓库里**没有 `prisma/migrations`**，所以 `npm run prisma:deploy` 第一次必失败。建一次基线：
 
@@ -112,7 +140,7 @@ npx prisma migrate dev --name add_cover_media_id
 
 ---
 
-## 四、调度：Timer 还是常驻
+## 五、调度：Timer 还是常驻
 
 | 方案 | 单元 | 适用 |
 |---|---|---|
@@ -124,11 +152,11 @@ Timer 改时间只改一行：`OnCalendar=*-*-* 06:05`。
 
 ---
 
-## 五、上线前置项（本轮代码**没有**解决，必须人工处理）
+## 六、上线前置项（本轮代码**没有**解决，必须人工处理）
 
 | # | 项 | 说明 |
 |---|---|---|
-| 1 | **`/api/*` 裸奔** | 全仓零鉴权：`ADMIN_PASSWORD` / `JWT_SECRET` 定义了但没有引用，CORS 全开。任何人都能读凭据掩码、改模型、推草稿。**必须**配 Nginx basic auth 或限制来源 IP——`nginx/wechat-pipeline.conf` 里已写好可抄的注释样板 |
+| 1 | ~~`/api/*` 裸奔~~ **已解决（2026-11-11）** | 现为口令+会话全量鉴权（公开项仅 `/api/health` 与 `/api/auth/*`），角色权限已挂全路由。上线仍建议：HTTPS（Nginx TLS）、限制来源 IP、`app.env` 权限 600 |
 | 2 | **`APP_SECRET_KEY` 不可变** | 一旦有凭据写入就永远不能改，改了所有已存 AppSecret 都解不开。改前先备份 |
 | 3 | **`/api/health` 会撒谎** | DB 挂了它仍返回 200，只把 `ok:false` 放在 body 里。Nginx/Docker 探活别只看状态码 |
 | 4 | **日志目录硬编码** | `logger.ts` 写死 `<项目根>/var/logs`，不读环境变量。必须保证 `wpc` 对该目录可写，并装 logrotate |
@@ -141,7 +169,7 @@ Timer 改时间只改一行：`OnCalendar=*-*-* 06:05`。
 
 ---
 
-## 六、验收清单
+## 七、验收清单
 
 ```bash
 # 1. 活着，且连的是 MySQL
@@ -172,7 +200,7 @@ curl -sI http://127.0.0.1/assets/$(ls web/dist/assets | head -1) | grep -i cache
 
 ---
 
-## 七、排障速查
+## 八、排障速查
 
 | 现象 | 原因 |
 |---|---|
@@ -186,7 +214,7 @@ curl -sI http://127.0.0.1/assets/$(ls web/dist/assets | head -1) | grep -i cache
 
 ---
 
-## 八、RHEL / CentOS 差异
+## 九、RHEL / CentOS 差异
 
 | 项 | Debian/Ubuntu | RHEL/CentOS |
 |---|---|---|
@@ -203,7 +231,7 @@ curl -sI http://127.0.0.1/assets/$(ls web/dist/assets | head -1) | grep -i cache
 
 ---
 
-## 九、回滚
+## 十、回滚
 
 ```bash
 sudo systemctl stop wechat-pipeline

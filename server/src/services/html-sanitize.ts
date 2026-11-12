@@ -81,13 +81,65 @@ export function normalizeBareParagraphs(html: string): string {
 }
 
 /**
- * 清洗入口：去掉围栏 → 补齐空缺的段落标签 → 裁掉首尾多余的说明文字。
+ * 把「标题被写进 `<strong>` 而不是 `<h1>`」的输出救回来。
  *
- * 顺序很关键：先补标签再截断，否则模型在末尾忘了包 `<p>` 时，
- * 「以最后一个 </p> 收口」会把那段没标签的正文整段切掉。
+ * 2026-11-11 真机生成时抓到：模型偶尔把标题写成
+ * `<strong>水逆第三天，已读不回不是忙</strong> <h2>…</h2> <p>…</p>`，
+ * 于是 `looksLikeArticleHtml` 判「没有 h1」→ 整篇作废回退骨架草稿，白烧一次生成。
+ *
+ * 这里只救**开头第一个**被 `<strong>` 包住的标题行（后面跟着 h2/p 的那种），
+ * 改成 `<h1>`；正文里的 `<strong>` 一律不动（那些是强调，不是标题）。
  */
+function fixStrongTitle(html: string): string {
+  // 形如：<strong>标题文字</strong> 后面紧跟 <h2> 或 <p>
+  const m = /^(\s*)<strong([^>]*)>([\s\S]{1,80}?)<\/strong>(\s*)(?=<h2[\s>]|<p[\s>])/i.exec(html);
+  if (!m) return html;
+  const lead = m[1] ?? '';
+  const attrs = m[2] ?? '';
+  const title = m[3] ?? '';
+  const gap = m[4] ?? '';
+  // 标题里已经有块级标签就放弃（不是标题，是别的结构）
+  if (/<[a-z]/i.test(title)) return html;
+  return `${lead}<h1${attrs}>${title}</h1>${gap}${html.slice(m[0].length)}`;
+}
+
+/**
+ * 清洗入口：去掉围栏 → 救回写成 `<strong>` 的标题 → 补齐空缺的段落标签 → 裁掉首尾多余的说明文字。
+ *
+ * 顺序很关键：
+ * - 先救标题再补标签——补标签会把裸文本包成 `<p>`，标题就被包成段落了，再也认不出；
+ * - 先补标签再截断——否则模型在末尾忘了包 `<p>` 时，
+ *   「以最后一个 </p> 收口」会把那段没标签的正文整段切掉。
+ */
+/**
+ * 清掉 markdown 加粗残留。
+ *
+ * 实测（2026-11-12，职场稿）：模型在写「自测清单」这种**带序号的短条目**时，
+ * 会不自觉回到 markdown——`**1. 领导要求你"把关"而非"沟通"。**` 直接混进 HTML，
+ * 落在页面上就是满屏星号，而且星号会把 `<p>` 切得七零八落（一条自测项被拆成三段）。
+ * 条目越多越容易触发，所以我方赛道一换成清单体就立刻暴露。
+ *
+ * 策略：成对的 `**…**` 还原成 `<strong>`（保留模型想强调的意图），
+ * 剩下的落单 `**` 一律删掉（它们只是排版噪声）。
+ * 嵌套的 `<strong>` 由 processEmphasis 拍平，这里不用管。
+ */
+function stripMarkdownBold(html: string): string {
+  if (!html.includes('**')) return html;
+  return html
+    .replace(/\*\*([^*<>]{1,80})\*\*/g, '<strong>$1</strong>')
+    .replace(/\*\*/g, '');
+}
+
 export function sanitizeModelHtml(raw: string): string {
-  let s = normalizeBareParagraphs(stripFences(raw));
+  let s = stripFences(raw);
+
+  // markdown 加粗残留（必须在补 <p> 之前：星号会把段落边界切碎）
+  s = stripMarkdownBold(s);
+
+  // 标题写成 <strong> 的救回（必须在补 <p> 之前）
+  s = fixStrongTitle(s);
+
+  s = normalizeBareParagraphs(s);
 
   // 若混有前后说明文字，截取到第一个 <h1> 与最后一个 </p> 之间
   const start = s.indexOf('<h1');

@@ -14,16 +14,14 @@ import { onMounted, reactive, ref } from 'vue';
 
 import { errMsg } from '../api/http.ts';
 import {
-  getContentPrefixes,
   getSchedulerStatus,
   schedulerStart,
   schedulerStop,
   schedulerTick,
   setSchedulerConfig,
-  updateContentPrefixes,
 } from '../api/index.ts';
 import StateError from '../components/StateError.vue';
-import type { ContentPrefixItem, SchedulerConfig, SchedulerStatus } from '../types.ts';
+import type { AutomationMode, SchedulerConfig, SchedulerStatus } from '../types.ts';
 
 const status = ref<SchedulerStatus | null>(null);
 const statusError = ref('');
@@ -34,6 +32,15 @@ const savingCfg = ref(false);
 const cfgDirty = ref(false);
 
 const cfg = reactive<SchedulerConfig>({ enabled: false, writeTime: '06:00', pushEnabled: false });
+const my = reactive<{ automationMode: AutomationMode; writeTime: string }>({
+  automationMode: 'manual',
+  writeTime: '06:00',
+});
+const modeOptions = ref<Array<{ value: AutomationMode; label: string }>>([
+  { value: 'manual', label: '纯手动（只手动出稿/推送）' },
+  { value: 'auto_draft', label: '自动写稿（到点入库，人工审后手动推）' },
+  { value: 'auto_draft_push', label: '自动写稿 + 自动推草稿箱（全自动）' },
+]);
 
 async function loadStatus() {
   loading.value = true;
@@ -43,6 +50,9 @@ async function loadStatus() {
     cfg.enabled = status.value.config.enabled;
     cfg.writeTime = status.value.config.writeTime;
     cfg.pushEnabled = status.value.config.pushEnabled;
+    my.automationMode = status.value.my?.automationMode ?? 'manual';
+    my.writeTime = status.value.my?.writeTime ?? '06:00';
+    if (status.value.modeOptions?.length) modeOptions.value = status.value.modeOptions;
     cfgDirty.value = false;
   } catch (e) {
     statusError.value = errMsg(e, '调度状态加载失败');
@@ -51,42 +61,6 @@ async function loadStatus() {
   }
 }
 
-// ── 内容标题前缀（文章 / 漫画） ──
-// 起因：旧流水线的 title_prefix 被迁移原样带进来（值「【冒烟】」），所有新草稿标题都带【冒烟】，
-// 而漫画前缀是另一个 key，于是文章【冒烟】、漫画【漫】混排。这里给个能看能改的入口。
-const prefixes = ref<ContentPrefixItem[]>([]);
-const prefixForm = reactive<Record<string, string>>({});
-const savingPrefix = ref(false);
-
-async function loadPrefixes() {
-  try {
-    const res = await getContentPrefixes();
-    prefixes.value = res.items;
-    for (const it of res.items) prefixForm[it.key] = it.value;
-  } catch (e) {
-    statusError.value = errMsg(e, '标题前缀加载失败');
-  }
-}
-
-async function savePrefixes() {
-  savingPrefix.value = true;
-  try {
-    const res = await updateContentPrefixes({ ...prefixForm });
-    prefixes.value = res.items;
-    for (const it of res.items) prefixForm[it.key] = it.value;
-    ElMessage.success(res.message ?? '已保存');
-  } catch (e) {
-    ElMessage.error(errMsg(e, '前缀保存失败'));
-  } finally {
-    savingPrefix.value = false;
-  }
-}
-
-function prefixLabel(key: string): string {
-  if (key === 'title_prefix') return '文章前缀';
-  if (key === 'comic_title_prefix') return '漫画前缀';
-  return key;
-}
 
 function onCfgChange() {
   cfgDirty.value = true;
@@ -95,8 +69,13 @@ function onCfgChange() {
 async function saveCfg() {
   savingCfg.value = true;
   try {
-    const res = await setSchedulerConfig({ ...cfg });
+    // P4：automationMode/writeTime=我的每客户开关；enabled/pushEnabled=全局（后端仅 admin 放行）
+    const res = await setSchedulerConfig({ ...cfg, automationMode: my.automationMode, writeTime: my.writeTime });
     Object.assign(cfg, res.config);
+    if (res.my) {
+      my.automationMode = res.my.automationMode;
+      my.writeTime = res.my.writeTime;
+    }
     cfgDirty.value = false;
     ElMessage.success('调度配置已保存');
     await loadStatus();
@@ -145,7 +124,6 @@ async function toggleRunning(start: boolean) {
 
 onMounted(() => {
   void loadStatus();
-  void loadPrefixes();
 });
 </script>
 
@@ -181,23 +159,27 @@ onMounted(() => {
       />
 
       <el-form label-width="96px" class="cfg-form">
-        <el-form-item label="启用调度">
-          <el-switch v-model="cfg.enabled" aria-label="启用自动调度" @change="onCfgChange" />
-          <span class="wb-muted hint">到点后按各账号配额自动写稿</span>
+        <el-form-item label="自动化模式">
+          <el-radio-group v-model="my.automationMode" @change="onCfgChange">
+            <el-radio v-for="opt in modeOptions" :key="opt.value" :value="opt.value" border style="margin: 4px 8px 4px 0">
+              {{ opt.label }}
+            </el-radio>
+          </el-radio-group>
         </el-form-item>
         <el-form-item label="写稿时间">
           <el-time-picker
-            v-model="cfg.writeTime"
+            v-model="my.writeTime"
             format="HH:mm"
             value-format="HH:mm"
             placeholder="06:00"
             style="width: 140px"
             @change="onCfgChange"
           />
+          <span class="wb-muted hint">到点后按各账号配额自动写稿（manual 模式不生效）</span>
         </el-form-item>
-        <el-form-item label="级联推送">
-          <el-switch v-model="cfg.pushEnabled" aria-label="级联推送到草稿箱" @change="onCfgChange" />
-          <span class="wb-muted hint">并行期建议关闭，只写草稿不推送</span>
+        <el-form-item label="全局总开关">
+          <el-switch v-model="cfg.enabled" aria-label="全局调度总开关" @change="onCfgChange" />
+          <span class="wb-muted hint">关掉后所有人的自动化都不跑（仅管理员可改）</span>
         </el-form-item>
       </el-form>
 
@@ -248,44 +230,10 @@ onMounted(() => {
       />
     </el-card>
 
-    <!-- 内容标题前缀：文章与漫画各一个，避免「文章【冒烟】、漫画【漫】」这种混排 -->
-    <el-card shadow="never">
-      <template #header>内容标题前缀</template>
-
-      <el-form label-width="96px" @submit.prevent>
-        <el-form-item v-for="p in prefixes" :key="p.key" :label="prefixLabel(p.key)">
-          <el-input v-model="prefixForm[p.key]" maxlength="12" style="width: 160px" />
-          <span class="wb-muted prefix-hint">
-            {{ p.desc }}<template v-if="p.value !== prefixForm[p.key]">（当前生效：{{ p.value }}）</template>
-          </span>
-        </el-form-item>
-      </el-form>
-
-      <el-alert
-        type="info"
-        show-icon
-        :closable="false"
-        title="前缀在渲染/建稿时幂等添加（标题已带该前缀就不重复加）。改动只影响之后生成的草稿，历史文章标题不变。"
-      />
-
-      <div class="prefix-actions">
-        <el-button type="primary" :loading="savingPrefix" @click="savePrefixes">保存前缀</el-button>
-      </div>
-    </el-card>
   </div>
 </template>
 
 <style scoped>
-.prefix-hint {
-  margin-left: var(--wb-space-2);
-  font-size: 12px;
-}
-
-.prefix-actions {
-  margin-top: var(--wb-space-3);
-  display: flex;
-  justify-content: flex-end;
-}
 
 .card-head {
   display: flex;
