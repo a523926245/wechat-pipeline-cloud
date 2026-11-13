@@ -1,0 +1,205 @@
+ .gitignore                     |  3 ++
+ CHANGELOG.md                   | 38 ++++++++++++++++++++
+ docs/DEVLOG.md                 | 81 ++++++++++++++++++++++++++++++++++++++++++
+ server/package.json            |  8 +++--
+ server/scripts/smoke-angles.ts |  1 +
+ server/scripts/smoke-lint.ts   |  1 +
+ 6 files changed, 129 insertions(+), 3 deletions(-)
+diff --git a/.gitignore b/.gitignore
+index 5be9aff..06e70da 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -31,6 +31,9 @@ web/.vite/
+ *.db.bak-*
+ *.db.bak
+ 
++# T0 smoke isolated databases (schema-only throwaway copies)
++dev.smoke-*.db
++
+ # server runtime state: holds AES master key + temp scratch files
+ server/var/
+ 
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 36cdc92..e4abfc1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,44 @@
+ 
+ 面向使用者的变更记录（按新增 / 变更 / 修复分类）。详细背景与验收见 `docs/DEVLOG.md`（进度台账唯一真源）。
+ 
++## 2026-11-13 · 阶段 0 · T0：冒烟测试隔离化（冒烟永远只碰隔离库）
++
++### 新增
++- `server/scripts/smoke-isolated.ts` 隔离运行器：每轮冒烟新建 schema-only 空库 `dev.smoke-*.db`（零行、真实数据零复制），
++  env 白名单注入（剥离 `APP_SECRET_KEY`、一切 `*TOKEN/*SECRET/*KEY`、代理变量），原库前后 SHA-256 指纹比对，
++  清理矩阵（普通异常/子进程非零退出/超时/SIGINT/SIGTERM）+ SIGKILL 残留恢复命令 `npm run smoke:prune-iso`。
++- `server/scripts/smoke-db-guard.ts` 子进程 DB 守卫：只认 `dev.smoke-*.db`，路径归一后反真实库（含别名），零绕过开关。
++- `server/scripts/smoke-net-guard.mjs` 网络网守（**Node 层入口隔离，非 OS 级**）：封 fetch/http/https/net/tls/dgram/
++  WebSocket/dns/child_process/worker_threads；仅允许 `listen(0)` 数值 loopback 临时端口 + 显式登记精确命中。
++- `server/scripts/smoke-run.ts` 引导入口（含 `selftest:*` 自检与 13 条网络反向用例）。
++- 十项验收台 `npm run verify:smoke-iso`（正向隔离/真实库反向被拒/env 失败即退/网络阻断/断言保留/四连/原库指纹一致/
++  清理矩阵/空库证明/网络反向）——2026-11-13 实测 **10/10 通过**。
++
++### 变更
++- `npm run smoke:lint / smoke:style / smoke:angles` **命令名不变**，执行体改走隔离运行器——今后三条标准冒烟
++  永远只跑隔离库，直跑 `smoke-*.ts` 会被拒绝。行为习惯变化：直跑被拒属预期，无任何绕过通道。
++- `.gitignore` 增加 `dev.smoke-*.db`。
++
++### 修复
++- 无（本项为测试基建，不触碰 `server/src/**`、Prisma Schema、真实数据与业务逻辑）。
++
++### 验收
++- typecheck 绿；smoke:lint **116 项** / smoke:style **33 项** / smoke:angles **30 项（当场计数）** 全 PASS；
++  真实 `dev.db` 全程指纹一致（`fea0f123…`）。详见 `docs/restructure/T0-ACCEPTANCE-REPORT.md`。
++
++## 2026-11-12（夜）· 重构第一阶段：项目审计（文档交付，未动代码）
++
++### 新增
++- `docs/AUDIT-REPORT.md` 项目现状审计报告：调用链/Prompt 分布/问题清单 P1-P14（带代码证据）/
++  四类模块清单/数据库调整方案/对 SECOND-OPINION 5 问的审计意见。
++- `docs/RESTRUCTURE-CHECKLIST.md` 重构实施清单：阶段 2-7 逐文件改造、验收门禁、PLAN §17 交付物对照。
++
++### 变更
++- 无代码变更（按 PLAN §16.1 先审计后动工）。
++
++### 修复
++- 无。
++
+ ## 2026-11-12（傍晚：只改提示词，用数据决定要不要写代码）
+ 
+ ### 新增
+diff --git a/docs/DEVLOG.md b/docs/DEVLOG.md
+index a6e5dba..2c7252d 100644
+--- a/docs/DEVLOG.md
++++ b/docs/DEVLOG.md
+@@ -1303,3 +1303,84 @@ Agnes-image（62）是用户重建的，Key 在。
+ - `joinVariantBlocks` 统一用 `---` 拼接（多于一条时），保证「点开看一眼再保存」不会改格式——
+   实测三个维度的回写都**逐字节相同**。
+ - 冒烟补 4 项：有 `---` 按块切、无 `---` 退回按行、`## ` 切小节。`smoke:style` 29 → **33 项**。
++
++## 2026-11-12（夜）· RESTRUCTURE-PLAN-V1 第一阶段：项目审计（未动代码）
++
++**背景**：用户提供《RESTRUCTURE-PLAN-V1.md》（整体重构方案）与《SECOND-OPINION.md》
++（形态一致性实测数据 + 5 问），要求先审计不动代码，输出审计报告与重构实施清单。
++
++**产出**
++- `docs/AUDIT-REPORT.md`——现状审计报告：架构/流程/DB 盘点/选题与写稿调用链/Prompt 分布/
++  问题 P1-P14（带文件行号证据）/可保留-需重构-需新增-需废弃四清单/数据库调整方案/
++  4 个冲突裁决点 + 对 SECOND-OPINION 5 问的审计意见。
++- `docs/RESTRUCTURE-CHECKLIST.md`——重构实施清单：阶段 2-7 逐文件改动、验收门禁
++  （typecheck + smoke:lint/style/angles）、附 PLAN §17 交付物对照。
++
++**审计关键发现（新增事实）**
++- `config/topic_seeds.json` 是死文件（无代码读取）；`dedup.ts` 的 `judgeAngle` 三层判重
++  是**死代码**（线上扩库只有 normalize 精确去重）；`Article.qualityJson` 死字段。
++  → 方案 §4.1「取消种子驱动」已自然发生，但去重比方案描述的更弱。
++- `style-prompts.ts` 迁移区 v2→v15 约 900 行 + Setting 里 14 个迁移标志 = P4 实证。
++- 方案要求的 8 个新实体全部不存在；TaskRun/RunLog/StylePrompt/Setting 可承接一半语义。
++- dev.db 盘点：6 赛道、Angle 33（21 未用）、Article 12（全 draft）、StylePrompt 41 行。
++
++**待用户拍板（审计 §13/§15）**
++1. 默认兜底 vs「配置非空不做兜底」的两步走方案
++2. reflowParagraphs 去留（不打补丁约束的边界）
++3. 门禁数字按形态参数化（FORM-ARCHITECTURE 三道闸）
++4. TrackContract 砍半范围（form+reviewPolicy 先落）
++5. Embedding 去重实现路径、事实核验来源白名单、审核模型角色归属
++
++**下一步**：等裁决 → 阶段 2（赛道配置与 Prompt 体系）动工。
++
++## 2026-11-12（晚）· 重构设计基线入库 + 实施前检查（docs/restructure/）
++
++**产出**：`docs/restructure/` 文档集——00-FINAL-EXECUTION-CHARTER（用户定稿总纲，含五项核心验收指标口径）、01-08 八份审查文档、README（阅读顺序+决策登记表）、09-PRE-IMPLEMENTATION-CHECK（实施前检查：代码-文档差异/决策落实/migration baseline 方案/Python 本机流水线盘点/阶段 0-1 文件清单/风险与测试计划）。
++
++**用户拍板**：D1 选题 status+used 双维度+TopicReview（不建 TopicCandidate）；D2 reflow 先对照测试再定默认；D3 门禁只参数化赛道变化项；D4 TrackContract=form+reviewPolicy、N 版本行+生效指针；D5 审核复用 write 角色（带验证条件）；D6 配置两步走。另有 RBAC 矩阵、expiresAt/maxOAAccounts 处置、legacy 追溯、迁移安全观（down≠安全）、UI 三批次、去重降级语义（判重失败阻止自动升格）、五项验收指标（分母/周期/来源口径）。
++
++**实施前检查关键发现**：Python 本机流水线与云端**已分叉**——双选题库（data/angles/*.json vs Angle 表，used 互不相通）、文风双真源、同批公众号账号、双调度器 → 决策 X（共存方式三选一）未决前，云端自动化不得对本机在产账号开启写稿+推送。
++
++**状态**：只读检查完成，未改任何代码/数据库。等用户授权阶段 0 与 1A。
++
++## 2026-11-12（晚 20:28）· 切换日：本机流水线停用，云端成为唯一系统
++
++用户拍板「停掉本机的，现在不需要了」，替代式切换当即执行：
++- WorkBuddy 自动化「公众号每日创作并推送草稿」（06:00）**PAUSED**（automation_update 核实；任务保留可逆）。
++- 本机 `wechat-pipeline` 转只读蓝本归档；**文风双真源作废**（唯一真源=云端 StylePrompt）。
++- ⚠️ 生产空窗：云端 User.automationMode 全为 manual，每日自动出稿为 0；恢复产稿=按账号调 auto_draft / auto_draft_push（群发永远人工）。
++- 决策 X 关闭；`docs/restructure/README` 与 `09-PRE-IMPLEMENTATION-CHECK` 已更新。
++
++## 2026-11-13 · 阶段 0 · T0：冒烟测试隔离化（授权范围仅 T0，完成后停下等验收）
++
++**授权**：仅 T0（T1–T8 UI 改造不在授权内）。机制真源=`docs/restructure/T0-SAFETY-SUPPLEMENT.md`（v3）；
++概要=`STAGE0-IMPLEMENTATION-PLAN-V2.md` §二；修订背景=`T0-V3-REVISION-DIFF.md`。V1 作废文档零引用。
++
++**交付**（验收报告全文见 `docs/restructure/T0-ACCEPTANCE-REPORT.md`）
++- 四件套：`smoke-isolated.ts`（795 行，运行器+十项验收台）/ `smoke-db-guard.ts`（106 行）/
++  `smoke-net-guard.mjs`（439 行，Node 层网络入口隔离，非 OS 级）/ `smoke-run.ts`（184 行，引导入口）。
++- 三 smoke 胶水：lint/angles 各 **仅 +1 行**端口登记；`smoke-style-prompts.ts` **零改动**（无 app.listen）。
++- `package.json`：`smoke:lint|style|angles` 命令名不变、改走隔离运行器；新增 `verify:smoke-iso` / `smoke:prune-iso`。
++- `.gitignore` +`dev.smoke-*.db`。
++
++**实测验收（2026-11-13 真实输出）**
++- 四连全绿：typecheck exit=0；smoke:lint **116 项**；smoke:style **33 项**；smoke:angles **30 项（当场计数）**。
++- `npm run verify:smoke-iso` **10/10 通过**（正向隔离/真实库反向被拒×3 形态/env 失败即退×3/网络阻断/13 条网络反向/
++  原库 SHA-256 一致 `fea0f123…`/清理矩阵五路径+SIGKILL 残留 prune 恢复/断言保留/四连/空库证明 15 表×0 行）。
++
++**与 v3 设计差异（实测修正，细节见验收报告 §4）**：①表名用物理名（`OAAccount`→`@@map("Account")`）；
++②`die()` 须自行清理（process.exit 跳 finally）+ exit 兜底；③dns 数值 IP **同步短路**（Node listen→lookupAndListen
++回调恒异步，破坏同步 bind/取端口语义）；④listen 不支持 options.lookup（同步语义由③保证）；⑤connect 强制
++数值 lookup 封「自定义 lookup 重定向」旁路（规则 4 加严）；⑥Node normalizeArgs 预归一化数组形态须先展开
++（undici/fetch 实证）；⑦dns.Resolver 实例通道补封；⑩target 映射/hang 保活/scanWriters 接 probePort/
++onSignal 延迟清理（Windows 句柄 EBUSY）/正则补 `-journal` 等实现期修复。
++
++**经验沉淀（写网守/运行器必读）**
++- Node `Server.listen(0)` 无 host 是**同步 bind**（address() 立即可读）；带 host 走 dns.lookup **异步**回调再 bind，
++  且**无视 options.lookup**。冒烟脚本全部依赖同步取端口 → 网守必须对数值 IP 同步短路 dns.lookup。
++- Node `net.connect` 内部以 `normalizeArgs` 预归一化的 `[options, cb]` **数组**调 `socket.connect`——
++  包装 Socket.prototype.connect 时必须先展开数组形态，否则把数组当 options、`.port` 取不到误杀。
++- `process.exit` 跳过 finally：runner 的 die() 必须自行清理 + `process.on('exit')` 兜底，否则失败路径留残留。
++- Prisma 模型名≠表名：`@@map` 存在时（OAAccount→Account）凡按 sqlite_master 查表必须用物理表名。
++
++**状态**：T0 完成，十项验收 10/10。**停在此处等 T0 验收；未获 T1 授权不进入 UI 改造。**
+diff --git a/server/package.json b/server/package.json
+index 6ed161c..765c8ce 100644
+--- a/server/package.json
++++ b/server/package.json
+@@ -24,12 +24,14 @@
+     "smoke:models": "node --experimental-strip-types scripts/smoke-models.ts",
+     "smoke:cover": "node --experimental-strip-types scripts/smoke-cover.ts",
+     "smoke:migrate": "node --experimental-strip-types scripts/smoke-migrate.ts",
+-    "smoke:angles": "node --experimental-strip-types scripts/smoke-angles.ts",
++    "smoke:angles": "node --experimental-strip-types scripts/smoke-isolated.ts run angles",
+     "smoke:bulk": "node --experimental-strip-types scripts/smoke-bulk-delete.ts",
+     "verify:bulk": "node --experimental-strip-types scripts/verify-bulk-delete.ts",
+     "verify:zodiac": "node --experimental-strip-types scripts/verify-zodiac.ts",
+-    "smoke:lint": "node --experimental-strip-types scripts/smoke-lint.ts",
+-    "smoke:style": "node --experimental-strip-types scripts/smoke-style-prompts.ts",
++    "smoke:lint": "node --experimental-strip-types scripts/smoke-isolated.ts run lint",
++    "smoke:style": "node --experimental-strip-types scripts/smoke-isolated.ts run style",
++    "verify:smoke-iso": "node --experimental-strip-types scripts/smoke-isolated.ts verify",
++    "smoke:prune-iso": "node --experimental-strip-types scripts/smoke-isolated.ts prune",
+     "smoke:auth": "node --experimental-strip-types scripts/smoke-auth.ts",
+     "prune:old": "node --experimental-strip-types scripts/prune-old-style.ts",
+     "demo:write": "node --experimental-strip-types scripts/demo-write.ts",
+diff --git a/server/scripts/smoke-angles.ts b/server/scripts/smoke-angles.ts
+index 8893f6b..68c4998 100644
+--- a/server/scripts/smoke-angles.ts
++++ b/server/scripts/smoke-angles.ts
+@@ -54,6 +54,7 @@ interface ListResult {
+ async function main(): Promise<void> {
+   const app = createApp();
+   const server = app.listen(0);
++  if (!(globalThis as { __SMOKE_NET__?: { register(s: unknown): boolean } }).__SMOKE_NET__?.register(server)) throw new Error('smoke-net-guard 未预载，拒绝运行（必须经 smoke-run.ts 引导）'); // T0 端口登记胶水
+   const port = (server.address() as { port: number }).port;
+   const base = `http://127.0.0.1:${port}`;
+ 
+diff --git a/server/scripts/smoke-lint.ts b/server/scripts/smoke-lint.ts
+index 26478af..8a7b8ad 100644
+--- a/server/scripts/smoke-lint.ts
++++ b/server/scripts/smoke-lint.ts
+@@ -400,6 +400,7 @@ async function main(): Promise<void> {
+ 
+   const app = createApp();
+   const server = app.listen(0);
++  if (!(globalThis as { __SMOKE_NET__?: { register(s: unknown): boolean } }).__SMOKE_NET__?.register(server)) throw new Error('smoke-net-guard 未预载，拒绝运行（必须经 smoke-run.ts 引导）'); // T0 端口登记胶水
+   const port = (server.address() as { port: number }).port;
+   const base = `http://127.0.0.1:${port}`;
+   // /api/* 已加鉴权；本脚本测门禁不测鉴权，走 SMOKE_NO_AUTH 旁路（同 smoke:cover 等）。

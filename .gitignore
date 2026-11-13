@@ -31,6 +31,9 @@ web/.vite/
 *.db.bak-*
 *.db.bak
 
+# T0 smoke isolated databases (schema-only throwaway copies)
+dev.smoke-*.db
+
 # server runtime state: holds AES master key + temp scratch files
 server/var/
 

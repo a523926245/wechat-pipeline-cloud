@@ -54,6 +54,7 @@ interface ListResult {
 async function main(): Promise<void> {
   const app = createApp();
   const server = app.listen(0);
+  if (!(globalThis as { __SMOKE_NET__?: { register(s: unknown): boolean } }).__SMOKE_NET__?.register(server)) throw new Error('smoke-net-guard 未预载，拒绝运行（必须经 smoke-run.ts 引导）'); // T0 端口登记胶水
   const port = (server.address() as { port: number }).port;
   const base = `http://127.0.0.1:${port}`;
 

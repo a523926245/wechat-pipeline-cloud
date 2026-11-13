@@ -1,0 +1,36 @@
+$ npm run verify:smoke-iso
+npm warn Unknown user config "home". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+
+> wechat-pipeline-server@0.1.0 verify:smoke-iso
+> node --experimental-strip-types scripts/smoke-isolated.ts verify
+
+════════════════════════════════════════════════════════
+[verify] T0 验收台（10 项，真实运行）
+[t0] prune 已清除 3 项：
+  K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.smoke-mweig6pi0tc3.db
+  K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.smoke-mweig6pi0tc3.db-journal
+  K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\var\tmp\smoke-iso-mweig6pi0tc3
+────────────────────────────────────────────────────────
+PASS  ① 隔离数据库正向测试通过
+      exit=0；ISO-EMPTY/FIXTURE/MATCH 标记齐=true
+PASS  ⑨ 空库证明（表结构存在 + 行数=0 + 自建数据创建/查询/清理）
+      ISO-EMPTY tables=15/15 rows=0 + FIXTURE-PROBE-OK = true
+PASS  ② 真实数据库反向测试被拒绝
+      相对路径指向真实库: exit=1 拒绝；绝对路径指向真实库: exit=1 拒绝；别名路径指向真实库: exit=1 拒绝
+PASS  ③ 环境变量注入失败时直接退出
+      DATABASE_URL 缺失: exit=1 拒绝；非 SQLite 连接串: exit=1 拒绝；隔离文件不存在: exit=1 拒绝
+PASS  ④ 网络访问被阻断（含 loopback 未登记端口，Node 层）
+      见⑩
+PASS  ⑩ 网络隔离反向测试（Node 层能力验证）
+      外部 HTTPS 请求被阻止: exit=1 命中被拦；外部 HTTP 请求被阻止: exit=1 命中被拦；未登记 loopback 端口被阻止（fetch）: exit=1 命中被拦；未登记 loopback 端口被阻止（http.get）: exit=1 命中被拦；未登记 loopback 端口被阻止（net.connect）: exit=1 命中被拦；已登记临时端口可达 + close 即撤销: exit=1 命中被拦；代理环境变量无法绕过: exit=1 命中被拦；dns 被阻止: exit=1 命中被拦；child_process 被阻止: exit=1 命中被拦；WebSocket 被阻止: exit=1 命中被拦；tls.connect 被阻止: exit=1 命中被拦；dgram 被阻止: exit=1 命中被拦；worker_threads 被阻止: exit=1 命中被拦
+PASS  ⑦ 真实 dev.db 前后 SHA-256 一致
+      sha256=fea0f12373a54678165f95651e358552e5eae17031046052aaff560dc86fc3f5（每轮 run 末尾另有 REAL-DB FINGERPRINT MATCH 断言）
+PASS  ⑧ 副本清理（五条退出路径 + SIGKILL 残留恢复）
+      runner普通异常: exit=1 残留=无 ；子进程未捕获异常: exit=1 残留=无 ；子进程非零退出: exit=3 残留=无 ；超时: exit=1 残留=无 ；SIGINT: exit=1 残留=无 ；SIGTERM: exit=1 残留=无 ；SIGKILL: 残留暴露=true（dev.smoke-mweig6pi0tc3.db,dev.smoke-mweig6pi0tc3.db-journal）→ prune 恢复=true
+PASS  ⑤ 三个 smoke 原有断言全部保留
+      git diff 白名单 + 计数不降（lint 116 / style 33 / angles 当场计数）——报告留档
+PASS  ⑥ 四连在隔离副本上通过
+      npm run typecheck + smoke:lint/style/angles 真实输出——报告留档
+────────────────────────────────────────────────────────
+[verify] 10/10 项通过
+EXIT_CODE=0
