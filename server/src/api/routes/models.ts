@@ -16,6 +16,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../db.ts';
 import { asyncHandler } from '../async-handler.ts';
 import { bulkDeleteSchema, runBulkDelete } from '../bulk-delete.ts';
@@ -329,7 +330,7 @@ modelsRouter.post(
         modelId: body.modelId,
         apiKeyEnc,
         apiKeyMask: apiKey ? maskSecret(apiKey) : '',
-        paramsJson: packJson(stripNulls(body.paramsJson) ?? null),
+        paramsJson: packJson(stripNulls(body.paramsJson) ?? null) ?? Prisma.DbNull,
         enabled: body.enabled,
       },
     });

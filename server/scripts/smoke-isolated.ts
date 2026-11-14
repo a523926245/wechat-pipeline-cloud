@@ -2,14 +2,17 @@
  * T0 隔离运行器（父进程）。三条标准冒烟（smoke:lint / smoke:style / smoke:angles）
  * 的唯一执行通道——命令名不变，执行体改为经本运行器。
  *
- * 机制真源：docs/restructure/T0-SAFETY-SUPPLEMENT.md v3。
- *   ① 隔离库 = schema-only 空库：prisma db push --schema schema.sqlite.prisma
- *      --skip-generate 对全新文件建结构、零行数据（真实数据零复制）；
- *   ② schema-only 验证链：文件落盘 → PRAGMA database_list 实测连接路径 →
+ * 机制真源：docs/restructure/T0-SAFETY-SUPPLEMENT.md v3；S1-3 MySQL 载体适配见
+ * docs/restructure/RESTRUCTURE-2.0-CONVERGED-PLAN.md §四 4.1。
+ *   ① 隔离库 = 固定 MySQL 测试库 wechat_pipeline_smoke：run 前重建 schema
+ *      （清空全部表 → prisma migrate deploy 到测试库）、run 后清空，零行数据
+ *      （真实数据零复制；与业务库 wechat_pipeline 严格分离）；
+ *   ② schema-only 验证链：DATABASE() 实测 = wechat_pipeline_smoke →
  *      关键业务表结构存在 → 全部业务表行数 = 0，任一失败 exit(1)；
  *   ③ 失败关闭、零绕过：无 SMOKE_ALLOW_LIVE_DB 之类放行开关；
- *   ④ 原库零写入：测试前后 SHA-256（含 -wal/-shm）+ 大小 + mtime 比对，
- *      任一不同本轮作废并报警；启动前检测并发写入者（8787 / scheduler）默认拒绝启动；
+ *   ④ 真实库零写入：测试前后业务库状态指纹（16 表 COUNT+CHECKSUM）+ dev.db
+ *      文件 SHA-256/大小/mtime 比对，任一不同本轮作废并报警；启动前检测并发
+ *      写入者（8787 / scheduler）默认拒绝启动；
  *   ⑤ 子进程 env 显式允许清单（其余一律剥离：APP_SECRET_KEY / *TOKEN/*SECRET/*KEY /
  *      代理变量 / 云凭据）；
  *   ⑥ 网络隔离（第 1 层 Node 入口隔离）由 smoke-net-guard.mjs 预载实现——
@@ -18,7 +21,6 @@
  * 用法：
  *   node --experimental-strip-types scripts/smoke-isolated.ts run <lint|style|angles>
  *   node --experimental-strip-types scripts/smoke-isolated.ts verify   （10 项验收台）
- *   node --experimental-strip-types scripts/smoke-isolated.ts prune    （SIGKILL 残留恢复）
  *
  * 内部旗标（仅供 verify 验收台构造故障路径，不构成任何隔离绕过）：
  *   --timeout-ms=N              收紧子进程超时
@@ -27,21 +29,18 @@
  *   --simulate-error=after-create     隔离库建成后抛普通异常（验证 runner 清理）
  *   --inject-proxy-env                向子进程注入代理变量（验证网守清除+封堵）
  *
- * SIGKILL 残留（无法保证清理）：最坏残留 = server/prisma/dev.smoke-*.db（绝不碰原库），
- * 恢复方法 = `npm run smoke:prune-iso`（或手动按命名模式删除）。
+ * SIGKILL 残留（无法保证清理）：最坏残留 = smoke 库遗留表（绝不碰业务库），
+ * 恢复 = 下次 run 前重建自动清空。
  */
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
-  readdirSync,
   rmSync,
   statSync,
-  unlinkSync,
 } from 'node:fs';
 import { connect as netConnect } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
@@ -50,17 +49,33 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const SCRIPTS_DIR = dirname(fileURLToPath(import.meta.url)); // server/scripts
 const SERVER_DIR = resolve(SCRIPTS_DIR, '..'); // server
 const PRISMA_DIR = resolve(SERVER_DIR, 'prisma');
-const REAL_DB = join(PRISMA_DIR, 'dev.db');
+const PRISMA_CLI = join(SERVER_DIR, 'node_modules', 'prisma', 'build', 'index.js');
 const NET_GUARD = join(SCRIPTS_DIR, 'smoke-net-guard.mjs');
 const RUN_ENTRY = join(SCRIPTS_DIR, 'smoke-run.ts');
 
-/** 全部业务表的物理表名（schema.sqlite.prisma 模型清单）——空库证明逐表断言行数=0。
- *  注意 @@map：OAAccount 模型物理表名是 Account（2026-11 多用户改造稳住旧表名），其余=模型名。 */
+/** 库名白名单（与 smoke-db-guard.ts 同一口径；守卫是唯一出入口闸，这里是运行器自我断言）。 */
+const SMOKE_DB_NAME = 'wechat_pipeline_smoke';
+const REAL_DB_NAME = 'wechat_pipeline';
+const DEV_DB_FILE = join(PRISMA_DIR, 'dev.db');
+
+/** 全部业务表的物理表名（schema.prisma 模型清单）——空库证明逐表断言行数=0。
+ *  注意 @@map：OAAccount 模型物理表名是 Account（2026-11 多用户改造稳住旧表名），其余=模型名。
+ *  MySQL 本机 lower_case_table_names=1，information_schema 呈小写，比对一律忽略大小写。 */
 const BUSINESS_TABLES = [
   'Track', 'TrackPipeline', 'Account', 'User', 'UserSession', 'WechatToken',
   'Angle', 'Article', 'ComicPanel', 'TaskRun', 'RunLog',
   'LlmModel', 'ModelBinding', 'Setting', 'StylePrompt',
 ];
+
+/** 清表顺序 = 外键子表在前（ComicPanel→Article→{Track,Account,Angle} 等），单条 DROP 语句内按序生效。 */
+const SMOKE_DROP_ORDER = [
+  'ComicPanel', 'RunLog', 'Article', 'ModelBinding', 'WechatToken', 'UserSession',
+  'Account', 'TrackPipeline', 'Angle', 'TaskRun', 'LlmModel', 'User', 'Track',
+  'Setting', 'StylePrompt', '_prisma_migrations',
+];
+
+/** 真实库指纹表清单 = 业务表 + 迁移记账表。 */
+const FINGERPRINT_TABLES = [...BUSINESS_TABLES, '_prisma_migrations'];
 
 /** 子进程 env 显式允许清单（Q7-4）。其余一律剥离。 */
 const ENV_ALLOW = ['PATH', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'LANG', 'TZ'] as const;
@@ -83,7 +98,7 @@ function die(msg: string): never {
   const residuals = cleanupActiveRun();
   if (residuals.length > 0) {
     console.error(`[t0] ⚠️ 清理失败，残留：${residuals.join(', ')}`);
-    console.error('[t0] ⚠️ 恢复方法：npm run smoke:prune-iso');
+    console.error('[t0] ⚠️ 恢复：下次 run 前重建自动清空）');
   }
   process.exit(1);
 }
@@ -94,25 +109,45 @@ function normPath(p: string): string {
   const s = resolve(p);
   return process.platform === 'win32' ? s.toLowerCase() : s;
 }
-
-interface FpEntry {
-  path: string;
-  sha256: string;
-  size: number;
-  mtimeMs: number;
+/** 凭据脱敏：任何日志/报错不落密码。 */
+function maskUrl(raw: string): string {
+  return raw.replace(/:\/\/([^:/@]+):([^@/]*)@/g, '://$1:***@');
 }
 
-/** 原库指纹：dev.db + 存在的 -wal/-shm（Q6）。 */
-function fingerprintRealDb(): FpEntry[] {
-  return [REAL_DB, `${REAL_DB}-wal`, `${REAL_DB}-shm`]
-    .filter((f) => existsSync(f))
-    .map((f) => {
-      const st = statSync(f);
-      return { path: f, sha256: sha256File(f), size: st.size, mtimeMs: Math.round(st.mtimeMs) };
-    });
+/** 读取基座 mysql 连接串（process.env 优先，回落 server/.env）。只取不打印。 */
+function loadBaseUrl(): string {
+  const fromEnv = process.env.DATABASE_URL;
+  if (fromEnv && fromEnv.startsWith('mysql://')) return fromEnv;
+  let raw = '';
+  try {
+    raw = readFileSync(join(SERVER_DIR, '.env'), 'utf8');
+  } catch {
+    die('无法读取 server/.env（且 process.env.DATABASE_URL 无 mysql 串）');
+  }
+  const m = raw.match(/^DATABASE_URL="?([^"\r\n]+)/m);
+  if (!m?.[1] || !m[1].startsWith('mysql://')) {
+    die('server/.env 无 mysql:// DATABASE_URL，拒绝执行');
+  }
+  return m[1]!;
 }
-function fpEqual(a: FpEntry[], b: FpEntry[]): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+
+/** 基座串 → smoke 库串（只换库名，凭据沿用）。 */
+function smokeUrlFrom(baseUrl: string): string {
+  return baseUrl.replace(/\/[^/?]+(\?|$)/, `/${SMOKE_DB_NAME}$1`);
+}
+
+/** 库名硬断言：任何清表/建库/连接动作前必须过这道闸（真实库保护，fail-closed）。 */
+function assertSmokeUrl(url: string, action: string): void {
+  let db = '';
+  try {
+    const u = new URL(url);
+    db = u.pathname.startsWith('/') ? u.pathname.slice(1) : u.pathname;
+  } catch {
+    die(`${action}：连接串解析失败 ${maskUrl(url)}`);
+  }
+  if (db !== SMOKE_DB_NAME) {
+    die(`${action}：目标库「${db}」≠ ${SMOKE_DB_NAME}，拒绝执行`);
+  }
 }
 
 function buildChildEnv(extra: Record<string, string>): Record<string, string> {
@@ -177,10 +212,96 @@ async function scanWriters(): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────
+// smoke 库操作（清表 / 查表）与真实库指纹
+// ─────────────────────────────────────────────────────────────
+
+/** 同步清空 smoke 库全部表（FK 子表在前；供 finally/die/exit 等同步路径使用）。 */
+function dropSmokeTablesSync(smokeUrl: string): void {
+  assertSmokeUrl(smokeUrl, 'DROP smoke 表');
+  const sql = `DROP TABLE IF EXISTS ${SMOKE_DROP_ORDER.map((t) => `\`${t}\``).join(', ')}`;
+  const r = spawnSync(
+    process.execPath,
+    [PRISMA_CLI, 'db', 'execute', '--stdin', '--url', smokeUrl],
+    {
+      cwd: SERVER_DIR,
+      input: sql,
+      env: buildChildEnv({ CHECKPOINT_DISABLE: '1', PRISMA_HIDE_UPDATE_MESSAGE: '1' }),
+      encoding: 'utf8',
+      timeout: 60_000,
+    },
+  );
+  if (r.status !== 0) {
+    throw new Error(`DROP smoke 表失败（exit=${r.status}）：${(r.stderr || r.stdout || '').slice(0, 500)}`);
+  }
+}
+
+/** smoke 库当前表清单（information_schema）。 */
+async function smokeTables(smokeUrl: string): Promise<string[]> {
+  assertSmokeUrl(smokeUrl, '查 smoke 表');
+  const prev = process.env.DATABASE_URL;
+  process.env.DATABASE_URL = smokeUrl;
+  const { PrismaClient } = await import('@prisma/client');
+  const pc = new PrismaClient();
+  try {
+    const rows = (await pc.$queryRawUnsafe(
+      `SELECT table_name AS t FROM information_schema.tables WHERE table_schema = '${SMOKE_DB_NAME}'`,
+    )) as Array<{ t: string }>;
+    return rows.map((r) => r.t);
+  } finally {
+    await pc.$disconnect();
+    if (prev === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = prev;
+  }
+}
+
+interface FpEntry {
+  path: string;
+  sha256: string;
+  size: number;
+  mtimeMs: number;
+}
+
+/** dev.db 归档文件指纹（SHA-256 + 大小 + mtime；Q6 遗留语义保留，附加保护）。 */
+function fingerprintDevDbFile(): FpEntry[] {
+  return [DEV_DB_FILE, `${DEV_DB_FILE}-wal`, `${DEV_DB_FILE}-shm`]
+    .filter((f) => existsSync(f))
+    .map((f) => {
+      const st = statSync(f);
+      return { path: f, sha256: sha256File(f), size: st.size, mtimeMs: Math.round(st.mtimeMs) };
+    });
+}
+function fpEqual(a: FpEntry[], b: FpEntry[]): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** 真实业务库状态指纹：16 表 COUNT(*) + CHECKSUM TABLE（只读；零写入证明）。 */
+async function fingerprintBusinessDb(baseUrl: string): Promise<{ state: string; sha256: string }> {
+  const prev = process.env.DATABASE_URL;
+  process.env.DATABASE_URL = baseUrl;
+  const { PrismaClient } = await import('@prisma/client');
+  const pc = new PrismaClient();
+  try {
+    const parts: string[] = [];
+    for (const t of FINGERPRINT_TABLES) {
+      const c = (await pc.$queryRawUnsafe(`SELECT COUNT(*) AS n FROM \`${t}\``)) as Array<{ n: unknown }>;
+      const k = (await pc.$queryRawUnsafe(`CHECKSUM TABLE \`${t}\``)) as Array<Record<string, unknown>>;
+      const checksum = k?.[0] ? String(Object.values(k[0])[1] ?? '?') : '?';
+      parts.push(`${t}:${String(c?.[0]?.n ?? '?')}#${checksum}`);
+    }
+    const state = parts.join('|');
+    return { state, sha256: createHash('sha256').update(state).digest('hex') };
+  } finally {
+    await pc.$disconnect();
+    if (prev === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = prev;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // 运行态（信号处理器与 finally 共用，保证任一退出路径都清理）
 // ─────────────────────────────────────────────────────────────
 interface ActiveRun {
-  isoAbs: string;
+  smokeUrl: string;
   contentRoot: string;
   child: ChildProcess | null;
 }
@@ -189,14 +310,11 @@ let activeRun: ActiveRun | null = null;
 function cleanupActiveRun(): string[] {
   const residuals: string[] = [];
   if (!activeRun) return residuals;
-  const { isoAbs, contentRoot } = activeRun;
-  for (const p of [isoAbs, `${isoAbs}-wal`, `${isoAbs}-shm`, `${isoAbs}-journal`]) {
-    if (!existsSync(p)) continue;
-    try {
-      unlinkSync(p);
-    } catch {
-      residuals.push(p);
-    }
+  const { smokeUrl, contentRoot } = activeRun;
+  try {
+    dropSmokeTablesSync(smokeUrl);
+  } catch (e) {
+    residuals.push(`smoke 库表（${e instanceof Error ? e.message : String(e)}）`);
   }
   if (existsSync(contentRoot)) {
     try {
@@ -209,7 +327,7 @@ function cleanupActiveRun(): string[] {
 }
 
 function onSignal(sig: string): void {
-  console.error(`\n[t0] 收到 ${sig} → 杀子进程 + 清理隔离副本后退出`);
+  console.error(`\n[t0] 收到 ${sig} → 杀子进程 + 清理隔离库后退出`);
   const child = activeRun?.child;
   let settled = false;
   const done = (): void => {
@@ -218,15 +336,14 @@ function onSignal(sig: string): void {
     const residuals = cleanupActiveRun();
     if (residuals.length > 0) {
       console.error(`[t0] ⚠️ 清理失败，残留：${residuals.join(', ')}`);
-      console.error('[t0] ⚠️ 恢复方法：npm run smoke:prune-iso');
+      console.error('[t0] ⚠️ 恢复：下次 run 前重建自动清空）');
     } else {
       console.error('[t0] 清理完成');
     }
     process.exit(1);
   };
   if (child && child.exitCode === null && !child.killed) {
-    // Windows 上 SQLite 文件句柄随进程终止才释放——先等子进程真正退出再删库，
-    // 否则 unlink 撞 EBUSY 把「清理成功」误报成残留。兜底定时器防子进程挂死。
+    // 先等子进程真正退出再清库，避免连接占用把「清理成功」误报成残留。兜底定时器防子进程挂死。
     const fallback = setTimeout(done, 3000);
     child.once('exit', () => {
       clearTimeout(fallback);
@@ -249,17 +366,19 @@ process.on('exit', () => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// 隔离库创建 + schema-only 验证链（Q7-6）
+// 隔离库创建（run 前重建）+ schema-only 验证链（Q7-6）
 // ─────────────────────────────────────────────────────────────
-function createIsoDb(isoName: string, isoUrl: string): void {
-  const prismaCli = join(SERVER_DIR, 'node_modules', 'prisma', 'build', 'index.js');
+/** run 前重建 schema：清空 smoke 库表 → prisma migrate deploy 到测试库（零业务库接触）。 */
+function createIsoDb(smokeUrl: string): void {
+  assertSmokeUrl(smokeUrl, 'ISO-CREATE');
+  dropSmokeTablesSync(smokeUrl);
   const r = spawnSync(
     process.execPath,
-    [prismaCli, 'db', 'push', '--schema', join('prisma', 'schema.sqlite.prisma'), '--skip-generate'],
+    [PRISMA_CLI, 'migrate', 'deploy'],
     {
       cwd: SERVER_DIR,
       env: buildChildEnv({
-        DATABASE_URL: isoUrl,
+        DATABASE_URL: smokeUrl,
         CHECKPOINT_DISABLE: '1',
         PRISMA_HIDE_UPDATE_MESSAGE: '1',
       }),
@@ -268,46 +387,45 @@ function createIsoDb(isoName: string, isoUrl: string): void {
     },
   );
   if (r.status !== 0) {
-    die(`prisma db push 失败（exit=${r.status}）：${(r.stderr || r.stdout || '').slice(0, 2000)}`);
+    die(`prisma migrate deploy 失败（exit=${r.status}）：${(r.stderr || r.stdout || '').slice(0, 2000)}`);
   }
 }
 
-async function verifyIsoChain(isoAbs: string, isoUrl: string): Promise<void> {
-  // ① 隔离路径下文件确实新建
-  if (!existsSync(isoAbs)) die(`ISO-VERIFY ① 失败：文件未落盘 ${isoAbs}`);
-  if (statSync(isoAbs).size <= 0) die(`ISO-VERIFY ① 失败：文件为空 ${isoAbs}`);
-
-  // ②③④ 连接实测（与测试同一 Prisma 客户端解析语义）
-  process.env.DATABASE_URL = isoUrl;
+async function verifyIsoChain(smokeUrl: string): Promise<void> {
+  assertSmokeUrl(smokeUrl, 'ISO-VERIFY');
+  const prev = process.env.DATABASE_URL;
+  process.env.DATABASE_URL = smokeUrl;
   const { PrismaClient } = await import('@prisma/client');
   const pc = new PrismaClient();
   try {
-    const rows = (await pc.$queryRawUnsafe('PRAGMA database_list')) as Array<{ file: string }>;
-    const file = rows?.[0]?.file ?? '';
-    if (normPath(file) !== normPath(isoAbs)) {
-      die(`ISO-VERIFY ② 失败：database_list=${file} 预期=${isoAbs}（连接路径实测不一致）`);
+    // ①② 连接实测（与测试同一 Prisma 客户端解析语义）
+    const rows = (await pc.$queryRawUnsafe('SELECT DATABASE() AS db')) as Array<{ db: string }>;
+    const db = rows?.[0]?.db ?? '';
+    if (db !== SMOKE_DB_NAME) {
+      die(`ISO-VERIFY ② 失败：DATABASE()=${db} 预期=${SMOKE_DB_NAME}（连接库实测不一致）`);
     }
-    log(`[t0] ISO-VERIFY ② database_list = ${file}`);
+    log(`[t0] ISO-VERIFY ② DATABASE() = ${db}`);
 
-    const tables = (await pc.$queryRawUnsafe(
-      "SELECT name FROM sqlite_master WHERE type='table'",
-    )) as Array<{ name: string }>;
-    const have = new Set(tables.map((t) => t.name));
-    const missing = BUSINESS_TABLES.filter((t) => !have.has(t));
+    const tabs = (await pc.$queryRawUnsafe(
+      `SELECT table_name AS t FROM information_schema.tables WHERE table_schema = '${SMOKE_DB_NAME}'`,
+    )) as Array<{ t: string }>;
+    const have = new Set(tabs.map((t) => t.t.toLowerCase()));
+    const missing = BUSINESS_TABLES.filter((t) => !have.has(t.toLowerCase()));
     if (missing.length > 0) die(`ISO-VERIFY ③ 失败：缺表 ${missing.join(', ')}`);
 
     let rowsTotal = 0;
     for (const t of BUSINESS_TABLES) {
-      const r = (await pc.$queryRawUnsafe(`SELECT COUNT(*) AS n FROM "${t}"`)) as Array<{ n: unknown }>;
+      const r = (await pc.$queryRawUnsafe(`SELECT COUNT(*) AS n FROM \`${t}\``)) as Array<{ n: unknown }>;
       const n = Number(r?.[0]?.n ?? -1);
       rowsTotal += n;
       if (n !== 0) die(`ISO-VERIFY ④ 失败：${t} 行数=${n}（空库证明不成立）`);
     }
     log(`[t0] ISO-EMPTY tables=${BUSINESS_TABLES.length}/${BUSINESS_TABLES.length} rows=${rowsTotal}`);
-    log('[t0] ISO-VERIFY PASS（落盘 / 连接实测 / 表结构 / 行数=0）');
+    log('[t0] ISO-VERIFY PASS（库名实测 / 表结构 / 行数=0）');
   } finally {
     await pc.$disconnect();
-    delete process.env.DATABASE_URL;
+    if (prev === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = prev;
   }
 }
 
@@ -324,58 +442,49 @@ interface RunOpts {
 
 async function runOne(opts: RunOpts): Promise<number> {
   const stamp = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-  const isoName = `dev.smoke-${stamp}.db`;
-  const isoUrl = `file:./${isoName}`;
-  const isoAbs = join(PRISMA_DIR, isoName);
+  const baseUrl = loadBaseUrl();
+  const smokeUrl = smokeUrlFrom(baseUrl);
+  assertSmokeUrl(smokeUrl, 'RUN');
   const contentRoot = join(SERVER_DIR, 'var', 'tmp', `smoke-iso-${stamp}`);
   const contentDir = join(contentRoot, 'content');
 
   log('════════════════════════════════════════════════════════');
   log(`[t0] RUN target=${opts.target}  timeout=${opts.timeoutMs}ms`);
-  log(`[t0] REAL      = ${REAL_DB}`);
-  log(`[t0] ISOLATED  = ${isoAbs}`);
+  log(`[t0] REAL      = ${REAL_DB_NAME}（业务库）+ dev.db（归档）——全程只读`);
+  log(`[t0] ISOLATED  = ${SMOKE_DB_NAME}（固定 MySQL 测试库，run 前重建 / run 后清空）`);
+  log(`[t0] ISOL-URL  = ${maskUrl(smokeUrl)}`);
   log(`[t0] CONTENT   = ${contentDir}`);
   log(`[t0] ENV-ALLOW = ${ENV_ALLOW.join(', ')} + DATABASE_URL/CONTENT_DIR/NODE_ENV（其余剥离：APP_SECRET_KEY、一切 *TOKEN/*SECRET/*KEY、代理变量）`);
   log(`[t0] NET       = Node 层网络入口隔离（smoke-net-guard），非 OS 级全网络隔离`);
-  if (process.platform === 'win32') {
-    log('[t0] NOTE Windows 下隔离库文件权限由 ACL 继承（POSIX 场景 chmod 0600）');
-  }
 
   // ① 并发写入者扫描（发现即拒绝启动，无绕过开关）
   log('[t0] WRITER-SCAN …');
   await scanWriters();
   log('[t0] WRITER-SCAN ok（8787 未监听 / 无 scheduler 进程）');
 
-  // ② 原库指纹（前）
-  const fpBefore = fingerprintRealDb();
-  for (const f of fpBefore) {
+  // ② 真实库指纹（前）
+  const fpBizBefore = await fingerprintBusinessDb(baseUrl);
+  const fpDevBefore = fingerprintDevDbFile();
+  log(`[t0] REAL-FP  business-db sha256=${fpBizBefore.sha256}（${FINGERPRINT_TABLES.length} 表 COUNT+CHECKSUM）`);
+  for (const f of fpDevBefore) {
     log(`[t0] REAL-FP  ${f.path} sha256=${f.sha256} size=${f.size} mtime=${f.mtimeMs}`);
   }
-  const walState = existsSync(`${REAL_DB}-wal`) ? 'present' : 'absent';
-  log(`[t0] REAL-WAL = ${walState}`);
 
   mkdirSync(contentDir, { recursive: true });
 
   let childExit = 1;
   let timedOut = false;
   let simTimer: NodeJS.Timeout | null = null;
-  activeRun = { isoAbs, contentRoot, child: null };
+  activeRun = { smokeUrl, contentRoot, child: null };
 
   try {
-    // ③ schema-only 建库
-    log(`[t0] ISO-CREATE prisma db push → ${isoName}`);
-    createIsoDb(isoName, isoUrl);
-    log('[t0] ISO-CREATE ok（schema-only）');
-    if (process.platform !== 'win32') {
-      try {
-        chmodSync(isoAbs, 0o600);
-      } catch {
-        /* 忽略 */
-      }
-    }
+    // ③ 重建隔离库 schema
+    log(`[t0] ISO-CREATE 重建 ${SMOKE_DB_NAME}（清空 + migrate deploy）`);
+    createIsoDb(smokeUrl);
+    log('[t0] ISO-CREATE ok（schema-only，零行数据）');
 
     // ④ schema-only 验证链
-    await verifyIsoChain(isoAbs, isoUrl);
+    await verifyIsoChain(smokeUrl);
 
     if (opts.simulateError === 'after-create') {
       throw new Error('[t0] simulate: runner 普通异常（verify 清理矩阵用）');
@@ -383,7 +492,7 @@ async function runOne(opts: RunOpts): Promise<number> {
 
     // ⑤ env 白名单 + 回读断言（注入失败即终止，不起子进程）
     const extra: Record<string, string> = {
-      DATABASE_URL: isoUrl,
+      DATABASE_URL: smokeUrl,
       CONTENT_DIR: contentDir,
       NODE_ENV: 'development',
     };
@@ -393,9 +502,10 @@ async function runOne(opts: RunOpts): Promise<number> {
       extra.ALL_PROXY = 'http://127.0.0.1:65002';
     }
     const childEnv = buildChildEnv(extra);
-    if (childEnv.DATABASE_URL !== isoUrl || childEnv.CONTENT_DIR !== contentDir) {
+    if (childEnv.DATABASE_URL !== smokeUrl || childEnv.CONTENT_DIR !== contentDir) {
       die('ENV 注入回读断言失败：隔离变量未生效，拒绝起子进程');
     }
+    assertSmokeUrl(childEnv.DATABASE_URL ?? '', 'ENV 回读断言');
     for (const banned of ['APP_SECRET_KEY', 'ADMIN_PASSWORD', 'JWT_SECRET']) {
       if (banned in childEnv) die(`ENV 白名单泄漏敏感变量 ${banned}，拒绝起子进程`);
     }
@@ -462,61 +572,29 @@ async function runOne(opts: RunOpts): Promise<number> {
     const residuals = cleanupActiveRun();
     if (residuals.length > 0) {
       console.error(`[t0] ⚠️ CLEANUP FAIL 残留：${residuals.join(', ')}`);
-      console.error('[t0] ⚠️ 恢复方法：npm run smoke:prune-iso');
+      console.error('[t0] ⚠️ 恢复：下次 run 前重建自动清空）');
       childExit = 1;
     } else {
-      log('[t0] CLEANUP ok（隔离库与临时内容目录已删除）');
+      log('[t0] CLEANUP ok（smoke 库表已清空与临时内容目录已删除）');
     }
     activeRun = null;
 
-    // ⑦ 原库指纹（后）比对——任一不同本轮作废
-    const fpAfter = fingerprintRealDb();
-    if (!fpEqual(fpBefore, fpAfter)) {
-      console.error('[t0] ⚠️ REAL-DB FINGERPRINT MISMATCH → 原库被写入/存在并发写入者，本轮作废！');
-      for (const f of fpAfter) {
+    // ⑦ 真实库指纹（后）比对——任一不同本轮作废
+    const fpBizAfter = await fingerprintBusinessDb(baseUrl);
+    const fpDevAfter = fingerprintDevDbFile();
+    if (fpBizAfter.state !== fpBizBefore.state || !fpEqual(fpDevBefore, fpDevAfter)) {
+      console.error('[t0] ⚠️ REAL-DB FINGERPRINT MISMATCH → 真实库被写入/存在并发写入者，本轮作废！');
+      console.error(`[t0] REAL-FP  business-db before=${fpBizBefore.sha256} after=${fpBizAfter.sha256}`);
+      for (const f of fpDevAfter) {
         console.error(`[t0] REAL-FP  ${f.path} sha256=${f.sha256} size=${f.size} mtime=${f.mtimeMs}`);
       }
       childExit = 1;
     } else {
-      log('[t0] REAL-DB FINGERPRINT MATCH（原库零写入）');
+      log('[t0] REAL-DB FINGERPRINT MATCH（真实库零写入）');
     }
     if (timedOut && childExit === 0) childExit = 1;
   }
   return childExit;
-}
-
-// ─────────────────────────────────────────────────────────────
-// prune：SIGKILL 残留恢复（文档化步骤的可执行形态）
-// ─────────────────────────────────────────────────────────────
-function prune(): number {
-  const removed: string[] = [];
-  for (const f of readdirSync(PRISMA_DIR)) {
-    if (/^dev\.smoke-.+\.db(-wal|-shm|-journal)?$/i.test(f)) {
-      const p = join(PRISMA_DIR, f);
-      try {
-        unlinkSync(p);
-        removed.push(p);
-      } catch (e) {
-        console.error(`[t0] prune 删除失败：${p}（${e instanceof Error ? e.message : e}）`);
-      }
-    }
-  }
-  const tmp = join(SERVER_DIR, 'var', 'tmp');
-  if (existsSync(tmp)) {
-    for (const d of readdirSync(tmp)) {
-      if (/^smoke-iso-/.test(d)) {
-        const p = join(tmp, d);
-        try {
-          rmSync(p, { recursive: true, force: true });
-          removed.push(p);
-        } catch (e) {
-          console.error(`[t0] prune 删除失败：${p}（${e instanceof Error ? e.message : e}）`);
-        }
-      }
-    }
-  }
-  log(removed.length > 0 ? `[t0] prune 已清除 ${removed.length} 项：\n  ${removed.join('\n  ')}` : '[t0] prune 无残留');
-  return 0;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -526,10 +604,6 @@ interface VerifyResult {
   label: string;
   ok: boolean;
   detail: string;
-}
-
-function hasIsoResidual(): string[] {
-  return readdirSync(PRISMA_DIR).filter((f) => /^dev\.smoke-.+\.db(-wal|-shm|-journal)?$/i.test(f));
 }
 
 function spawnCapture(
@@ -558,6 +632,9 @@ async function verify(): Promise<number> {
   log('════════════════════════════════════════════════════════');
   log('[verify] T0 验收台（10 项，真实运行）');
   const results: VerifyResult[] = [];
+  const baseUrl = loadBaseUrl();
+  const smokeUrl = smokeUrlFrom(baseUrl);
+  assertSmokeUrl(smokeUrl, 'verify');
   const netCases: Array<[string, string]> = [
     ['net-external-https', '外部 HTTPS 请求被阻止'],
     ['net-external-http', '外部 HTTP 请求被阻止'],
@@ -595,12 +672,12 @@ async function verify(): Promise<number> {
     });
   }
 
-  // ── 验收 2：真实数据库反向被拒 ──
+  // ── 验收 2：真实数据库反向被拒（MySQL 形态反例 + 旧 file: 形态）──
   {
     const cases: Array<[string, string]> = [
-      ['file:./dev.db', '相对路径指向真实库'],
-      [`file:${REAL_DB.replace(/\\/g, '/')}`, '绝对路径指向真实库'],
-      ['file:./../prisma/dev.db', '别名路径指向真实库'],
+      ['mysql://guard_probe:probe@127.0.0.1:3306/wechat_pipeline', 'MySQL 形态指向业务库'],
+      ['mysql://guard_probe:probe@127.0.0.1:3306/wechat_pipeline_shadow', 'MySQL 形态指向 shadow 库'],
+      ['file:./dev.db', 'file: 串指向真实库（旧形态一律拒）'],
     ];
     let allOk = true;
     const details: string[] = [];
@@ -617,8 +694,10 @@ async function verify(): Promise<number> {
   {
     const cases: Array<[Record<string, string>, string]> = [
       [{}, 'DATABASE_URL 缺失'],
-      [{ DATABASE_URL: 'mysql://user:pass@host/db' }, '非 SQLite 连接串'],
-      [{ DATABASE_URL: 'file:./dev.smoke-notexist.db' }, '隔离文件不存在'],
+      [{ DATABASE_URL: 'not-a-url' }, '非 mysql 连接串'],
+      [{ DATABASE_URL: 'mysql://guard_probe:probe@10.99.99.99:3306/wechat_pipeline_smoke' }, '错主机'],
+      [{ DATABASE_URL: 'mysql://guard_probe:probe@127.0.0.1:3307/wechat_pipeline_smoke' }, '错端口'],
+      [{ DATABASE_URL: 'mysql://guard_probe:probe@127.0.0.1:3306/' }, '缺库名'],
     ];
     let allOk = true;
     const details: string[] = [];
@@ -654,16 +733,17 @@ async function verify(): Promise<number> {
     results.push({ label: '⑩ 网络隔离反向测试（Node 层能力验证）', ok: allOk, detail: details.join('；') });
   }
 
-  // ── 验收 7：原库前后 SHA-256 一致（每轮 runner 自检，这里聚合） ──
+  // ── 验收 7：真实库（业务库状态 + dev.db 文件）前后指纹一致（每轮 runner 自检，这里聚合） ──
   {
-    // 任意一轮 run 输出里都有 MATCH；上面①的轮次已含。补一轮快照。
-    const fp1 = fingerprintRealDb();
-    const fp2 = fingerprintRealDb();
-    const ok = fpEqual(fp1, fp2);
+    const biz1 = await fingerprintBusinessDb(baseUrl);
+    const dev1 = fingerprintDevDbFile();
+    const biz2 = await fingerprintBusinessDb(baseUrl);
+    const dev2 = fingerprintDevDbFile();
+    const ok = biz1.state === biz2.state && fpEqual(dev1, dev2);
     results.push({
-      label: '⑦ 真实 dev.db 前后 SHA-256 一致',
+      label: '⑦ 真实库（业务库状态 + dev.db 文件）前后指纹一致',
       ok,
-      detail: `sha256=${fp1[0]?.sha256}（每轮 run 末尾另有 REAL-DB FINGERPRINT MATCH 断言）`,
+      detail: `business sha256=${biz1.sha256} dev.db=${dev1[0]?.sha256 ?? 'n/a'}（每轮 run 末尾另有 REAL-DB FINGERPRINT MATCH 断言）`,
     });
   }
 
@@ -674,48 +754,48 @@ async function verify(): Promise<number> {
 
     // runner 普通异常
     let r = runRunnerCase('selftest:ok', ['--simulate-error=after-create']);
-    let ok = r.code !== 0 && hasIsoResidual().length === 0;
+    let ok = r.code !== 0 && (await smokeTables(smokeUrl)).length === 0;
     allOk = allOk && ok;
     details.push(`runner普通异常: exit=${r.code} 残留=无 ${ok ? '' : '⚠️'}`);
 
     // 子进程未捕获异常
     r = runRunnerCase('selftest:throw');
-    ok = r.code !== 0 && hasIsoResidual().length === 0;
+    ok = r.code !== 0 && (await smokeTables(smokeUrl)).length === 0;
     allOk = allOk && ok;
     details.push(`子进程未捕获异常: exit=${r.code} 残留=无 ${ok ? '' : '⚠️'}`);
 
     // 子进程非零退出
     r = runRunnerCase('selftest:exit1');
-    ok = r.code !== 0 && hasIsoResidual().length === 0;
+    ok = r.code !== 0 && (await smokeTables(smokeUrl)).length === 0;
     allOk = allOk && ok;
     details.push(`子进程非零退出: exit=${r.code} 残留=无 ${ok ? '' : '⚠️'}`);
 
     // 超时
     r = runRunnerCase('selftest:hang', ['--timeout-ms=2500']);
-    ok = r.code !== 0 && r.out.includes('TIMEOUT') && hasIsoResidual().length === 0;
+    ok = r.code !== 0 && r.out.includes('TIMEOUT') && (await smokeTables(smokeUrl)).length === 0;
     allOk = allOk && ok;
     details.push(`超时: exit=${r.code} 残留=无 ${ok ? '' : '⚠️'}`);
 
     // SIGINT / SIGTERM（Windows 跨进程信号=硬终止，用处理器自触发验证清理路径）
     for (const sig of ['SIGINT', 'SIGTERM'] as const) {
       r = runRunnerCase('selftest:hang', [`--simulate-signal=${sig}`, '--timeout-ms=15000']);
-      ok = r.code !== 0 && hasIsoResidual().length === 0;
+      ok = r.code !== 0 && (await smokeTables(smokeUrl)).length === 0;
       allOk = allOk && ok;
       details.push(`${sig}: exit=${r.code} 残留=无 ${ok ? '' : '⚠️'}`);
     }
 
-    // SIGKILL：硬终止 runner → 残留必须暴露 → prune 恢复
+    // SIGKILL：硬终止 runner → 残留必须暴露 → 下次 run 前重建的清空半步恢复
     const child = spawn(
       process.execPath,
       ['--experimental-strip-types', join(SCRIPTS_DIR, 'smoke-isolated.ts'), 'run', 'selftest:hang', '--timeout-ms=60000'],
       { cwd: SERVER_DIR, env: buildChildEnv({}), stdio: 'ignore' },
     );
-    // 等隔离库出现
+    // 等隔离库出现（重建完成、表已建）
     const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline && hasIsoResidual().length === 0) {
+    while (Date.now() < deadline && (await smokeTables(smokeUrl)).length === 0) {
       await new Promise((res) => setTimeout(res, 300));
     }
-    const hadResidual = hasIsoResidual().length > 0;
+    const hadResidual = (await smokeTables(smokeUrl)).length > 0;
     if (process.platform === 'win32') {
       spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { encoding: 'utf8' });
     } else {
@@ -726,20 +806,20 @@ async function verify(): Promise<number> {
       }
     }
     await new Promise((res) => setTimeout(res, 500));
-    const residualAfterKill = hasIsoResidual();
+    const residualAfterKill = await smokeTables(smokeUrl);
     const killOk = hadResidual && residualAfterKill.length > 0;
-    // 恢复方法验证
-    prune();
-    const recovered = hasIsoResidual().length === 0;
+    // 恢复方法验证 = 下次 run 前重建的清空半步
+    dropSmokeTablesSync(smokeUrl);
+    const recovered = (await smokeTables(smokeUrl)).length === 0;
     allOk = allOk && killOk && recovered;
     details.push(
-      `SIGKILL: 残留暴露=${killOk}（${residualAfterKill.join(',') || '无'}）→ prune 恢复=${recovered}`,
+      `SIGKILL: 残留暴露=${killOk}（${residualAfterKill.join(',') || '无'}）→ 重建清空恢复=${recovered}`,
     );
 
     results.push({ label: '⑧ 副本清理（五条退出路径 + SIGKILL 残留恢复）', ok: allOk, detail: details.join('；') });
   }
 
-  // ── 验收 5 / 6：由 diff 白名单与四连实测留档（见 T0 验收报告） ──
+  // ── 验收 5 / 6：由 diff 白名单与四连实测留档（见 T0 验收报告 / T0-MYSQL-ADAPT 记录） ──
   results.push({ label: '⑤ 三个 smoke 原有断言全部保留', ok: true, detail: 'git diff 白名单 + 计数不降（lint 116 / style 33 / angles 当场计数）——报告留档' });
   results.push({ label: '⑥ 四连在隔离副本上通过', ok: true, detail: 'npm run typecheck + smoke:lint/style/angles 真实输出——报告留档' });
 
@@ -761,10 +841,9 @@ async function main(): Promise<number> {
   const argv = process.argv.slice(2);
   const cmd = argv[0] ?? '';
 
-  if (cmd === 'prune') return prune();
   if (cmd === 'verify') return verify();
   if (cmd !== 'run') {
-    console.error('用法：smoke-isolated.ts run <lint|style|angles> | verify | prune');
+    console.error('用法：smoke-isolated.ts run <lint|style|angles> | verify');
     return 2;
   }
 

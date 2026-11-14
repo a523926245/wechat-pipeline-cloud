@@ -17,6 +17,7 @@
  *   - 推送只到草稿箱（复用 publisher.pushArticleToDraft），不存在任何群发路径。
  */
 
+import { Prisma } from '@prisma/client';
 import { prisma } from '../db.ts';
 import { withLock } from '../db.ts';
 import { COMIC_IMAGE } from '../config.ts';
@@ -226,7 +227,7 @@ async function logRun(level: 'info' | 'warn' | 'error', stage: string, message: 
         level,
         stage,
         message: message.slice(0, 2000),
-        contextJson: ctx === undefined ? null : packJson(ctx),
+        contextJson: ctx === undefined ? Prisma.DbNull : packJson(ctx) ?? Prisma.DbNull,
       },
     });
   } catch (e) {

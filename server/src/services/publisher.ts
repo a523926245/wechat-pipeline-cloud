@@ -18,6 +18,7 @@
 
 import { existsSync } from 'node:fs';
 
+import { Prisma } from '@prisma/client';
 import { prisma } from '../db.ts';
 import { NotFoundError, WechatApiError } from '../errors.ts';
 import { WechatClient } from './wechat.ts';
@@ -260,8 +261,8 @@ async function recordPushRun(info: PushRunInfo): Promise<void> {
         articleId: info.articleId,
         runDate: info.runDate,
         attempt: 1,
-        paramsJson: packJson({ articleId: info.articleId }),
-        resultJson: info.ok ? packJson({ mediaId: info.mediaId }) : null,
+        paramsJson: packJson({ articleId: info.articleId }) ?? Prisma.DbNull,
+        resultJson: info.ok ? packJson({ mediaId: info.mediaId }) ?? Prisma.DbNull : Prisma.DbNull,
         errorCode: info.errcode != null ? String(info.errcode) : '',
         errorMessage: info.errMessage ?? '',
         finishedAt: new Date(),

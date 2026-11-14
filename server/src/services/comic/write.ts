@@ -9,6 +9,7 @@
 
 import { randomUUID } from 'node:crypto';
 
+import { Prisma } from '@prisma/client';
 import type { OAAccount, Angle, Track } from '@prisma/client';
 
 import { prisma } from '../../db.ts';
@@ -74,7 +75,7 @@ export async function createComicDraft(
         genWidth: DEFAULT_GEN_SIZE.width,
         genHeight: DEFAULT_GEN_SIZE.height,
         createdAt: todayKey(),
-      }),
+      }) ?? Prisma.DbNull,
     },
   });
 
@@ -99,8 +100,8 @@ export async function createComicDraft(
       angleId: angle.id,
       runDate: todayKey(),
       attempt: 1,
-      paramsJson: packJson({ unitCount: script.units.length, style: script.styleKey }),
-      resultJson: packJson({ articleId: article.id, title: script.title }),
+      paramsJson: packJson({ unitCount: script.units.length, style: script.styleKey }) ?? Prisma.DbNull,
+      resultJson: packJson({ articleId: article.id, title: script.title }) ?? Prisma.DbNull,
     },
   });
 

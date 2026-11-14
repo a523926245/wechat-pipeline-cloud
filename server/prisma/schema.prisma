@@ -1,11 +1,9 @@
 // 数据字典真源。
-// 生产用 MySQL（utf8mb4）；本地无 MySQL 时由 scripts/gen-sqlite-schema.mjs
-// 自动生成等价的 SQLite 版本，无需维护两份。
+// 运行库为 MySQL（utf8mb4）。
 //
 // 变更记录：
-// 2026-10 新增 Article.coverMediaId / coverUploaded（封面永久素材复用）。
-//   生产上线前必须生成含这两个字段的 baseline migration，否则 publisher 一跑就
-//   Unknown column —— 见 deploy/README.md「上线前置项」。
+// 2026-10 新增 Article.coverMediaId / coverUploaded（封面永久素材复用，
+//   已含于初始迁移 20261113145706_init）。
 
 generator client {
   provider = "prisma-client-js"
@@ -82,7 +80,6 @@ enum LogLevel {
 
 /// 调用协议：决定 services/llm.ts 走哪条 HTTP 通道。
 /// 用枚举而非 String：未知协议只能在运行时炸，枚举让非法值在写入时就被拦下。
-/// 本地 SQLite（gen-sqlite-schema.mjs 自动生成）会把它降级为 String，
 /// 代码侧统一用 services/model-registry.ts 的本地联合类型 Protocol，不 import Prisma 枚举。
 enum ModelProtocol {
   openai_chat
@@ -90,6 +87,8 @@ enum ModelProtocol {
   agnes_image
   /// ModelScope Qwen Image（gradio REST 直连 studio 端点，2026-10 已实证可用）
   modelscope_qwen_image
+  /// ModelScope Qwen Image MCP 备选通道（MCP Streamable HTTP，JSON-RPC over SSE）
+  modelscope_qwen_image_mcp
   /// 预留：尚未实现分派，保存时会被拒绝
   anthropic_messages
   /// 预留：尚未实现分派，保存时会被拒绝
@@ -113,6 +112,8 @@ enum ModelRole {
   comic_script
   /// 漫画格：按单元提示词逐格生成场景插图（画面内含中文气泡）
   comic_panel
+  /// 漫画格（备选通道）：主通道失败时同心跳降级的备用生图通道
+  comic_panel_fallback
 }
 
 /// 赛道。账号挂在赛道下，同赛道多账号共享该赛道的角度池。
@@ -140,7 +141,7 @@ model Track {
 
 /// 赛道下的产线。同一账号同一赛道可并行跑多条产线（文章 / 漫画），
 /// 各自配额独立、各自的角度切片独立（Angle.scope）。
-/// kind 用 String 而非 enum：与 SQLite 枚举降级策略一致，且新增产线类型不应改 schema。
+/// kind 用 String 而非 enum：新增产线类型不应改 schema。
 /// 读口径统一走 services/pipeline.ts（缺行回落 Track.quotaPerDay 旧语义）。
 model TrackPipeline {
   id          Int      @id @default(autoincrement())

@@ -11,6 +11,7 @@
  * - 给出该赛道近作供写稿时做观点层去重
  */
 
+import { Prisma } from '@prisma/client';
 import type { Angle } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 
@@ -373,8 +374,8 @@ export async function runPipelineForAccount(
         accountId: acc.id,
         runDate: todayStr(),
         attempt: 1,
-        paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }),
-        resultJson: packJson({ createdIds: created.map((c) => c.id).filter(Boolean) }),
+        paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }) ?? Prisma.DbNull,
+        resultJson: packJson({ createdIds: created.map((c) => c.id).filter(Boolean) }) ?? Prisma.DbNull,
       },
     });
     return { accountId, account: acc.name, need: reserved.length, created };
@@ -421,8 +422,8 @@ export async function runPipelineForAccount(
       accountId: acc.id,
       runDate: todayStr(),
       attempt: 1,
-      paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }),
-      resultJson: packJson({ createdIds: created.map((c) => c.id), modelUsed: created[0]?.modelUsed ?? null }),
+      paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }) ?? Prisma.DbNull,
+      resultJson: packJson({ createdIds: created.map((c) => c.id), modelUsed: created[0]?.modelUsed ?? null }) ?? Prisma.DbNull,
     },
   });
 

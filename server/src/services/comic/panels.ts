@@ -34,6 +34,7 @@ import { decryptSecret } from '../../lib/crypto.ts';
 import { assertRoleUsable, generateImage, tryResolveForRole } from '../llm.ts';
 import { ensureComicAssetsReady } from '../render/comic.ts';
 import { loadComicTemplates } from './script.ts';
+import { Prisma } from '@prisma/client';
 import type { LlmModel } from '@prisma/client';
 
 interface ComicMeta {
@@ -297,8 +298,8 @@ export async function processComicImages(
         articleId: aid,
         runDate: todayKey(),
         attempt: 1,
-        paramsJson: null,
-        resultJson: null,
+        paramsJson: Prisma.DbNull,
+        resultJson: Prisma.DbNull,
       },
     }).catch(() => undefined);
   }
