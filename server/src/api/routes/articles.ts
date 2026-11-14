@@ -21,6 +21,7 @@ import { renderArticle } from '../../services/render/index.ts';
 import { buildLocalComicPreview } from '../../services/render/comic.ts';
 import { pushArticleToDraft } from '../../services/publisher.ts';
 import { lintArticle } from '../../services/lint.ts';
+import { assertAngleApproved } from '../../services/topic-review.ts';
 import { generateCoverForArticle } from '../../services/cover.ts';
 import { toRelativeCoverPath } from '../../services/content-path.ts';
 import { assertAccountAccess, assertArticleAccess, isAdmin, requirePrincipal } from '../../services/ownership.ts';
@@ -104,6 +105,8 @@ articlesRouter.post(
     if (!account) throw new NotFoundError(`账号 ${body.accountId} 不存在`);
     const angle = await prisma.angle.findUnique({ where: { id: body.angleId } });
     if (!angle) throw new NotFoundError(`选题 ${body.angleId} 不存在`);
+    // S4-1 补充核查：漫画脚本以选题正文为创作输入，必须已审核通过（reserve 路径另有 planner 过滤）。
+    assertAngleApproved(angle);
     const track = await prisma.track.findUnique({ where: { id: account.trackId } });
     if (!track) throw new NotFoundError(`账号所在赛道不存在`);
     const result = await createComicDraft(account, angle, track, {
@@ -197,6 +200,18 @@ articlesRouter.post(
       });
       assertAccountAccess(requirePrincipal(req), acc, body.accountId);
       if (!acc) throw new NotFoundError(`账号 ${body.accountId} 不存在`);
+    }
+
+    // S4-1 补充核查：挂稿的 angleId 是文章的「选题归属」——绑定即意味着该选题进入生产。
+    // 正文虽由调用方提供（服务端不读选题正文），但候选/待修改/已拒绝选题不得成为生产文章的主题，
+    // 否则审核门可被挂稿绕过。只校验状态，不碰 used/消费语义。
+    // 不存在的 angleId 保持原有处理方式（不新增 404，落库时按原外键行为失败）。
+    if (body.angleId != null) {
+      const ang = await prisma.angle.findUnique({
+        where: { id: body.angleId },
+        select: { id: true, theme: true, status: true },
+      });
+      if (ang) assertAngleApproved(ang);
     }
 
     const { parsed, rendered } = await build(body.contentHtml, {

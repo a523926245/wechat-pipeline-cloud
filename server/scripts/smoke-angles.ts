@@ -389,6 +389,97 @@ async function main(): Promise<void> {
       { scoreTotal: u3.scoreTotal, scoreError: u3.scoreError },
     );
 
+    // ═══════════ S4-1 补充核查：手动指定 angleId 的创作入口四状态门禁 ═══════════
+    // 覆盖：POST /api/articles（手动挂稿）与 POST /api/articles/comic/create（漫画建稿）。
+    // approved 保持原功能；candidate / needs_revision / rejected 一律 400 拒绝；不存在的 angleId 按原行为。
+    const GATE = '只有审核通过';
+    async function postJson(
+      path: string,
+      body: unknown,
+    ): Promise<{ status: number; json: Record<string, unknown> }> {
+      const res = await fetch(`${base}/api${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      let json: Record<string, unknown> = {};
+      try {
+        json = (await res.json()) as Record<string, unknown>;
+      } catch {
+        json = {};
+      }
+      return { status: res.status, json };
+    }
+    const msgOf = (j: Record<string, unknown>) => {
+      const err = j.error as { message?: string } | undefined;
+      return String(j.message ?? err?.message ?? '');
+    };
+
+    // 26) 手动挂稿：三态拒 + approved 原功能（201 落库）
+    for (const [label, ang] of [
+      ['candidate', x1],
+      ['needs_revision', x4],
+      ['rejected', x5],
+    ] as Array<[string, { id: number }]>) {
+      const rr = await postJson('/articles', {
+        contentHtml: '<h1>未过审选题挂稿</h1><p>正文内容样例。</p>',
+        trackId,
+        accountId: acc.id,
+        angleId: ang.id,
+      });
+      expect(
+        `26 挂稿 ${label} 被拒（400+明确文案）`,
+        rr.status === 400 && msgOf(rr.json).includes(GATE) && msgOf(rr.json).includes('审核'),
+        rr.json,
+      );
+    }
+    const okHang = await postJson('/articles', {
+      contentHtml: '<h1>通过选题的挂稿</h1><p>正文内容保持不变。</p>',
+      trackId,
+      accountId: acc.id,
+      angleId: x2.id,
+    });
+    expect(
+      '26 挂稿 approved → 201 原功能不变',
+      okHang.status === 201 && typeof okHang.json.id === 'number',
+      okHang.json,
+    );
+
+    // 27) 漫画建稿：三态拒 + approved 过门禁（无模型时按原流程报模型错，非审核门错）
+    for (const [label, ang] of [
+      ['candidate', x1],
+      ['needs_revision', x4],
+      ['rejected', x5],
+    ] as Array<[string, { id: number }]>) {
+      const rr = await postJson('/articles/comic/create', { accountId: acc.id, angleId: ang.id });
+      expect(
+        `27 漫画建稿 ${label} 被拒（400+明确文案）`,
+        rr.status === 400 && msgOf(rr.json).includes(GATE),
+        rr.json,
+      );
+    }
+    const okComic = await postJson('/articles/comic/create', { accountId: acc.id, angleId: x3.id });
+    expect(
+      '27 漫画建稿 approved 过门禁（后续为模型/角色错，非审核门）',
+      !msgOf(okComic.json).includes(GATE),
+      okComic.json,
+    );
+
+    // 28) 不存在的 angleId 仍按原有方式处理（不新增审核门 404/400 语义）
+    const missComic = await postJson('/articles/comic/create', { accountId: acc.id, angleId: 999999 });
+    expect('28 漫画建稿 不存在选题 → 404 原行为', missComic.status === 404, missComic.json);
+    const missHang = await postJson('/articles', {
+      contentHtml: '<p>hi</p>',
+      trackId,
+      accountId: acc.id,
+      angleId: 999999,
+    });
+    expect(
+      '28 挂稿 不存在选题 → 原失败路径（非审核门拒绝）',
+      missHang.status !== 201 && !msgOf(missHang.json).includes(GATE),
+      missHang.json,
+    );
+
     console.log(`\nSMOKE ANGLES: ALL PASS (${passed} 项)`);
   } finally {
     // ── 清理：绝不留下脏数据（TopicReview 随 Angle 级联删） ──

@@ -315,6 +315,25 @@ export interface ReviewInput {
   reviewedBy?: string;
 }
 
+/**
+ * 创作入口守卫（S4-1 补充核查）：选题进入创作（或作为文章的选题归属）必须已审核通过。
+ *
+ * 适用：手动挂稿（POST /api/articles 的 angleId）与漫画建稿（POST /api/articles/comic/create）
+ * 等**不经过 reserveAnglesForPipeline** 的 angleId 入口——reserve 路径已由 planner 过滤 approved。
+ * 不适用：角度归还/删除等回收语义、只读查询、开发者本地脚本。
+ *
+ * 只校验状态，不碰 used / FIFO / 任何消费语义；approved 选题原流程不变。
+ */
+export function assertAngleApproved(angle: { id: number; theme?: string; status: AngleStatus }): void {
+  if (angle.status === 'approved') return;
+  const label =
+    angle.status === 'candidate' ? '候选待审' : angle.status === 'needs_revision' ? '待修改' : '已拒绝';
+  throw new BadRequestError(
+    `选题「${angle.theme || angle.id}」当前为「${label}」状态，只有审核通过（approved）的选题才能用于创作；` +
+      '请先到「赛道管理 → 选题库」完成人工审核',
+  );
+}
+
 export interface TopicReviewRecord {
   id: number;
   angleId: number;

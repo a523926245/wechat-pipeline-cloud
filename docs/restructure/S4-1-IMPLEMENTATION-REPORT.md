@@ -68,7 +68,8 @@ used（消费态）：独立维度，仅在 approved 后由排产置位
 - approved 集合内 `ORDER BY seq ASC`——FIFO 与原排产业务语义不变。
 - 消费入口核查：自动调度（scheduler.tick → runPipelineForAccount）与手动触发（POST /api/plan/trigger）都收敛到 reserveAnglesForPipeline，一处过滤全覆盖。
 - 角度池为空时提示区分「没有选题」与「有 N 条候选/待修改未审核」。
-- 未处理（超出任务书枚举范围，如实声明）：手动指定 angleId 的挂稿/漫画建稿路径不走 reserve、不置 used，未加 approved 校验；如需覆盖请在后续批次确认。
+- 未处理（超出任务书枚举范围，如实声明）：手动指定 angleId 的挂稿/漫画建稿路径不走 reserve、不置 used，未加 approved 校验。
+  **→ 已在验收前补充核查中处理**（两入口加 approved 门禁），详见 `S4-1-ANGLE-ENTRY-CHECK-REPORT.md`。
 
 ## 6. 测试结果（真实输出）
 
@@ -108,7 +109,7 @@ used（消费态）：独立维度，仅在 approved 后由排产置位
 1. **⚠️ 业务库迁移待授权部署**：`prisma migrate deploy`（`20261114093000_add_angle_status_topic_review`）尚未在 `wechat_pipeline` 执行（任务书规定另行授权）。**部署前**新代码对业务库不可用（Angle 新列/TopicReview 不存在）；部署后即启用。部署即改变业务库指纹，届时按惯例单独记录。
 2. promptVersionHash / contractVersion 缺列（S3 裁决所致，非缺陷）；S6 文档收口时在 DATABASE-DESIGN-REVIEW 标注。
 3. dupHits 恒空，语义判重/S4-2 接线后才有数据；「标重复」事件（verdict=rejected, reason=dup_*）当前由人工在拒绝原因里填写。
-4. 手动指定 angleId 的建稿/挂稿路径未加 approved 校验（§5 声明），是否覆盖待后续批次确认。
+4. ~~手动指定 angleId 的建稿/挂稿路径未加 approved 校验（§5 声明）~~ **已处理**（2026-11-14 晚补充核查：挂稿 + 漫画建稿两入口加 approved 门禁，smoke:angles 54→64）——详见 `S4-1-ANGLE-ENTRY-CHECK-REPORT.md`。
 5. 评分提示词在 `topic-review.ts` 代码内（审核任务提示词，非写作提示词）；若后续要做提示词版本化，归 S6/PromptVersion 类议题。
 6. 手动新增选题不自动评分（无模型调用）；如需「手动补评」入口，待真实使用反馈后定。
 7. 业务库部署迁移后，建议把 `dev.db` 存量 33 条的处置（D1「逐条检查后回填」或保持不迁）单独决策——本阶段按任务书不回填、不伪装。

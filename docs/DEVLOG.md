@@ -1568,3 +1568,12 @@ T1 拆 T1-A 基线迁移 / T1-B TrackContract / T1-C PromptVersion / T1-D Genera
 - **Git**：独立 commit（含 S4-0 报告与 S4-1 全部文件；DEVLOG 同批带上前次遗留的 S3 验收条目）。
 - **⚠️ 待授权事项**：业务库 `wechat_pipeline` 的 `prisma migrate deploy`（`20261114093000`）**未执行**（任务书 §五：未经另行授权不得写业务库）。部署前新代码对业务库不可用（Angle 新列不存在）；部署后即可启用。
 - **状态：S4-1 完成，停等验收。不自动进入 S4-2。**
+
+## 2026-11-14（晚）· S4-1 验收前补充核查：手动指定 angleId 的创作入口门禁
+
+- **范围**：S4-1 报告 §5/§9 遗留（非 reserve 的 angleId 入口）。判定判据=选题正文是否作创作输入 / 是否构成选题→生产归属；非消费入口只记录不修改。
+- **入口穷举 7 条**（报告 `docs/restructure/S4-1-ANGLE-ENTRY-CHECK-REPORT.md`）：①漫画建稿 `POST /articles/comic/create`（angle 进 LLM 脚本）→ **加 approved 校验**；②手动挂稿 `POST /articles`（正文来自调用方但 angleId=选题生产归属，放行即绕过审核门）→ **加 approved 校验**；③reserve 路径已门禁；④删文/删账号归还（回收语义）不改；⑤只读接口不改；⑥scripts/demo-write、ab-gen（开发 CLI 非业务入口）不改，留待确认；⑦cli/migrate 历史导入器不改。
+- **实现**：`topic-review.assertAngleApproved()` 共用守卫 + articles.ts 两入口接线；三态（candidate/needs_revision/rejected）400 明确文案；approved 原流程零变化；不存在的 angleId 保持原行为（漫画 404 / 挂稿原外键失败路径）；不碰 used/FIFO。
+- **验收**：tsc 0 / vue-tsc×2 0 / lint 116 / style 41 / angles **64**（54+10）/ verify:smoke-iso 10/10。新增 26-28 组：四状态×两入口（三态拒+approved 挂稿 201/漫画过门禁）+ 不存在 angleId 原行为。
+- **数据库安全**：业务库零写入（15 表+_prisma_migrations 3 条，无 TopicReview=迁移仍未部署）；smoke 0 残留；dev.db `fea0f123…`+8 备份未动；他库零触碰。
+- **Git**：独立 commit（详见 git log）。**状态：完成，停等 S4-1 最终验收及业务库 Migration 授权。未进 S4-2。**

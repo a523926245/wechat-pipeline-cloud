@@ -2,6 +2,22 @@
 
 面向使用者的变更记录（按新增 / 变更 / 修复分类）。详细背景与验收见 `docs/DEVLOG.md`（进度台账唯一真源）。
 
+## 2026-11-14（晚）· S4-1 补充：手动创作入口的选题审核门禁
+
+### 新增
+- 无。
+
+### 变更
+- **手动挂稿（POST /api/articles 携带 angleId）与漫画建稿（POST /api/articles/comic/create）**：
+  选题必须已审核通过（approved）才能用于创作/归属；候选、待修改、已拒绝一律拒绝并提示先审核。
+  approved 选题流程不变；不改 used 与排产消费语义；不存在的 angleId 处理方式不变。
+
+### 修复
+- 无。
+
+### 验收
+- typecheck / vue-tsc 通过；smoke:lint 116 / style 41 / angles 64（+10 四状态门禁用例）/ verify:smoke-iso 10/10；业务库指纹不变。
+
 ## 2026-11-14 · S4-1：选题评分与审核状态机
 
 ### 新增
