@@ -277,7 +277,7 @@ tracksRouter.post(
       ...result,
       message:
         result.added > 0
-          ? `新增 ${result.added} 条${SCOPE_LABEL[result.scope]}选题` +
+          ? `新增 ${result.added} 条${SCOPE_LABEL[result.scope]}候选（已评 ${result.scored} 条，待人工审核通过后才可被排产消费）` +
             (result.skippedDuplicate > 0 ? `，跳过重复 ${result.skippedDuplicate} 条` : '') +
             `，该用途当前可用 ${result.scopeUnused} 条`
           : `没有新增：模型给的 ${result.generated} 条全部与现有选题重复，请换个种子或减少条数再试`,

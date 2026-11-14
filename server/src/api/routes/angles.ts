@@ -27,6 +27,8 @@ import {
   releaseAngle,
   updateAngle,
 } from '../../services/angles.ts';
+import { listTopicReviews, reviewAngle } from '../../services/topic-review.ts';
+import { requirePrincipal } from '../../services/ownership.ts';
 import { asyncHandler } from '../async-handler.ts';
 import { bulkDeleteSchema, runBulkDelete } from '../bulk-delete.ts';
 import { requirePermission } from '../permissions.ts';
@@ -48,12 +50,16 @@ const scopeField = z.enum(['article', 'comic', 'shared']);
 const listQuery = z.object({
   trackId: z.coerce.number().int().positive(),
   used: z.enum(['unused', 'used', 'all']).optional().default('all'),
+  /** 审核态过滤（S4-1）。 */
+  status: z.enum(['candidate', 'needs_revision', 'approved', 'rejected', 'all']).optional().default('all'),
   scope: scopeField.optional(),
   /** offIp=1 只看含 IP 外角色的选题（漫画产线治理）。 */
   offIp: z
     .union([z.literal('1'), z.literal('true'), z.literal('0'), z.literal('false')])
     .optional(),
   keyword: z.string().trim().max(64).optional(),
+  /** score=按总分降序（未评分排最后）；缺省按 seq。 */
+  sort: z.enum(['seq', 'score']).optional().default('seq'),
   limit: z.coerce.number().int().min(1).max(100).optional().default(20),
   offset: z.coerce.number().int().min(0).optional().default(0),
 });
@@ -72,7 +78,7 @@ const updateSchema = z.object({
   scope: scopeField.optional(),
 });
 
-/** 列表：按赛道 + 使用状态 + 切片 + 关键词过滤，分页返回明细。 */
+/** 列表：按赛道 + 使用状态 + 审核态 + 切片 + 关键词过滤，分页返回明细。 */
 anglesRouter.get(
   '/',
   asyncHandler(async (req, res) => {
@@ -80,9 +86,11 @@ anglesRouter.get(
     const result = await listAngles({
       trackId: q.trackId,
       used: q.used,
+      status: q.status,
       scope: q.scope,
       offIp: q.offIp === '1' || q.offIp === 'true',
       keyword: q.keyword,
+      sort: q.sort,
       limit: q.limit,
       offset: q.offset,
     });
@@ -171,6 +179,44 @@ anglesRouter.post(
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
     res.json(await releaseAngle(id));
+  }),
+);
+
+/**
+ * 人工审核（S4-1）：通过 / 拒绝 / 要求修改。
+ *
+ * - 只走后端状态机（topic-review.reviewAngle），前端无法直接改写 status；
+ * - 评分（六维）不替代人工审核：LLM 的 suggestion 不经此端口，此端口只收人工 verdict；
+ * - approved / rejected 为终态，非法流转返回 400。
+ */
+const reviewSchema = z.object({
+  verdict: z.enum(['approved', 'needs_revision', 'rejected']),
+  reason: z.string().trim().max(500).optional(),
+});
+
+anglesRouter.post(
+  '/:id(\\d+)/review',
+  asyncHandler(async (req, res) => {
+    const id = idParam.parse(req.params.id);
+    const body = reviewSchema.parse(req.body ?? {});
+    const principal = requirePrincipal(req);
+    const record = await reviewAngle(id, {
+      verdict: body.verdict,
+      reason: body.reason,
+      reviewedBy: principal.username ?? String(principal.userId ?? ''),
+    });
+    const item = await getAngle(id);
+    res.json({ ok: true, review: record, item, message: `已${body.verdict === 'approved' ? '通过' : body.verdict === 'rejected' ? '拒绝' : '要求修改'}` });
+  }),
+);
+
+/** 审核记录（多轮全留，新轮在前）。 */
+anglesRouter.get(
+  '/:id(\\d+)/reviews',
+  asyncHandler(async (req, res) => {
+    const id = idParam.parse(req.params.id);
+    const items = await listTopicReviews(id);
+    res.json({ total: items.length, items });
   }),
 );
 

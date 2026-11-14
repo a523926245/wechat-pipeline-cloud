@@ -106,7 +106,9 @@ export async function buildPlan(
   const tracks = await prisma.track.findMany({
     include: {
       accounts: { where: accWhere, orderBy: { name: 'asc' } },
-      angles: { where: { used: false }, orderBy: { seq: 'asc' } },
+      // S4-1：只有 approved（人工审核通过）的选题可被排产消费；候选/待修改/已拒绝一概不进。
+      // 消费顺序不变：seq 升序 FIFO。
+      angles: { where: { used: false, status: 'approved' }, orderBy: { seq: 'asc' } },
       articles: { orderBy: { createdAt: 'desc' }, take: 8, select: { createdAt: true, title: true } },
       pipelines: true,
     },
@@ -263,6 +265,8 @@ async function scanBacklog(
 /**
  * 为指定账号在指定产线的角度切片里预留 need 个未用角度（事务内 CAS：先读未用池，再标记 used）。
  * article 消费 [article, shared]，comic 消费 [comic, shared]；used 全局先到先得。
+ * S4-1：**只消费 approved**（D1——candidate / needs_revision / rejected 不得进入生产）。
+ * approved 集合内保持 seq 升序 FIFO，不改变现有排产业务语义。
  */
 export async function reserveAnglesForPipeline(
   accountId: number,
@@ -275,7 +279,7 @@ export async function reserveAnglesForPipeline(
     if (!acc) throw new NotFoundError(`账号 ${accountId} 不存在`);
     const today = todayStr();
     const pool = await tx.angle.findMany({
-      where: { trackId: acc.trackId, used: false, scope: { in: scopesFor(pipeline) } },
+      where: { trackId: acc.trackId, used: false, status: 'approved', scope: { in: scopesFor(pipeline) } },
       orderBy: { seq: 'asc' },
       take: need,
     });
@@ -342,11 +346,20 @@ export async function runPipelineForAccount(
     for (const o of others) byTrack.set(o.track.name, (byTrack.get(o.track.name) ?? 0) + 1);
     const otherText = [...byTrack.entries()].map(([n, c]) => `【${n}】${c} 条`).join('、');
     const kindText = pipeline === 'comic' ? '漫画' : '文章';
+    // S4-1：未审核的候选不是可用库存——区分「没题」与「有题但没审」，别让人白扩库。
+    const pendingReview = await prisma.angle.count({
+      where: { trackId: acc.trackId, used: false, status: { in: ['candidate', 'needs_revision'] }, scope: { in: scopesFor(pipeline) } },
+    });
+    const reviewHint =
+      pendingReview > 0
+        ? `注意：该赛道另有 ${pendingReview} 条候选/待修改选题**尚未通过人工审核**——只有审核通过（approved）才能被排产消费，请先到「赛道管理 → 选题库」审核。`
+        : '请先到「赛道管理 → 选题库」给该赛道扩库，并将候选审核通过后再排产。';
     const reason =
-      `角度池已空：账号「${acc.name}」属【${acc.track.name}】赛道，该赛道没有可用的${kindText}选题。` +
+      `角度池已空（无可消费的已通过选题）：账号「${acc.name}」属【${acc.track.name}】赛道，该赛道没有可用的${kindText}选题。` +
+      reviewHint +
       (byTrack.size > 0
         ? `注意：未用选题在 ${otherText} ——那是别的赛道的池子，本账号吃不到。请给【${acc.track.name}】扩库（${kindText}切片），或把账号改绑到对应赛道。`
-        : '请先到「赛道管理 → 选题库」给该赛道扩库。');
+        : '');
     return { accountId, account: acc.name, need, created: [], reason };
   }
 

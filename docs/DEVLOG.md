@@ -1535,3 +1535,36 @@ T1 拆 T1-A 基线迁移 / T1-B TrackContract / T1-C PromptVersion / T1-D Genera
 - **补充验证（smoke-style-prompts.ts 新增 [5] 节 8 断言，经隔离运行器跑在 smoke 库）**：5.1 DB 覆盖生效（`r:冒烟赛道` 只豁免 para_shape→para_shape 消失、para_short 仍在）；5.2 种子回落生效（删 `r:育儿`→种子 relax=para_short 生效、para_shape 仍在）；5.3 relax 关不掉 error（chars/sections 写进豁免列表仍拦）。style 断言 33→41（计数不降）。
 - **验证**：typecheck 0✓；smoke:style 41/41✓（真实库指纹 MATCH=零写入）；提交后补跑 lint/angles/verify:smoke-iso（见下方验收记录）。
 - **Git**：S3 第一批独立提交（含 3 死代码清理 + 2 relax 修复 + 测试 + 本进度记录），Commit SHA 见下条验收记录。
+
+## 2026-11-14（傍晚）· S3 最终验收记录 —— S3 完成
+
+- **对照 `RESTRUCTURE-2.0-CONVERGED-PLAN.md` §八 S3 逐项核查，全部达成**：
+  - 范围①「TrackContract / PromptVersion / GenerationRun / Renderer / 门禁参数化逐项出裁决表（先报批再动代码）」→ **完成**：裁决表已出具并经用户确认冻结——TrackContract / PromptVersion / GenerationRun / Prompt Renderer（form/render.ts）**不实施**；微信草稿 Renderer（services/render/）与门禁参数化机制**保留**。以该裁决为准，不再重复讨论、不新增对应抽象。
+  - 范围②「只实施被裁决为『当前必须』的最小集」→ **完成**：Commit `ee17c18`（3 处死代码清理 + relax 4 调用点修复 + 8 断言验证），无其他「当前必须」实施项。
+  - 验收①「裁决表经你确认」→ ✅（S3 第一批审核结论确认，裁决冻结）。
+  - 验收②「实施项 typecheck+冒烟绿」→ ✅ tsc 0；lint 116 / style 41 / angles 30；verify:smoke-iso 10/10。
+  - 验收③「不引入新表除非裁决明确要求」→ ✅ 零新表、零 migration、零 schema 变更。
+  - 衔接项（§七7.2）「T1-B~E 最终取舍开工前单独报确认」→ ✅ 已履行；路线图 V2 阶段 1「契约/配置并入 S3」（§七7.2 L243）由五对象裁决覆盖。
+- **未完成明确事项：无。**
+- **范围外备注（归 S6 收口，不在 S3 实施）**：① CHANGELOG 的 S3 条目（S6 明确含「CHANGELOG/文档/验收」）；② PROMPT-AND-CONTRACT-DESIGN.md 等 T1-B~E 相关设计文档的取代/裁决标注（S2 只标注了 T1-A 系列，S6 文档统一时一并处理）。
+- **状态：S3 完成（2026-11-14）。下一步 S4 未授权不进。**
+
+## 2026-11-14（下午）· S4-0 业务流程与内容质量核查（只读）
+
+- **交付**：`docs/restructure/S4-0-AUDIT-REPORT.md`（唯一产出；零代码/零 DB 写入/未动 CHANGELOG/DEVLOG）。
+- **要点**：选题无评分无审核态（扩库即入库）；去重仅 normalize 精确匹配（judgeAngle 三层判重为死代码）；lint 残留不落库（planner 落库无 note，12 篇实证）；pushed→draft|updated 双语义 + 删除回收漏洞；ending_hook 与分赛道结尾形态冲突；dev.db 33 选题全量复算=10 条门禁漂移、2 组主题级跨赛道重复全算法漏过。
+- **S4 建议顺序**：S4-1 评分+审核状态机 → S4-2 去重接线 → S4-3 lint 落库闭环 → S4-4 状态机/回收修正 → S4-5 形态分赛道 → S4-6 标题多样性 → S4-7 清理。
+
+## 2026-11-14（下午）· S4-1 选题评分与审核状态机 —— 完成，停等验收
+
+- **授权**：S4-1 正式实施（六维评分 / Angle.status 四态 / TopicReview / 消费链路 approved 过滤 / TrackAnglesView 审核界面）。评分口径用户确认：**0-5 整数/维、总分=等权合计 0-30、无权重、无阈值、无低分提示线**；评分不替代人工审核、不自动批准；硬门禁优先（被 topicRejectReason 拒收的选题不进评分）。
+- **Schema + Migration**（`20261114093000_add_angle_status_topic_review`，人工审查后入）：Angle + `status`(AngleStatus 默认 candidate)/`reviewRound`/`metaJson`（六维评分依据）；索引演进 `[trackId,used,seq]`→`[trackId,status,seq]`（DATABASE-DESIGN-REVIEW §③）；新表 TopicReview（angleId+round / scoresJson / riskHits / dupHits / verdict / reason / model / reviewedBy / createdAt，N:1 级联删）。**暂缺** promptVersionHash/contractVersion（S3 裁决 PromptVersion/TrackContract 不实施，不伪造追溯）；dupHits 恒空留 S4-2。
+- **服务**：`services/topic-review.ts`——normalizeScores/parseScoreBatch 纯函数（缺维/越界整体判失败=未评分）；scoreAngleCandidates 批量评分（D5 复用 write 角色，≤25 条/次，失败只降级未评分）；reviewAngle 状态机（candidate→approved/needs_revision/rejected；needs_revision 多轮复审 round+1；approved/rejected 终态；CAS updateMany 防并发）+ TopicReview 事件留痕。
+- **链路**：扩库/手动新增一律进 candidate（扩库后批量评分入 metaJson；手动=未评分）；改正文评分失效；planner.buildPlan 与 reserveAnglesForPipeline **只消费 approved**（seq 升序 FIFO 不变）；角度池空的报错区分「没题」与「有题未审」。
+- **API+前端**：POST /api/angles/:id/review、GET /:id/reviews；列表加 status 过滤 + sort=score（总分降序、未评分排最后）；TrackAnglesView 审核筛选/评分列（六维弹层）/通过·拒绝·要求修改操作/审核记录弹窗（不搞全面 UI 重构）。
+- **T0 载体最小适配（smoke-isolated.ts 3 处）**：SMOKE_DROP_ORDER/BUSINESS_TABLES 补 TopicReview（FK 子表在前）；业务库指纹表缺表记 `absent`（业务库未部署迁移时前后一致即 MATCH）；verify ①⑨ 空库标记串随表数动态（语义不变=全部业务表 0 行）。
+- **验收（真实输出）**：prisma validate ✓ / generate ✓ / tsc 0 / vue-tsc 两遍 0 / smoke:lint **116** / smoke:style **41** / smoke:angles **54**（原 30+新增 24）/ verify:smoke-iso **10/10**。新增用例覆盖：手动新增+扩库(Mock LLM)均进 candidate、评分失败不自动批准、六维合计正确、状态机合法/非法流转、多轮审核留痕、candidate/rejected/needs_revision 不可消费、approved FIFO 消费、sort=score、改正文评分失效。
+- **数据库安全**：业务库零写入（_prisma_migrations=3、Angle/Article 0 行、TopicReview 表 absent=迁移待授权）；smoke 库 run 后清空 0 表；dev.db 指纹 `fea0f123…` 不变 + 8 备份只读未动；wpc_app 权限止步三库（他库 information_schema 不可见）。
+- **Git**：独立 commit（含 S4-0 报告与 S4-1 全部文件；DEVLOG 同批带上前次遗留的 S3 验收条目）。
+- **⚠️ 待授权事项**：业务库 `wechat_pipeline` 的 `prisma migrate deploy`（`20261114093000`）**未执行**（任务书 §五：未经另行授权不得写业务库）。部署前新代码对业务库不可用（Angle 新列不存在）；部署后即可启用。
+- **状态：S4-1 完成，停等验收。不自动进入 S4-2。**

@@ -10,7 +10,7 @@
  *   ② schema-only 验证链：DATABASE() 实测 = wechat_pipeline_smoke →
  *      关键业务表结构存在 → 全部业务表行数 = 0，任一失败 exit(1)；
  *   ③ 失败关闭、零绕过：无 SMOKE_ALLOW_LIVE_DB 之类放行开关；
- *   ④ 真实库零写入：测试前后业务库状态指纹（16 表 COUNT+CHECKSUM）+ dev.db
+ *   ④ 真实库零写入：测试前后业务库状态指纹（全部业务表 COUNT+CHECKSUM）+ dev.db
  *      文件 SHA-256/大小/mtime 比对，任一不同本轮作废并报警；启动前检测并发
  *      写入者（8787 / scheduler）默认拒绝启动；
  *   ⑤ 子进程 env 显式允许清单（其余一律剥离：APP_SECRET_KEY / *TOKEN/*SECRET/*KEY /
@@ -64,12 +64,12 @@ const DEV_DB_FILE = join(PRISMA_DIR, 'dev.db');
 const BUSINESS_TABLES = [
   'Track', 'TrackPipeline', 'Account', 'User', 'UserSession', 'WechatToken',
   'Angle', 'Article', 'ComicPanel', 'TaskRun', 'RunLog',
-  'LlmModel', 'ModelBinding', 'Setting', 'StylePrompt',
+  'LlmModel', 'ModelBinding', 'Setting', 'StylePrompt', 'TopicReview',
 ];
 
-/** 清表顺序 = 外键子表在前（ComicPanel→Article→{Track,Account,Angle} 等），单条 DROP 语句内按序生效。 */
+/** 清表顺序 = 外键子表在前（ComicPanel/TopicReview→Article/Angle→{Track,Account} 等），单条 DROP 语句内按序生效。 */
 const SMOKE_DROP_ORDER = [
-  'ComicPanel', 'RunLog', 'Article', 'ModelBinding', 'WechatToken', 'UserSession',
+  'ComicPanel', 'TopicReview', 'RunLog', 'Article', 'ModelBinding', 'WechatToken', 'UserSession',
   'Account', 'TrackPipeline', 'Angle', 'TaskRun', 'LlmModel', 'User', 'Track',
   'Setting', 'StylePrompt', '_prisma_migrations',
 ];
@@ -274,7 +274,9 @@ function fpEqual(a: FpEntry[], b: FpEntry[]): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-/** 真实业务库状态指纹：16 表 COUNT(*) + CHECKSUM TABLE（只读；零写入证明）。 */
+/** 真实业务库状态指纹：业务表 COUNT(*) + CHECKSUM TABLE（只读；零写入证明）。
+ *  表不存在（业务库尚未 apply 对应迁移）时记 'absent'——前后两次一致即 MATCH，
+ *  不因「迁移待授权部署」而误报（S4-1 起 TopicReview 在业务库暂缺，属预期状态）。 */
 async function fingerprintBusinessDb(baseUrl: string): Promise<{ state: string; sha256: string }> {
   const prev = process.env.DATABASE_URL;
   process.env.DATABASE_URL = baseUrl;
@@ -283,10 +285,14 @@ async function fingerprintBusinessDb(baseUrl: string): Promise<{ state: string; 
   try {
     const parts: string[] = [];
     for (const t of FINGERPRINT_TABLES) {
-      const c = (await pc.$queryRawUnsafe(`SELECT COUNT(*) AS n FROM \`${t}\``)) as Array<{ n: unknown }>;
-      const k = (await pc.$queryRawUnsafe(`CHECKSUM TABLE \`${t}\``)) as Array<Record<string, unknown>>;
-      const checksum = k?.[0] ? String(Object.values(k[0])[1] ?? '?') : '?';
-      parts.push(`${t}:${String(c?.[0]?.n ?? '?')}#${checksum}`);
+      try {
+        const c = (await pc.$queryRawUnsafe(`SELECT COUNT(*) AS n FROM \`${t}\``)) as Array<{ n: unknown }>;
+        const k = (await pc.$queryRawUnsafe(`CHECKSUM TABLE \`${t}\``)) as Array<Record<string, unknown>>;
+        const checksum = k?.[0] ? String(Object.values(k[0])[1] ?? '?') : '?';
+        parts.push(`${t}:${String(c?.[0]?.n ?? '?')}#${checksum}`);
+      } catch {
+        parts.push(`${t}:absent`);
+      }
     }
     const state = parts.join('|');
     return { state, sha256: createHash('sha256').update(state).digest('hex') };
@@ -654,11 +660,13 @@ async function verify(): Promise<number> {
   // ── 验收 1：正向隔离通过 + 验收 9：空库证明 ──
   {
     const r = runRunnerCase('selftest:ok');
+    // 标记串随 BUSINESS_TABLES 动态（表数是 schema 演进量，验收语义=全部业务表行数为 0 不变）。
+    const emptyMark = `ISO-EMPTY tables=${BUSINESS_TABLES.length}/${BUSINESS_TABLES.length} rows=0`;
     const ok =
       r.code === 0 &&
       r.out.includes('SELFTEST OK') &&
       r.out.includes('FIXTURE-PROBE-OK') &&
-      r.out.includes('ISO-EMPTY tables=15/15 rows=0') &&
+      r.out.includes(emptyMark) &&
       r.out.includes('REAL-DB FINGERPRINT MATCH');
     results.push({
       label: '① 隔离数据库正向测试通过',
@@ -668,7 +676,7 @@ async function verify(): Promise<number> {
     results.push({
       label: '⑨ 空库证明（表结构存在 + 行数=0 + 自建数据创建/查询/清理）',
       ok,
-      detail: `ISO-EMPTY tables=15/15 rows=0 + FIXTURE-PROBE-OK = ${ok}`,
+      detail: `${emptyMark} + FIXTURE-PROBE-OK = ${ok}`,
     });
   }
 

@@ -18,6 +18,10 @@
 process.env.SMOKE_NO_AUTH = '1';
 import { createApp } from '../src/app.ts';
 import { prisma } from '../src/db.ts';
+import { unpackJson } from '../src/db-json.ts';
+import { expandAnglesForTrack } from '../src/services/angles.ts';
+import { reserveAnglesForPipeline } from '../src/services/planner.ts';
+import { normalizeScores, parseScoreBatch } from '../src/services/topic-review.ts';
 
 let passed = 0;
 
@@ -42,6 +46,13 @@ interface SmokeAngle {
   usedDate: string | null;
   source: string;
   articleCount: number;
+  // S4-1：审核态与评分（老用例只用上面的字段，这里按需读取）
+  status?: string;
+  reviewRound?: number;
+  scores?: { total: number } | null;
+  scoreTotal?: number | null;
+  scoreSuggestion?: string;
+  scoreError?: string | null;
 }
 
 interface ListResult {
@@ -248,9 +259,140 @@ async function main(): Promise<void> {
     const artJson = (await artRes.json()) as { ok: boolean; recycledAngle: boolean };
     expect('18 删文章 → 200 且 recycledAngle=false', artRes.status === 200 && artJson.recycledAngle === false, artJson);
 
+    // ═══════════ S4-1：选题评分与审核状态机 ═══════════
+
+    // 19) 手动新增进 candidate、未评分（评分缺失不视为高质量、不自动批准）
+    expect(
+      '19 手动新增 → candidate/未评分/round=0',
+      c1.status === 'candidate' && c1.scoreTotal === null && (c1.reviewRound ?? 0) === 0,
+      c1,
+    );
+
+    // 20) 扩库（Mock LLM）：进 candidate + 六维评分入 metaJson；评分失败=未评分且不自动批准
+    const mockGen = async () =>
+      JSON.stringify([
+        { theme: '扩库甲', content: '孩子把牛奶打翻后主动收拾，妈妈该怎么夸才不空洞' },
+        { theme: '扩库乙', content: '老人追着喂饭孩子直躲，这顿饭到底该怎么收场' },
+      ]);
+    const mockScore = async () =>
+      JSON.stringify([
+        { id: 1, fit: 4, scene: 3, conflict: 4, method: 5, safety: 4, novelty: 2, suggestion: 'approved', why: '具体' },
+        { id: 2, fit: 9, scene: 3, conflict: 3, method: 3, safety: 3, novelty: 3, why: '越界应判失败' },
+      ]);
+    const exp = await expandAnglesForTrack(trackId, 2, undefined, 'article', {
+      gen: mockGen as never,
+      score: mockScore as never,
+    });
+    expect('20 扩库 Mock 入库 2 条、评上 1 条', exp.added === 2 && exp.scored === 1, exp);
+    const expanded = await prisma.angle.findMany({
+      where: { trackId, source: 'llm-expand' },
+      orderBy: { seq: 'asc' },
+    });
+    expect('20 两条均进 candidate（不自动批准）', expanded.every((x) => x.status === 'candidate'), expanded.map((x) => x.status));
+    const e1 = expanded[0]!;
+    const e2 = expanded[1]!;
+    const e1Meta = unpackJson<{ scores?: { total: number }; scoreError?: string }>(e1.metaJson) ?? {};
+    const e2Meta = unpackJson<{ scores?: unknown; scoreError?: string }>(e2.metaJson) ?? {};
+    expect('20 六维合计 22 入库', e1Meta.scores?.total === 22, e1Meta);
+    expect(
+      '20 评分越界判失败（未评分+scoreError，不当高质量）',
+      e2Meta.scores == null && Boolean(e2Meta.scoreError),
+      e2Meta,
+    );
+
+    // 21) 评分纯函数：缺维/越界整体判失败；批次缺条目有 scoreError
+    expect('21 normalizeScores 合法 → 合计', normalizeScores({ fit: 5, scene: 4, conflict: 3, method: 2, safety: 1, novelty: 0 })?.total === 15);
+    expect('21 normalizeScores 缺维 → null', normalizeScores({ fit: 5, scene: 4, conflict: 3, method: 2, safety: 1 }) === null);
+    expect('21 normalizeScores 越界 → null', normalizeScores({ fit: 6, scene: 4, conflict: 3, method: 2, safety: 1, novelty: 0 }) === null);
+    const pb = parseScoreBatch('[{"id":1,"fit":4,"scene":4,"conflict":4,"method":4,"safety":4,"novelty":4}]', [1, 2]);
+    expect('21 批次缺条目 → scoreError', pb.get(2)?.scores === null && Boolean(pb.get(2)?.scoreError), pb.get(2));
+
+    // 22) 审核状态机（API）：合法流转 + 终态拦截 + 多轮留痕
+    r = await call('POST', `/${c1.id}/review`, { verdict: 'approved' });
+    const rv1 = r.json as unknown as { ok: boolean; review: { round: number; verdict: string; reviewedBy: string }; item: SmokeAngle };
+    expect(
+      '22 candidate → approved（round=1，reviewedBy 记录）',
+      r.status === 200 && rv1.item.status === 'approved' && rv1.review.round === 1 && rv1.review.reviewedBy === 'smoke',
+      r.json,
+    );
+    r = await call('POST', `/${c1.id}/review`, { verdict: 'rejected' });
+    expect('22 approved 终态 → 400', r.status === 400, r.json);
+
+    r = await call('POST', `/${c2.id}/review`, { verdict: 'needs_revision', reason: '再改改' });
+    expect('22 candidate → needs_revision', r.status === 200 && (r.json as unknown as { item: SmokeAngle }).item.status === 'needs_revision', r.json);
+    r = await call('POST', `/${c2.id}/review`, { verdict: 'needs_revision', reason: '还是不行' });
+    expect('22 needs_revision → needs_revision（round=2 多轮留痕）', r.status === 200 && (r.json as unknown as { review: { round: number } }).review.round === 2, r.json);
+    r = await call('POST', `/${c2.id}/review`, { verdict: 'rejected', reason: '定位不符' });
+    expect('22 needs_revision → rejected（round=3）', r.status === 200 && (r.json as unknown as { item: SmokeAngle }).item.status === 'rejected', r.json);
+    r = await call('POST', `/${c2.id}/review`, { verdict: 'approved' });
+    expect('22 rejected 终态 → 400', r.status === 400, r.json);
+    r = await call('POST', `/${c2.id}/review`, { verdict: 'auto_approve' });
+    expect('22 非法 verdict → 400（评分/自动结论不可走人工端口）', r.status === 400, r.json);
+
+    r = await call('GET', `/${c2.id}/reviews`);
+    const reviews = r.json as unknown as { total: number; items: { round: number; verdict: string; reason: string }[] };
+    expect('22 审核记录 3 条且新轮在前', reviews.total === 3 && reviews.items[0]?.round === 3 && reviews.items[2]?.round === 1, reviews);
+    expect('22 记录含 verdict+reason', reviews.items[0]?.verdict === 'rejected' && reviews.items[0]?.reason === '定位不符', reviews.items[0]);
+
+    // 23) 消费链路：只有 approved 可消费；approved 内 FIFO（seq 升序）不变
+    const acc = await prisma.oAAccount.create({
+      data: { trackId, name: `smoke-angles-acc-${stamp}`, appid: `wxsmokeang${stamp}`.slice(0, 18), credStatus: 'ok', enabled: true },
+    });
+    const mk = (code: string, seq: number, status: string) =>
+      prisma.angle.create({
+        data: { trackId, code, seq, theme: `消费测试${seq}`, content: `消费测试选题第 ${seq} 条，该怎么收场`, source: 'smoke', status: status as never },
+      });
+    const x1 = await mk(`smoke-${stamp}-c10`, 10, 'candidate');
+    const x2 = await mk(`smoke-${stamp}-c11`, 11, 'approved');
+    const x3 = await mk(`smoke-${stamp}-c12`, 12, 'approved');
+    const x4 = await mk(`smoke-${stamp}-c13`, 13, 'needs_revision');
+    const x5 = await mk(`smoke-${stamp}-c14`, 14, 'rejected');
+    const reserved = await reserveAnglesForPipeline(acc.id, 3, 'article');
+    expect(
+      '23 只消费 approved 且 FIFO（seq 4→11→12，c1 已在 22 通过）',
+      reserved.map((x) => x.id).join(',') === `${c1.id},${x2.id},${x3.id}`,
+      reserved.map((x) => ({ id: x.id, seq: x.seq })),
+    );
+    const leftovers = await prisma.angle.findMany({
+      where: { id: { in: [x1.id, x4.id, x5.id] } },
+      select: { id: true, used: true, status: true },
+    });
+    expect(
+      '23 candidate/needs_revision/rejected 不可消费（used 仍=false）',
+      leftovers.every((x) => x.used === false),
+      leftovers,
+    );
+    const noMore = await reserveAnglesForPipeline(acc.id, 1, 'article');
+    expect('23 再取一次 → 空（approved 已用完）', noMore.length === 0, noMore.length);
+
+    // 24) 评分影响排序：sort=score 总分降序、未评分排最后
+    r = await call('GET', `/?trackId=${trackId}&sort=score&limit=100`);
+    const sorted = (r.json as unknown as ListResult).items;
+    const idxOf = (id: number) => sorted.findIndex((x) => x.id === id);
+    expect(
+      '24 有分条目排在无分条目前（E1=22 分最前）',
+      sorted[0]?.id === e1.id && sorted[0]?.scoreTotal === 22,
+      sorted.slice(0, 3).map((x) => ({ id: x.id, t: x.scoreTotal })),
+    );
+    expect(
+      '24 未评分（E2）排在已评分之后',
+      idxOf(e2.id) > idxOf(e1.id),
+      { e1: idxOf(e1.id), e2: idxOf(e2.id) },
+    );
+
+    // 25) 改正文 → 旧评分失效（不给过期分数可乘之机）
+    r = await call('PUT', `/${e1.id}`, { content: '改了正文之后旧评分必须失效，该怎么收场' });
+    const u3 = r.json as unknown as SmokeAngle;
+    expect(
+      '25 改正文后评分失效（scores=null + scoreError）',
+      u3.scoreTotal === null && Boolean(u3.scoreError),
+      { scoreTotal: u3.scoreTotal, scoreError: u3.scoreError },
+    );
+
     console.log(`\nSMOKE ANGLES: ALL PASS (${passed} 项)`);
   } finally {
-    // ── 清理：绝不留下脏数据 ──
+    // ── 清理：绝不留下脏数据（TopicReview 随 Angle 级联删） ──
+    await prisma.oAAccount.deleteMany({ where: { trackId } });
     await prisma.angle.deleteMany({ where: { trackId } });
     await prisma.article.deleteMany({ where: { trackId } });
     await prisma.track.deleteMany({ where: { id: trackId } });

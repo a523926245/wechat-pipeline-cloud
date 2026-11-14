@@ -106,12 +106,54 @@ export interface AngleItem {
   usedBy: string;
   usedDate: string | null;
   source: string;
+  /** 审核态（S4-1）：candidate / needs_revision / approved / rejected。 */
+  status: AngleStatus;
+  /** 已完成审核轮数（0=从未审核）。 */
+  reviewRound: number;
+  /** 六维评分（未评分为 null——不得视为高质量）。 */
+  scores: AngleScores | null;
+  /** 总分（0-30，六维等权合计）；未评分为 null。 */
+  scoreTotal: number | null;
+  /** 评分模型给出的参考建议（不是审核结论）。 */
+  scoreSuggestion: string;
+  /** 评分失败/缺失原因；null=已评分。 */
+  scoreError: string | null;
   /** 引用了该选题的文章数，删除前据此给用户强提示 */
   articleCount: number;
   /** 含 IP 外角色（奶奶/婆婆/老师…）：漫画线画不出来，需要退回文章专用。 */
   offIp?: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+/** 选题审核态（D1：status 只管审核态，used 只管消费态）。 */
+export type AngleStatus = 'candidate' | 'needs_revision' | 'approved' | 'rejected';
+/** 人工审核结论（评分不替代人工审核，此枚举只来自人工操作）。 */
+export type AngleReviewVerdict = 'approved' | 'needs_revision' | 'rejected';
+
+/** 六维评分（0-5 整数/维，总分=等权合计 0-30；无权重、无阈值）。 */
+export interface AngleScores {
+  fit: number;
+  scene: number;
+  conflict: number;
+  method: number;
+  safety: number;
+  novelty: number;
+  total: number;
+}
+
+/** TopicReview 审核事件（一候选多轮全留）。 */
+export interface TopicReviewRecord {
+  id: number;
+  angleId: number;
+  round: number;
+  scores: AngleScores | null;
+  riskHits: string[];
+  verdict: AngleReviewVerdict;
+  reason: string;
+  model: string;
+  reviewedBy: string;
+  createdAt: string;
 }
 
 export type AngleUsedFilter = 'unused' | 'used' | 'all';
@@ -121,11 +163,15 @@ export type AngleScopeFilter = 'article' | 'comic' | 'shared';
 export interface AngleListQuery {
   trackId: number;
   used?: AngleUsedFilter;
+  /** 审核态过滤；'all' 不下发。 */
+  status?: AngleStatus | 'all';
   /** 角度切片过滤：article / comic / shared */
   scope?: AngleScopeFilter;
   /** 只看含 IP 外角色的选题。 */
   offIp?: boolean;
   keyword?: string;
+  /** score=按总分降序（未评分排最后）。 */
+  sort?: 'seq' | 'score';
   limit?: number;
   offset?: number;
 }
@@ -196,6 +242,8 @@ export interface TrackExpandResult {
   requested: number;
   added: number;
   skippedDuplicate: number;
+  /** 六维评分成功的条数（S4-1；评分失败按未评分，不自动批准）。 */
+  scored: number;
   generated: number;
   /** 本批产出的角度切片 */
   scope: AngleScopeFilter;

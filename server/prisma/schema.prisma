@@ -29,6 +29,26 @@ enum ArticleStatus {
   failed
 }
 
+/// 选题审核态（D1：status 只管审核态，used 只管消费态，两者不合并）。
+/// 状态图：candidate ─┬─ approved ─(used=true 由排产置)─▶ 已消费
+///                     ├─ needs_revision ─┬─ approved
+///                     │                  └─ rejected
+///                     └─ rejected
+/// approved / rejected 为终态；「标重复」= TopicReview 事件（verdict=rejected, reason=dup_*），不新增主状态。
+enum AngleStatus {
+  candidate
+  needs_revision
+  approved
+  rejected
+}
+
+/// TopicReview.verdict：人工审核操作三态（评分不替代人工审核，无自动 verdict）。
+enum TopicVerdict {
+  approved
+  needs_revision
+  rejected
+}
+
 enum TaskStatus {
   pending
   running
@@ -254,6 +274,15 @@ model Angle {
   theme     String    @db.VarChar(64)
   content   String    @db.VarChar(500)
   scope     String    @default("article") @db.VarChar(16)
+  /// 审核态（D1）：candidate / needs_revision / approved / rejected。扩库与手动新增一律进 candidate，
+  /// 只有 approved 可被排产消费（planner/reserve 过滤）。终态 approved/rejected 不可再流转。
+  status    AngleStatus @default(candidate)
+  /// 已完成的审核轮数（每条 TopicReview 事件 +1，0=从未审核）。
+  reviewRound Int       @default(0)
+  /// 六维评分依据/风险说明/判重结果（S4-1 起：scores{fit,scene,conflict,method,safety,novelty,total}、
+  /// scoreSource/scoreModel/scoredAt/riskHits/suggestion/rationale，失败时 scoreError）。
+  /// 评分只影响排序与人工参考，不替代人工审核，不设自动批准/淘汰阈值。
+  metaJson  Json?
   used      Boolean   @default(false)
   /// 展示用占用标签（账号名，兼容旧数据与导出）。结构化归属见 usedById/usedByAccountId。
   usedBy    String    @default("") @db.VarChar(64)
@@ -268,11 +297,45 @@ model Angle {
 
   track    Track      @relation(fields: [trackId], references: [id], onDelete: Cascade)
   articles Article[]
+  /// 审核事件流水（一候选多轮全留，回答「修改后重审如何追踪」）。
+  topicReviews TopicReview[]
 
   @@unique([trackId, code])
   @@index([trackId, scope, used, seq])
-  @@index([trackId, used, seq])
+  /// DATABASE-DESIGN-REVIEW §③：现 [trackId,used,seq] 演进为 [trackId,status,seq]。
+  @@index([trackId, status, seq])
   @@index([theme])
+}
+
+/// 选题审核记录（D1：Angle.status + used + TopicReview 事件表，不建 TopicCandidate）。
+/// N:1 → Angle（angleId + round）；一候选多轮审核全留。
+/// 字段依据 DATABASE-DESIGN-REVIEW §④：scoresJson（六维）/ riskHits / dupHits / verdict / reason / model / createdAt。
+/// promptVersionHash / contractVersion 暂缺：S3 裁决 PromptVersion / TrackContract 不实施，
+/// 写了就是伪造追溯（决策 C：不伪造历史），待相关能力落地后再补列。
+/// reviewedBy：审核操作者（登录名，空=未记录），满足「审核操作可追溯」的最低要求，非审批流/角色机制。
+model TopicReview {
+  id         Int          @id @default(autoincrement())
+  angleId    Int
+  /// 审核轮数：同一 angleId 下从 1 递增（与 Angle.reviewRound 同步推进）。
+  round      Int
+  /// 六维评分快照（审核时刻 Angle.metaJson.scores 的拷贝）：{fit,scene,conflict,method,safety,novelty,total}。
+  scoresJson Json?
+  /// 风险项快照（评分/守门发现的风险说明）。
+  riskHits   Json?
+  /// 判重命中（相似 Angle id+分数）。S4-2 去重链接入前恒空。
+  dupHits    Json?
+  verdict    TopicVerdict
+  reason     String       @default("") @db.VarChar(500)
+  /// 评分所用模型名快照（D5：第一版复用 write 角色）。
+  model      String       @default("") @db.VarChar(64)
+  /// 审核操作者（登录名）。
+  reviewedBy String       @default("") @db.VarChar(64)
+  createdAt  DateTime     @default(now())
+
+  angle Angle @relation(fields: [angleId], references: [id], onDelete: Cascade)
+
+  @@index([angleId, round])
+  @@index([verdict, createdAt])
 }
 
 /// 文章。contentHtml 可编辑，contentWechat 是推送渲染产物（由同一渲染函数产出）。

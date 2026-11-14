@@ -9,6 +9,7 @@ import type {
   AngleListQuery,
   AngleListResult,
   AnglePayload,
+  AngleReviewVerdict,
   AngleScopeFilter,
   AngleUpdatePayload,
   ArticleDetail,
@@ -54,6 +55,7 @@ import type {
   StylePromptItem,
   SystemStatus,
   TickResult,
+  TopicReviewRecord,
   TrackExpandResult,
   TrackItem,
   TrackPayload,
@@ -166,6 +168,20 @@ export const releaseAngle = (id: number) =>
   http.post<{ ok: boolean; id: number; poolUnused: number; message: string }>(
     `/angles/${id}/release`,
   );
+
+/**
+ * 人工审核（S4-1）：通过 / 拒绝 / 要求修改。
+ * 只走后端状态机；评分不替代人工审核（approved / rejected 为终态）。
+ */
+export const reviewAngle = (id: number, verdict: AngleReviewVerdict, reason?: string) =>
+  http.post<{ ok: boolean; review: TopicReviewRecord; item: AngleItem; message: string }>(
+    `/angles/${id}/review`,
+    reason ? { verdict, reason } : { verdict },
+  );
+
+/** 审核记录（一候选多轮全留，新轮在前）。 */
+export const listAngleReviews = (id: number) =>
+  http.get<{ total: number; items: TopicReviewRecord[] }>(`/angles/${id}/reviews`);
 
 // ── 模型 ──
 export const listModels = () => http.get<{ total: number; items: LlmModelView[] }>('/models');

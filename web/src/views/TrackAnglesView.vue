@@ -20,6 +20,7 @@ import {
   Plus,
   Refresh,
   RefreshLeft,
+  Select,
   Share,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
@@ -34,21 +35,32 @@ import {
   deleteAngle,
   expandTrackAngles,
   getAngle,
+  listAngleReviews,
   listAngles,
   listTracks,
   reassignOffIpAngles,
   releaseAngle,
+  reviewAngle,
   updateAngle,
 } from "../api/index.ts";
 import BatchBar from "../components/BatchBar.vue";
 import StateError from "../components/StateError.vue";
 import RowActions, { type RowAction } from "../components/RowActions.vue";
 import { useBatchDelete } from "../composables/useBatchDelete.ts";
-import type { AngleItem, AngleScopeFilter, AngleUsedFilter } from "../types.ts";
+import type {
+  AngleItem,
+  AngleReviewVerdict,
+  AngleScopeFilter,
+  AngleStatus,
+  AngleUsedFilter,
+  TopicReviewRecord,
+} from "../types.ts";
 import { angleScopeText } from "../utils/format.ts";
 
 /** 用途选项：与后端 Angle.scope 一一对应，文案由 /api/pipelines 下发（有兜底）。 */
 const SCOPE_OPTIONS: AngleScopeFilter[] = ["article", "comic", "shared"];
+/** 审核态选项（D1 四态）。 */
+const STATUS_OPTIONS: AngleStatus[] = ["candidate", "needs_revision", "approved", "rejected"];
 
 const router = useRouter();
 const route = useRoute();
@@ -86,20 +98,39 @@ const scope = computed<AngleScopeFilter | "all">(() => {
   const v = route.query.scope;
   return v === "article" || v === "comic" || v === "shared" ? v : "all";
 });
+/** 审核态筛选（S4-1）。 */
+const status = computed<AngleStatus | "all">(() => {
+  const v = route.query.status;
+  return v === "candidate" || v === "needs_revision" || v === "approved" || v === "rejected"
+    ? v
+    : "all";
+});
+/** 排序：score=按总分降序（评分影响排序，S4-1）。 */
+const sort = computed<"seq" | "score">(() =>
+  route.query.sort === "score" ? "score" : "seq",
+);
 const filtered = computed(
-  () => used.value !== "all" || keyword.value !== "" || scope.value !== "all",
+  () =>
+    used.value !== "all" ||
+    keyword.value !== "" ||
+    scope.value !== "all" ||
+    status.value !== "all",
 );
 
 /** 表单与 URL 解耦：点「搜索/重置」才提交，避免每敲一个字就 replace 一次。 */
 const usedInput = ref<string>(used.value);
 const keywordInput = ref(keyword.value);
 const scopeInput = ref<string>(scope.value);
+const statusInput = ref<string>(status.value);
+const sortInput = ref<string>(sort.value);
 
 /** URL 被外部改动（返回、分享链接）时同步表单控件。 */
-watch([used, keyword, scope], () => {
+watch([used, keyword, scope, status, sort], () => {
   usedInput.value = used.value;
   keywordInput.value = keyword.value;
   scopeInput.value = scope.value;
+  statusInput.value = status.value;
+  sortInput.value = sort.value;
 });
 
 async function loadTrackName() {
@@ -122,8 +153,10 @@ async function load() {
     const res = await listAngles({
       trackId: trackId.value,
       used: used.value,
+      status: status.value,
       scope: scope.value === "all" ? undefined : scope.value,
       keyword: keyword.value || undefined,
+      sort: sort.value,
       limit: PAGE_SIZE,
       offset: (page.value - 1) * PAGE_SIZE,
     });
@@ -186,7 +219,7 @@ onMounted(() => {
   void load();
   void loadOffIpCount();
 });
-watch([used, keyword, scope, page, trackId], load);
+watch([used, keyword, scope, status, sort, page, trackId], load);
 
 function setQuery(patch: Record<string, string | number | undefined>) {
   const query: Record<string, string> = {};
@@ -201,6 +234,8 @@ function applyFilter() {
   setQuery({
     used: usedInput.value === "all" ? undefined : usedInput.value,
     scope: scopeInput.value === "all" ? undefined : scopeInput.value,
+    status: statusInput.value === "all" ? undefined : statusInput.value,
+    sort: sortInput.value === "seq" ? undefined : sortInput.value,
     keyword: keywordInput.value || undefined,
     page: 1,
   });
@@ -210,7 +245,16 @@ function resetFilter() {
   usedInput.value = "all";
   keywordInput.value = "";
   scopeInput.value = "all";
-  setQuery({ used: undefined, scope: undefined, keyword: undefined, page: 1 });
+  statusInput.value = "all";
+  sortInput.value = "seq";
+  setQuery({
+    used: undefined,
+    scope: undefined,
+    status: undefined,
+    sort: undefined,
+    keyword: undefined,
+    page: 1,
+  });
 }
 
 function backToTracks() {
@@ -439,7 +483,7 @@ const batch = useBatchDelete<AngleItem>({
  * reserve-selection 会让勾选跨数据刷新保留——翻页时这是想要的（跨页攒一批），
  * 但换筛选后旧勾选指向的是另一个结果集，留着会让用户删到看不见的选题。
  */
-watch([used, keyword, scope], () => {
+watch([used, keyword, scope, status, sort], () => {
   batch.clearSelection();
 });
 
@@ -494,8 +538,139 @@ async function changeScope(row: AngleItem, next: AngleScopeFilter) {
   }
 }
 
+/**
+ * 人工审核（S4-1）：通过 / 拒绝 / 要求修改。
+ * - 评分只做排序与参考，不替代人工审核；approved / rejected 为终态（后端状态机校验）。
+ * - 拒绝 / 要求修改时可填原因（可选），留空也允许。
+ */
+const reviewingId = ref<number | null>(null);
+
+function statusText(s: AngleStatus): string {
+  return (
+    { candidate: "候选待审", needs_revision: "待修改", approved: "已通过", rejected: "已拒绝" } as const
+  )[s];
+}
+
+function statusTagType(s: AngleStatus): "info" | "warning" | "success" | "danger" {
+  return (
+    { candidate: "info", needs_revision: "warning", approved: "success", rejected: "danger" } as const
+  )[s];
+}
+
+/** 六维标签（与后端 SCORE_DIMENSION_LABELS 同源文案）。 */
+const SCORE_LABELS: Array<{ key: string; label: string }> = [
+  { key: "fit", label: "定位契合" },
+  { key: "scene", label: "具体画面" },
+  { key: "conflict", label: "冲突反差" },
+  { key: "method", label: "方法落点" },
+  { key: "safety", label: "情绪安全" },
+  { key: "novelty", label: "差异化" },
+];
+
+/** 取单维分数（模板里不做类型断言）。 */
+function scoreDim(s: AngleItem["scores"], key: string): number | string {
+  if (!s) return "—";
+  return (s as unknown as Record<string, number>)[key] ?? "—";
+}
+
+async function review(row: AngleItem, verdict: AngleReviewVerdict) {
+  if (reviewingId.value !== null) return;
+  const label =
+    verdict === "approved" ? "通过" : verdict === "rejected" ? "拒绝" : "要求修改";
+  let reason = "";
+  try {
+    if (verdict === "approved") {
+      await ElMessageBox.confirm(
+        `将选题「${row.theme || row.content.slice(0, 20)}」审核为**通过**。\n通过后它才会被排产消费（used 由排产置）。确认？`,
+        "审核通过",
+        { type: "info", confirmButtonText: "通过", cancelButtonText: "取消" },
+      );
+    } else {
+      const r = await ElMessageBox.prompt(
+        `将选题「${row.theme || row.content.slice(0, 20)}」标为「${label}」。可填写原因（可选，≤500 字）：`,
+        verdict === "rejected" ? "审核拒绝" : "要求修改",
+        {
+          type: "warning",
+          confirmButtonText: label,
+          cancelButtonText: "取消",
+          inputPlaceholder: "原因（可选）",
+          inputValidator: (v: string) => v.trim().length <= 500 || "原因不能超过 500 字",
+        },
+      );
+      reason = (r.value ?? "").trim();
+    }
+  } catch {
+    return;
+  }
+  reviewingId.value = row.id;
+  try {
+    const res = await reviewAngle(row.id, verdict, reason || undefined);
+    ElMessage.success(res.message || `已${label}`);
+    await load();
+  } catch (e) {
+    ElMessage.error(errMsg(e, "审核失败"));
+  } finally {
+    reviewingId.value = null;
+  }
+}
+
+// ── 审核记录（一候选多轮全留）──
+const reviewDialog = reactive({
+  visible: false,
+  loading: false,
+  theme: "",
+  content: "",
+  items: [] as TopicReviewRecord[],
+});
+
+async function openReviewRecords(row: AngleItem) {
+  reviewDialog.visible = true;
+  reviewDialog.loading = true;
+  reviewDialog.theme = row.theme;
+  reviewDialog.content = row.content;
+  reviewDialog.items = [];
+  try {
+    const res = await listAngleReviews(row.id);
+    reviewDialog.items = res.items;
+  } catch (e) {
+    ElMessage.error(errMsg(e, "审核记录加载失败"));
+  } finally {
+    reviewDialog.loading = false;
+  }
+}
+
+function reviewVerdictText(v: AngleReviewVerdict): string {
+  return v === "approved" ? "通过" : v === "rejected" ? "拒绝" : "要求修改";
+}
+
 function angleActions(row: AngleItem): RowAction[] {
   const actions: RowAction[] = [{ command: "edit", label: "编辑", icon: Edit }];
+  // 审核操作只出现在可流转状态（approved / rejected 是终态，后端也会拒）。
+  if (row.status === "candidate" || row.status === "needs_revision") {
+    actions.push({
+      command: "review:approved",
+      label: "审核通过",
+      icon: Select,
+      loading: reviewingId.value === row.id,
+    });
+    actions.push({
+      command: "review:needs_revision",
+      label: "要求修改",
+      loading: reviewingId.value === row.id,
+    });
+    actions.push({
+      command: "review:rejected",
+      label: "审核拒绝",
+      type: "danger",
+      loading: reviewingId.value === row.id,
+    });
+  }
+  if (row.reviewRound > 0) {
+    actions.push({
+      command: "reviews",
+      label: "审核记录",
+    });
+  }
   const cur: AngleScopeFilter = row.scope ?? "article";
   const busy = scopingId.value === row.id;
   if (cur !== "shared") {
@@ -557,7 +732,10 @@ function onAngleCommand(cmd: string, row: AngleItem) {
   if (cmd === "edit") openEdit(row);
   else if (cmd === "release") void release(row);
   else if (cmd === "delete") void remove(row);
-  else if (cmd.startsWith("scope:")) {
+  else if (cmd === "reviews") void openReviewRecords(row);
+  else if (cmd.startsWith("review:")) {
+    void review(row, cmd.slice(7) as AngleReviewVerdict);
+  } else if (cmd.startsWith("scope:")) {
     void changeScope(row, cmd.slice(6) as AngleScopeFilter);
   }
 }
@@ -640,6 +818,21 @@ function onAngleCommand(cmd: string, row: AngleItem) {
             <el-option label="未用" value="unused" />
           </el-select>
         </el-form-item>
+        <el-form-item label="审核" class="wb-filter-item">
+          <el-select
+            v-model="statusInput"
+            placeholder="全部"
+            style="width: 130px"
+          >
+            <el-option label="全部" value="all" />
+            <el-option
+              v-for="s in STATUS_OPTIONS"
+              :key="s"
+              :label="statusText(s)"
+              :value="s"
+            />
+          </el-select>
+        </el-form-item>
         <el-form-item label="用途" class="wb-filter-item">
           <el-select
             v-model="scopeInput"
@@ -653,6 +846,12 @@ function onAngleCommand(cmd: string, row: AngleItem) {
               :label="angleScopeText(s)"
               :value="s"
             />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="排序" class="wb-filter-item">
+          <el-select v-model="sortInput" style="width: 130px">
+            <el-option label="按序号" value="seq" />
+            <el-option label="按评分（高→低）" value="score" />
           </el-select>
         </el-form-item>
         <el-form-item label="关键词" class="wb-filter-item">
@@ -727,6 +926,52 @@ function onAngleCommand(cmd: string, row: AngleItem) {
             >
               IP外
             </el-tag>
+          </template>
+        </el-table-column>
+        <!-- 审核态（S4-1）：candidate/needs_revision/approved/rejected，与消费态（已用/未用）是两个维度 -->
+        <el-table-column label="审核" width="104">
+          <template #default="{ row }">
+            <el-tag :type="statusTagType(row.status)" size="small">
+              {{ statusText(row.status) }}
+            </el-tag>
+            <span
+              v-if="row.reviewRound > 0"
+              class="wb-muted review-round"
+              :title="`已完成 ${row.reviewRound} 轮审核`"
+              >R{{ row.reviewRound }}</span
+            >
+          </template>
+        </el-table-column>
+        <!-- 六维评分（0-5/维，总分=等权合计 0-30）：只做排序与人工参考，无阈值、不自动批准 -->
+        <el-table-column label="评分" width="96">
+          <template #default="{ row }">
+            <el-popover v-if="row.scores" placement="left" :width="230" trigger="hover">
+              <template #reference>
+                <span
+                  class="score-total"
+                  :title="`总分 ${row.scoreTotal}/30（六维等权合计）`"
+                  >{{ row.scoreTotal }}<span class="wb-muted">/30</span></span
+                >
+              </template>
+              <div class="score-pop">
+                <div v-for="d in SCORE_LABELS" :key="d.key" class="score-row">
+                  <span>{{ d.label }}</span>
+                  <span>{{ scoreDim(row.scores, d.key) }}</span>
+                </div>
+                <div class="score-row score-sum">
+                  <span>总分</span><span>{{ row.scoreTotal }}/30</span>
+                </div>
+                <div v-if="row.scoreSuggestion" class="wb-muted score-sug">
+                  模型建议：{{ row.scoreSuggestion }}（仅供参考，以人工审核为准）
+                </div>
+              </div>
+            </el-popover>
+            <span
+              v-else
+              class="wb-muted"
+              :title="row.scoreError || '未评分——不视为高质量，仅可人工审核'"
+              >未评分</span
+            >
           </template>
         </el-table-column>
         <el-table-column label="状态" min-width="180" show-overflow-tooltip>
@@ -910,7 +1155,7 @@ function onAngleCommand(cmd: string, row: AngleItem) {
         type="info"
         show-icon
         :closable="false"
-        title="用「模型配置」里绑定到「扩角度(expand_angles)」角色的模型生成，与现有选题归一化去重后入库（每次生成都会消耗 Token）。"
+        title="用「模型配置」里绑定到「扩角度(expand_angles)」角色的模型生成，与现有选题归一化去重后进入「候选」。生成后自动做六维评分（复用「写作」角色模型，失败=未评分），并需人工审核通过（approved）后才会被排产消费。"
       />
 
       <template #footer>
@@ -923,6 +1168,47 @@ function onAngleCommand(cmd: string, row: AngleItem) {
         >
       </template>
     </el-dialog>
+
+    <!-- 审核记录：一候选多轮全留（回答「修改后重审如何追踪」） -->
+    <el-dialog
+      v-model="reviewDialog.visible"
+      :title="`审核记录 · ${reviewDialog.theme || reviewDialog.content.slice(0, 20)}`"
+      width="min(640px, 92vw)"
+    >
+      <div v-loading="reviewDialog.loading">
+        <p class="wb-muted review-head">
+          {{ reviewDialog.content }}
+        </p>
+        <el-empty
+          v-if="!reviewDialog.loading && reviewDialog.items.length === 0"
+          description="还没有审核记录"
+          :image-size="48"
+        />
+        <div
+          v-for="r in reviewDialog.items"
+          :key="r.id"
+          class="review-row"
+        >
+          <div class="review-row-head">
+            <el-tag :type="statusTagType(r.verdict)" size="small">
+              {{ reviewVerdictText(r.verdict) }}
+            </el-tag>
+            <span class="wb-muted"
+              >第 {{ r.round }} 轮 · {{ r.createdAt.slice(0, 19).replace("T", " ")
+              }}<template v-if="r.reviewedBy"> · {{ r.reviewedBy }}</template></span
+            >
+            <span v-if="r.scores" class="wb-muted"
+              >评分 {{ r.scores.total }}/30</span
+            >
+            <span v-else class="wb-muted">未评分</span>
+          </div>
+          <div v-if="r.reason" class="review-reason">{{ r.reason }}</div>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="reviewDialog.visible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -930,6 +1216,71 @@ function onAngleCommand(cmd: string, row: AngleItem) {
 .used-by {
   margin-left: var(--wb-space-1);
   font-size: 12px;
+}
+
+/* 六维评分（S4-1） */
+.score-total {
+  cursor: default;
+  font-weight: 600;
+}
+
+.score-pop .score-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.9;
+}
+
+.score-pop .score-sum {
+  border-top: 1px solid var(--el-border-color-lighter);
+  margin-top: 4px;
+  padding-top: 4px;
+  font-weight: 600;
+}
+
+.score-pop .score-sug {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.review-round {
+  margin-left: 4px;
+  font-size: 11px;
+}
+
+/* 审核记录弹窗 */
+.review-head {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.review-row {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+
+.review-row:last-child {
+  border-bottom: none;
+}
+
+.review-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.review-reason {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--el-text-color-regular);
+  word-break: break-all;
 }
 
 .scope-hint {

@@ -21,13 +21,23 @@
  */
 
 import { prisma } from '../db.ts';
+import { packJson } from '../db-json.ts';
 import { BadRequestError, NotFoundError } from '../errors.ts';
 import { logger } from '../logger.ts';
+import { Prisma, type AngleStatus } from '@prisma/client';
 import { assertRoleUsable, chatComplete } from './llm.ts';
 import { findOffIpWords, ipCharacterBrief, loadComicTemplates } from './comic/script.ts';
 import { loadGlobalPrompt } from './style-prompts.ts';
 import type { AngleScope } from './pipeline.ts';
 import { ruleFor } from './track-rules.ts';
+import {
+  scoreAngleCandidates,
+  toScoreMeta,
+  readScoreMeta,
+  type AngleScoreMeta,
+  type AngleScores,
+  type CompleteFn,
+} from './topic-review.ts';
 
 /** 生成 scope=x 的选题时，会被同一产线同时看到的切片（用来决定「喂哪些现有选题给模型避重」）。 */
 function visibleScopes(scope: AngleScope): AngleScope[] {
@@ -45,6 +55,8 @@ export interface ExpandResult {
   skippedDuplicate: number;
   /** 因违反正能量守门（心理标签/纯困境结尾）被确定性过滤的条数 */
   skippedOffensive: number;
+  /** 六维评分成功的条数（评分失败/缺失=其余条数，不视为高质量、不自动批准） */
+  scored: number;
   /** 模型返回的原始条数（可能少于请求数） */
   generated: number;
   /** 本批入库的角度切片（article / comic / shared）。 */
@@ -321,25 +333,37 @@ export function topicRejectReason(
 /**
  * 为赛道扩充选题角度池。
  *
+ * S4-1 起：产出**一律进 candidate（候选）**，不直接入正式题库（D1）；
+ * 只有人工审核 approved 后才可被排产消费。入库前做六维评分（D5 复用 write 角色，
+ * 批量调用），评分失败按未评分入库——绝不默认高质量、绝不自动批准。
+ *
  * @param trackId 赛道 id
  * @param count   希望新增的条数（1~100）
  * @param seed    可选的维度种子，用来引导本批选题的方向
  * @param scope   产出的角度切片（默认 article）。**给漫画产线扩库必须传 comic 或 shared**，
  *                否则产出的选题只挂在文章切片上，漫画产线一粒都吃不到。
+ * @param opts    测试注入缝（Mock LLM）：gen=生成调用、score=评分调用；缺省走真实 chatComplete。
  */
 export async function expandAnglesForTrack(
   trackId: number,
   count: number,
   seed?: string,
   scope: AngleScope = 'article',
+  opts: { gen?: CompleteFn; score?: CompleteFn } = {},
 ): Promise<ExpandResult> {
   const want = Math.min(Math.max(Math.floor(count) || 20, 1), MAX_COUNT);
 
   const track = await prisma.track.findUnique({ where: { id: trackId } });
   if (!track) throw new NotFoundError(`赛道 ${trackId} 不存在`);
 
-  // 未绑定 / 停用 / 能力不符 / 缺 Key 都由统一判定给出可读的 400 文案
-  const model = await assertRoleUsable('expand_angles');
+  // 未绑定 / 停用 / 能力不符 / 缺 Key 都由统一判定给出可读的 400 文案。
+  // 测试注入 opts.gen 时跳过角色解析（Mock：不触真实模型绑定与外呼）。
+  let modelName = 'mock-expand';
+  let model: Awaited<ReturnType<typeof assertRoleUsable>> | null = null;
+  if (!opts.gen) {
+    model = await assertRoleUsable('expand_angles');
+    modelName = model.name;
+  }
 
   const visScopes = visibleScopes(scope);
 
@@ -362,11 +386,10 @@ export async function expandAnglesForTrack(
   // 创作总纲（文风配置页）：题库扩库与写稿共用同一份正能量约束。
   const globalPrompt = await loadGlobalPrompt();
 
-  const raw = await chatComplete(
-    model,
-    buildMessages(track.name, want, existing, seed, scope, globalPrompt),
-    { temperature: 0.9, maxTokens: 4000 },
-  );
+  const messages = buildMessages(track.name, want, existing, seed, scope, globalPrompt);
+  const raw = opts.gen
+    ? await opts.gen(messages, { temperature: 0.9, maxTokens: 4000 })
+    : await chatComplete(model!, messages, { temperature: 0.9, maxTokens: 4000 });
 
   const candidates = extractJsonArray(raw);
   if (candidates.length === 0) {
@@ -382,12 +405,14 @@ export async function expandAnglesForTrack(
     content: string;
     source: string;
     scope: string;
+    status: AngleStatus;
   }[] = [];
   let skippedDuplicate = 0;
   let skippedOffensive = 0;
 
   for (const c of candidates) {
     // 正能量守门：拒收纯困境结尾/心理标签题（比提示词更硬，模型不听话时兜底）
+    // ⚠️ 评分不绕过硬门禁：被守门拒收的候选根本不进入评分与入库（S4-1 红线）。
     const reject = topicRejectReason(c, track.name);
     if (reject) {
       skippedOffensive += 1;
@@ -408,11 +433,31 @@ export async function expandAnglesForTrack(
       content: clip(c.content, 500),
       source: 'llm-expand',
       scope,
+      // D1：生成即候选。任何路径都不允许生成后直接进正式题库。
+      status: 'candidate',
     });
   }
 
+  // 六维评分（S4-1）：批量一次判多条（Q10）；失败只降级为未评分，不阻断候选入库。
+  let scored = 0;
   if (rows.length > 0) {
-    await prisma.angle.createMany({ data: rows });
+    const scoreMap = await scoreAngleCandidates(
+      track.name,
+      rows.map((r, i) => ({ id: i + 1, theme: r.theme, content: r.content })),
+      opts.score,
+    );
+    let scoreModel = '';
+    const data = rows.map((r, i) => {
+      const rec = scoreMap.get(i + 1);
+      if (rec?.scores) {
+        scored += 1;
+        scoreModel = 'write-role';
+      }
+      const meta: AngleScoreMeta = toScoreMeta(rec, opts.score ? 'mock-write' : 'write-role');
+      return { ...r, metaJson: packJson(meta) ?? Prisma.DbNull };
+    });
+    await prisma.angle.createMany({ data });
+    logger.info({ trackId, count: rows.length, scored, scoreModel }, '选题六维评分完成');
   }
 
   const [poolTotal, poolUnused, scopeUnused] = await Promise.all([
@@ -422,8 +467,8 @@ export async function expandAnglesForTrack(
   ]);
 
   logger.info(
-    { trackId, track: track.name, model: model.name, scope, requested: want, added: rows.length, skippedDuplicate, skippedOffensive },
-    '选题扩库完成',
+    { trackId, track: track.name, model: modelName, scope, requested: want, added: rows.length, skippedDuplicate, skippedOffensive, scored },
+    '选题扩库完成（进入候选，待人工审核）',
   );
 
   return {
@@ -433,6 +478,7 @@ export async function expandAnglesForTrack(
     added: rows.length,
     skippedDuplicate,
     skippedOffensive,
+    scored,
     generated: candidates.length,
     scope,
     scopeUnused,
@@ -528,6 +574,18 @@ export interface AngleItem {
   usedById: number | null;
   usedByAccountId: number | null;
   source: string;
+  /** 审核态（D1）：candidate / needs_revision / approved / rejected。 */
+  status: AngleStatus;
+  /** 已完成的审核轮数（0=从未审核）。 */
+  reviewRound: number;
+  /** 六维评分（未评分为 null——不得视为高质量）。 */
+  scores: AngleScores | null;
+  /** 总分（0-30，六维等权合计）；未评分为 null。 */
+  scoreTotal: number | null;
+  /** 评分模型给出的参考建议（不是审核结论，人工审核为准）。 */
+  scoreSuggestion: string;
+  /** 评分失败/缺失原因；空=已评分或未要求评分。 */
+  scoreError: string | null;
   /** 引用了该选题的文章数，删除提示要用 */
   articleCount: number;
   /**
@@ -544,11 +602,15 @@ export type AngleUsedFilter = 'unused' | 'used' | 'all';
 export interface AngleListParams {
   trackId: number;
   used?: AngleUsedFilter;
+  /** 审核态过滤；不传 = 全部。 */
+  status?: AngleStatus | 'all';
   /** 按切片过滤；不传 = 全部。 */
   scope?: AngleScope;
   /** 只看含 IP 外角色的选题（漫画产线治理用）。 */
   offIp?: boolean;
   keyword?: string;
+  /** 排序：seq=现有序号（默认）；score=总分降序（未评分类排最后）。评分影响排序（S4-1）。 */
+  sort?: 'seq' | 'score';
   limit?: number;
   offset?: number;
 }
@@ -588,6 +650,9 @@ type AngleRow = {
   theme: string;
   content: string;
   scope: string;
+  status: AngleStatus;
+  reviewRound: number;
+  metaJson: unknown;
   used: boolean;
   usedBy: string;
   usedDate: string | null;
@@ -602,6 +667,7 @@ type AngleRow = {
 type AngleWhere = NonNullable<NonNullable<Parameters<typeof prisma.angle.findMany>[0]>['where']>;
 
 function toItem(a: AngleRow): AngleItem {
+  const meta = readScoreMeta(a.metaJson);
   return {
     id: a.id,
     trackId: a.trackId,
@@ -617,6 +683,12 @@ function toItem(a: AngleRow): AngleItem {
     usedById: a.usedById ?? null,
     usedByAccountId: a.usedByAccountId ?? null,
     source: a.source,
+    status: a.status ?? 'candidate',
+    reviewRound: a.reviewRound ?? 0,
+    scores: meta?.scores ?? null,
+    scoreTotal: meta?.scores?.total ?? null,
+    scoreSuggestion: meta?.suggestion ?? '',
+    scoreError: meta?.scoreError ?? null,
     articleCount: a._count.articles,
     offIp: findOffIpWords(`${a.theme ?? ''}${a.content ?? ''}`).length > 0,
     createdAt: a.createdAt.toISOString(),
@@ -632,6 +704,8 @@ function isUniqueViolation(e: unknown): boolean {
 /**
  * 分页查询某赛道的选题明细。
  * 注意：SQLite 不支持 `mode: 'insensitive'`，contains 只能做大小写敏感匹配。
+ * sort=score 时在内存里按总分降序（未评分类排最后）——评分影响排序（S4-1），
+ * 赛道内是百条量级，内存排序 + 分页完全够用（与 offIp 过滤同思路）。
  */
 export async function listAngles(
   p: AngleListParams,
@@ -640,22 +714,37 @@ export async function listAngles(
   const offset = Math.max(Math.floor(p.offset ?? 0) || 0, 0);
   const kw = p.keyword?.trim() ?? '';
   const used = p.used ?? 'all';
+  const status = p.status ?? 'all';
 
   const where: AngleWhere = { trackId: p.trackId };
   if (used !== 'all') where.used = used === 'used';
+  if (status !== 'all') where.status = status;
   if (p.scope) where.scope = p.scope;
   if (kw) where.OR = [{ content: { contains: kw } }, { theme: { contains: kw } }];
 
-  // offIp 是「词表命中」判定，没法下推到 SQL（SQLite 无全文索引），
-  // 但赛道级数据量是百条量级，内存过滤 + 分页完全够用。
-  if (p.offIp) {
+  // offIp / score 排序都是「词表或分数没法下推到 SQL」的内存路径。
+  if (p.offIp || p.sort === 'score') {
     const all = await prisma.angle.findMany({
       where,
       orderBy: [{ seq: 'asc' }],
       include: { _count: { select: { articles: true } } },
     });
-    const hit = all.filter((a) => findOffIpWords(`${a.theme ?? ''}${a.content ?? ''}`).length > 0);
-    return { total: hit.length, limit, offset, items: hit.slice(offset, offset + limit).map(toItem) };
+    let rows = all;
+    if (p.offIp) {
+      rows = rows.filter((a) => findOffIpWords(`${a.theme ?? ''}${a.content ?? ''}`).length > 0);
+    }
+    if (p.sort === 'score') {
+      // 总分降序；未评分（null）排最后；同分保持 seq 升序（稳定）。
+      rows = [...rows].sort((x, y) => {
+        const sx = readScoreMeta(x.metaJson)?.scores?.total ?? null;
+        const sy = readScoreMeta(y.metaJson)?.scores?.total ?? null;
+        if (sx === null && sy === null) return x.seq - y.seq;
+        if (sx === null) return 1;
+        if (sy === null) return -1;
+        return sy - sx || x.seq - y.seq;
+      });
+    }
+    return { total: rows.length, limit, offset, items: rows.slice(offset, offset + limit).map(toItem) };
   }
 
   const [total, rows] = await Promise.all([
@@ -725,6 +814,7 @@ export async function getAngle(id: number): Promise<AngleItem> {
 /**
  * 手动新增一条选题。
  * seq 取当前赛道最大值 +1（保证排产按序消费），code 需规避 @@unique([trackId, code])。
+ * S4-1：手动新增同样进 candidate（评分缺失=未评分，不默认高质量、不自动批准）。
  */
 export async function createAngle(input: AngleCreateInput): Promise<AngleItem> {
   const track = await prisma.track.findUnique({ where: { id: input.trackId } });
@@ -746,9 +836,10 @@ export async function createAngle(input: AngleCreateInput): Promise<AngleItem> {
     const code = clip(`manual-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, 32);
     try {
       const created = await prisma.angle.create({
-        data: { trackId: input.trackId, code, seq, theme, content, source, scope },
+        // D1：手动新增进候选，与扩库同语义；未评分（metaJson 不造数据）。
+        data: { trackId: input.trackId, code, seq, theme, content, source, scope, status: 'candidate' },
       });
-      logger.info({ id: created.id, trackId: input.trackId, source, scope }, '手动新增选题');
+      logger.info({ id: created.id, trackId: input.trackId, source, scope }, '手动新增选题（进入候选，待人工审核）');
       return await getAngle(created.id);
     } catch (e) {
       if (isUniqueViolation(e)) continue;
@@ -758,17 +849,27 @@ export async function createAngle(input: AngleCreateInput): Promise<AngleItem> {
   throw new BadRequestError('选题编码冲突，请重试');
 }
 
-/** 只允许改 theme / content / scope，消费态字段（used/usedBy/usedDate）不接受外部改写。 */
+/** 只允许改 theme / content / scope，消费态字段（used/usedBy/usedDate）与审核态（status/reviewRound）不接受外部改写。 */
 export async function updateAngle(id: number, patch: AngleUpdateInput): Promise<AngleItem> {
-  const exists = await prisma.angle.findUnique({ where: { id }, select: { id: true } });
+  const exists = await prisma.angle.findUnique({ where: { id }, select: { id: true, metaJson: true } });
   if (!exists) throw new NotFoundError(`选题 ${id} 不存在`);
 
-  const data: { theme?: string; content?: string; scope?: string } = {};
+  const data: { theme?: string; content?: string; scope?: string; metaJson?: string | typeof Prisma.DbNull } = {};
   if (patch.theme !== undefined) data.theme = clip(patch.theme, 64);
   if (patch.content !== undefined) {
     const c = clip(patch.content, 500);
     if (!c) throw new BadRequestError('选题内容不能为空');
     data.content = c;
+    // 正文变了旧评分即失效：留空标注「内容已修改，评分失效」，不给过期分数可乘之机。
+    const prev = readScoreMeta(exists.metaJson);
+    data.metaJson = packJson({
+      ...(prev ?? {}),
+      scores: null,
+      scoreSource: 'none',
+      scoreModel: '',
+      scoredAt: new Date().toISOString(),
+      scoreError: '内容已修改，评分已失效（未重新评分）',
+    }) ?? Prisma.DbNull;
   }
   // 改切片 = 把这条选题划给另一条产线（给漫画线补角度最快的一条路）。
   if (patch.scope !== undefined) data.scope = patch.scope;
