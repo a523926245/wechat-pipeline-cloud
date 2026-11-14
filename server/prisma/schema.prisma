@@ -12,8 +12,9 @@ generator client {
 }
 
 datasource db {
-  provider = "mysql"
-  url      = env("DATABASE_URL")
+  provider          = "mysql"
+  url               = env("DATABASE_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
 }
 
 enum CredStatus {
@@ -282,7 +283,7 @@ model Article {
   title           String        @db.VarChar(255)
   digest          String        @default("") @db.VarChar(255)
   contentHtml     String        @db.Text
-  contentWechat   String        @default("") @db.LongText
+  contentWechat   String        @default(dbgenerated("('')")) @db.LongText
   contentPath     String        @default("") @db.VarChar(255)
   coverPath       String        @default("") @db.VarChar(255)
   /// 封面上传为微信永久素材后的 media_id。publisher 据此复用，避免每次推送都往
