@@ -29,12 +29,16 @@ import {
   listStylePrompts,
   loadGlobalPrompt,
   loadStyleForTrack,
+  loadTrackRule,
   parseLengthLine,
   pickVariants,
+  ruleKey,
   upsertStylePrompt,
   variantKey,
 } from '../src/services/style-prompts.ts';
+import { lintArticle } from '../src/services/lint.ts';
 import { buildPrompt, buildSystemPrompt } from '../src/services/writer.ts';
+import { oldStyleHtml } from './fixtures/article-sample.ts';
 import type { Angle, Track } from '@prisma/client';
 
 let passed = 0;
@@ -52,6 +56,7 @@ function expect(label: string, cond: boolean, detail?: unknown): void {
 const SMOKE_TRACK = '冒烟赛道';
 const SMOKE_KEYS = [
   SMOKE_TRACK,
+  ruleKey(SMOKE_TRACK),
   variantKey(SMOKE_TRACK, 'title'),
   variantKey(SMOKE_TRACK, 'structure'),
   variantKey(SMOKE_TRACK, 'length'),
@@ -180,6 +185,53 @@ async function main(): Promise<void> {
   // system 提示词随篇幅档变锚
   const sys = buildSystemPrompt({ target: v1.lengthTarget ?? undefined });
   expect('system 篇幅锚跟随变体', sys.includes(`${v1.lengthTarget?.min}-${v1.lengthTarget?.max} 字`));
+
+  console.log('\n[5] 机器规则：DB 覆盖 / 种子回落 / relax 豁免（S3 relax 修复验证）');
+  // oldStyleHtml 稳定触发：errors=chars/sections，warns=para_shape/para_short。
+  // 调用形态与修复后的 articles/publisher 一致：checks 与 relax 取自同一条 rule。
+  // 5.1 DB 覆盖生效：库里 r:冒烟赛道 只豁免 para_shape（与种子不同）→ 以库为准
+  await upsertStylePrompt(
+    ruleKey(SMOKE_TRACK),
+    JSON.stringify({ checks: [], angleMode: 'default', relax: ['para_shape'] }),
+  );
+  const dbRule = await loadTrackRule(SMOKE_TRACK);
+  expect('5.1 loadTrackRule 读库：relax 以库为准', JSON.stringify(dbRule.relax) === JSON.stringify(['para_shape']), dbRule);
+  const dbLint = lintArticle(oldStyleHtml(), undefined, SMOKE_TRACK, dbRule.checks, dbRule.relax);
+  expect(
+    '5.1 DB relax 生效：para_shape 被豁免',
+    !dbLint.warnings.some((w) => w.code === 'para_shape'),
+    dbLint.warnings,
+  );
+  expect(
+    '5.1 豁免有边界：para_short 仍提示（库只列了 para_shape）',
+    dbLint.warnings.some((w) => w.code === 'para_short'),
+    dbLint.warnings,
+  );
+  // 5.2 种子默认生效：删掉库里的 r:育儿 → 回落出厂种子（relax: ['para_short']）
+  await deleteStylePrompt(ruleKey('育儿'));
+  const seedRule = await loadTrackRule('育儿');
+  expect('5.2 loadTrackRule 回落种子：relax=para_short', JSON.stringify(seedRule.relax) === JSON.stringify(['para_short']), seedRule);
+  const seedLint = lintArticle(oldStyleHtml(), undefined, '育儿', seedRule.checks, seedRule.relax);
+  expect(
+    '5.2 种子 relax 生效：para_short 被豁免',
+    !seedLint.warnings.some((w) => w.code === 'para_short'),
+    seedLint.warnings,
+  );
+  expect(
+    '5.2 种子豁免有边界：para_shape 仍提示（育儿只豁免 para_short）',
+    seedLint.warnings.some((w) => w.code === 'para_shape'),
+    seedLint.warnings,
+  );
+  // 5.3 relax 只豁免 warn：error 是推送门禁，任何豁免配置都关不掉。
+  // oldStyleHtml 的 warn 全集：para_shape/para_short/ending_hook/emphasis/key_emphasis。
+  const warnCodes = ['para_shape', 'para_short', 'ending_hook', 'emphasis', 'key_emphasis'];
+  const hard = lintArticle(oldStyleHtml(), undefined, SMOKE_TRACK, [], [...warnCodes, 'chars', 'sections']);
+  expect(
+    '5.3 relax 关不掉 error：error 码放进 relax 也仍拦',
+    hard.errors.some((e) => e.code === 'chars') && hard.errors.some((e) => e.code === 'sections'),
+    hard.errors,
+  );
+  expect('5.3 relax 可免尽 warn', hard.warnings.length === 0, hard.warnings);
 
   await cleanup();
   expect('清理完成', (await prisma.stylePrompt.count({ where: { key: { in: SMOKE_KEYS } } })) === 0);

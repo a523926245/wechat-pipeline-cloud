@@ -1521,3 +1521,17 @@ T1 拆 T1-A 基线迁移 / T1-B TrackContract / T1-C PromptVersion / T1-D Genera
 - **验收 10/10**：validate✓ / typecheck 0✓ / 启动 health driver:mysql✓ / 三冒烟 116+33+30✓ / verify 10/10✓ / 废弃 SQLite 配置零残留✓ / dev.db+8 备份 9 文件 SHA256 全 MATCH✓ / 业务库 15 表 0 行+3 迁移记录不变、他库零触碰✓ / Git diff 无业务逻辑意外变化✓。
 - **Git：未提交**（与 S1-3 累计改动一并留待后续统一提交）。
 - **状态：完成，S2 验收通过（2026-11-14）。S3 未授权不进。**
+
+## 2026-11-14（下午）· S3 第一批：架构与抽象精简裁决 + relax 修复
+
+- **授权**：S3 正式授权。范围限五对象（TrackContract / PromptVersion / GenerationRun / Renderer / 门禁参数化）+ 直接相关调用链；低风险简化可直接实施，涉 DB 模型/持久化语义/业务流程先报批；完成一批执行验证；不进 S4、不扩大 S3。
+- **五对象裁决（基于真实调用链核查，用户已全部确认，以此为准不再重复讨论）**：
+  - **TrackContract / PromptVersion / GenerationRun：不实施**——三者在代码中零命中（T1-B~E 纸面设计），职能已由现有机制覆盖：门禁数字=constants 单一真源、机器规则=track-rules 种子+`r:{赛道}` DB 覆盖、提示词排障=prompt-dump 落盘 30 份、运行记录=TaskRun/RunLog。建表建抽象=纯增维护面，与 S3 精简目标相反。
+  - **Prompt Renderer（form/render.ts 唯一拼装入口）：不实施**——prompt 拼装已集中在 writer.ts 一处；**微信草稿 Renderer（services/render/）：保留**——6 处真实调用（articles/emphasis/revise/planner/comic/publisher），README 硬性要求预览=推送同函数。
+  - **门禁参数化机制：保留**——lint/angles/writer/前端四链路依赖，配置页改完即生效，无更简实现。
+- **死代码清理（3 文件，−14 行）**：track-rules.ts 删 `hasCheck()`（全仓零调用，lint 实用 `includes` 直判）；style-prompts.ts 删对 track-rules 的再导出块（零消费，angles/lint 直连 track-rules）；render/index.ts `renderInline` 去 export（仅模块内 2 处使用）。
+- **relax 参数不对称修复（4 调用点，用户批准）**：articles.ts 三处（GET /:id、GET /:id/lint、PUT /:id/content）+ publisher.ts 一处（推送门禁）——原只传 `(await loadTrackRule(x)).checks`、relax 回落种子版，与 writer.ts（传 style.rule.checks+relax 同源）不一致；现统一为规则对象一次加载、checks+relax 同源传入（loadTrackRule 调用次数与加载逻辑不变，checks 语义不变）。
+  - **行为差异**：修复前——若配置页改过 `r:{赛道}.relax`（与出厂种子不同），改稿页/lint 端点/推送门禁的 warn 豁免**不生效**（用种子值），与写稿时体检两套标准；修复后四处一致以 DB 规则为准，未配置时回落种子（行为不变）。relax 只豁免 warn，error 拦截不变。
+- **补充验证（smoke-style-prompts.ts 新增 [5] 节 8 断言，经隔离运行器跑在 smoke 库）**：5.1 DB 覆盖生效（`r:冒烟赛道` 只豁免 para_shape→para_shape 消失、para_short 仍在）；5.2 种子回落生效（删 `r:育儿`→种子 relax=para_short 生效、para_shape 仍在）；5.3 relax 关不掉 error（chars/sections 写进豁免列表仍拦）。style 断言 33→41（计数不降）。
+- **验证**：typecheck 0✓；smoke:style 41/41✓（真实库指纹 MATCH=零写入）；提交后补跑 lint/angles/verify:smoke-iso（见下方验收记录）。
+- **Git**：S3 第一批独立提交（含 3 死代码清理 + 2 relax 修复 + 测试 + 本进度记录），Commit SHA 见下条验收记录。

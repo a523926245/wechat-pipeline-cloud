@@ -539,14 +539,6 @@ export const DEFAULT_SYSTEM_PROMPTS: Record<string, string> = {
   科技: SYS_TEMPLATE_TECH,
 };
 
-/**
- * 机器规则：不直接进 prompt，决定「这条赛道要跑哪些专项体检、选题守门走哪套」。
- *
- * 定义已移到 `services/track-rules.ts`（纯模块，lint 要用但 lint 不能碰 DB）。
- * 这里只做**转出**，让消费方从一个地方拿全（读库的 `loadTrackRule` 也在这里）。
- */
-export { DEFAULT_TRACK_RULES, ruleFor, type TrackRule } from './track-rules.ts';
-
 // ── 三维变体库 ──────────────────────────────────────────────────────────────
 //
 // 反模板化背景（2026-11-11 调研）：微信推荐运营规范把「短期内高频发布结构/框架/观点

@@ -443,6 +443,9 @@ articlesRouter.get(
       return;
     }
 
+    // 成稿体检：与推送门禁同一套规则，改稿页据此提示「现在能不能推、还差什么」。
+    // checks 与 relax 必须取自同一条 `r:{赛道}` 规则：漏传 relax 会让配置页配的 warn 豁免失效。
+    const lintRule = a.pipeline === 'comic' ? null : await loadTrackRule(a.track?.name ?? '');
     res.json({
       id: a.id,
       title: rendered.title,
@@ -453,8 +456,7 @@ articlesRouter.get(
       charCount: parsed.charCount,
       boldCount: parsed.boldCount,
       warnings: parsed.warnings,
-      // 成稿体检：与推送门禁同一套规则，改稿页据此提示「现在能不能推、还差什么」。
-      lint: a.pipeline === 'comic' ? null : lintArticle(a.contentHtml, parsed, a.track?.name ?? '', (await loadTrackRule(a.track?.name ?? '')).checks),
+      lint: lintRule ? lintArticle(a.contentHtml, parsed, a.track?.name ?? '', lintRule.checks, lintRule.relax) : null,
     });
   }),
 );
@@ -471,8 +473,8 @@ articlesRouter.get(
     assertArticleAccess(requirePrincipal(req), a, id);
     if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
     const trackName = a.track?.name ?? '';
-    const lint =
-      a.pipeline === 'comic' ? null : lintArticle(a.contentHtml, undefined, trackName, (await loadTrackRule(trackName)).checks);
+    const rule = a.pipeline === 'comic' ? null : await loadTrackRule(trackName);
+    const lint = rule ? lintArticle(a.contentHtml, undefined, trackName, rule.checks, rule.relax) : null;
     res.json({ id: a.id, pipeline: a.pipeline, lint });
   }),
 );
@@ -514,6 +516,7 @@ articlesRouter.put(
       },
     });
 
+    const lintRule = a.pipeline === 'comic' ? null : await loadTrackRule(a.track?.name ?? '');
     res.json({
       id: updated.id,
       title: rendered.title,
@@ -525,7 +528,7 @@ articlesRouter.put(
       boldCount: parsed.boldCount,
       status: updated.status,
       warnings: parsed.warnings,
-      lint: a.pipeline === 'comic' ? null : lintArticle(body.contentHtml, parsed, a.track?.name ?? '', (await loadTrackRule(a.track?.name ?? '')).checks),
+      lint: lintRule ? lintArticle(body.contentHtml, parsed, a.track?.name ?? '', lintRule.checks, lintRule.relax) : null,
     });
   }),
 );

@@ -56,8 +56,3 @@ const FALLBACK_RULE: TrackRule = { checks: [], angleMode: 'default' };
 export function ruleFor(track: string): TrackRule {
   return DEFAULT_TRACK_RULES[track] ?? FALLBACK_RULE;
 }
-
-/** 这条赛道是否要跑某项专项体检。 */
-export function hasCheck(track: string, code: string, checks?: string[]): boolean {
-  return (checks ?? ruleFor(track).checks).includes(code);
-}

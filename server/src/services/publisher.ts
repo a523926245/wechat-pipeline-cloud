@@ -115,8 +115,10 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
   // 放在凭据校验之后：先确认「能推」，再判断「值不值得推」，免得白跑一次体检。
   if (a.pipeline !== 'comic' && a.contentHtml.trim()) {
     // 赛道专项检查按 `r:{赛道}` 配置走（不再是代码里的赛道名分支）。
+    // checks 与 relax 取自同一条规则：漏传 relax 会让配置页配的 warn 豁免在推送门禁失效。
     const trackName = a.track?.name ?? '';
-    const lint = lintArticle(a.contentHtml, undefined, trackName, (await loadTrackRule(trackName)).checks);
+    const rule = await loadTrackRule(trackName);
+    const lint = lintArticle(a.contentHtml, undefined, trackName, rule.checks, rule.relax);
     if (!lint.ok) {
       logger.warn(
         { articleId: a.id, errors: lint.errors.map((e) => e.code) },
