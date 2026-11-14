@@ -2,6 +2,87 @@
 
 面向使用者的变更记录（按新增 / 变更 / 修复分类）。详细背景与验收见 `docs/DEVLOG.md`（进度台账唯一真源）。
 
+## 2026-11-14 · S2：SQLite 遗留清理与文档收口
+
+### 新增
+- `docs/restructure/README.md`：AI 阅读规则（必读 / 按需 / 禁用）与文档状态导航。
+
+### 变更
+- **SQLite 全面退役**：删除 `server/prisma/schema.sqlite.prisma`、`scripts/gen-sqlite-schema.mjs`；
+  移除 7 个废弃 npm 入口（schema:sqlite / sqlite:generate / sqlite:push / migrate / migrate:dry /
+  smoke:migrate / smoke:prune-iso）；smoke-isolated 的 prune 子命令退役（verify ⑧ 自带恢复）。
+- 兼容代码清理：`config.ts`（DATABASE_URL 必填 fail-fast，删 IS_SQLITE / devMasterKey）、
+  `db.ts`（withLock 恒走 GET_LOCK）、`db-json.ts`（删 isSqlite）、`system.ts`（driver 恒 'mysql'）。
+- CI 裁剪为 prisma generate + typecheck + web build（数据库冒烟 CI 恢复留 S6 测试固化）。
+- README / CONTRIBUTING / SECURITY / deploy/README 清除失效 SQLite 命令引用；
+  T1-A 系列文档挂「已被取代」标记；dev.db 与备份标注为历史归档、不参与运行。
+
+### 修复
+- 无。
+
+### 验收
+- 10 项全过：validate / typecheck 0 / 启动 health driver:mysql / 三冒烟 116+33+30 / verify:smoke-iso 10/10 /
+  废弃配置零残留 / dev.db+8 备份 9 文件 SHA256 全 MATCH / 他库零触碰 / Git diff 无业务意外变化。
+
+## 2026-11-13 ~ 2026-11-14 · S1：MySQL 初始化与切换（S1-0 ~ S1-3）
+
+### 新增
+- MySQL 三具名库（`wechat_pipeline` / `_shadow` / `_smoke`）+ 账号 `wpc_app`@127.0.0.1（仅三库权限、零全局权限）。
+- Prisma Migrate 迁移链：`20261113145706_init`（15 表初始迁移）、`20261114035440_add_missing_enum_values`（enum 补值）。
+- `docs/restructure/T0-MYSQL-ADAPT-REPORT.md`：T0 冒烟隔离 MySQL 适配验收记录。
+
+### 变更
+- **运行库切换**：SQLite（dev.db）退役归档，MySQL 8 为唯一运行数据库；`DATABASE_URL` 必填（缺失即拒启动）。
+- T0 冒烟隔离载体换 MySQL 固定 smoke 库（smoke-db-guard 库名白名单 + smoke-isolated 载体适配，
+  `smoke:lint|style|angles` 命令名不变）；三冒烟计数不降 lint 116 / style 33 / angles 30。
+- schema enum 补值：ModelRole + `comic_panel_fallback`、ModelProtocol + `modelscope_qwen_image_mcp`
+  （漫画格 MCP 备选降级通道恢复可配置）。
+
+### 修复
+- JSON 列写入 null 统一映射 `Prisma.DbNull`（13 处；契约：null=未赋值→DB NULL）。
+- `contentWechat` 默认值改 `@default(dbgenerated("('')"))`，兼容 MySQL 8（TEXT 列禁字面默认值）。
+
+### 验收
+- typecheck 0；三冒烟 116 / 33 / 30 全 PASS；verify:smoke-iso 10/10；health ok:true db:up driver:mysql。
+
+## 2026-11-13 · 阶段 0 · T0：冒烟测试隔离化（冒烟永远只碰隔离库）
+
+### 新增
+- `server/scripts/smoke-isolated.ts` 隔离运行器：每轮冒烟新建 schema-only 空库 `dev.smoke-*.db`（零行、真实数据零复制），
+  env 白名单注入（剥离 `APP_SECRET_KEY`、一切 `*TOKEN/*SECRET/*KEY`、代理变量），原库前后 SHA-256 指纹比对，
+  清理矩阵（普通异常/子进程非零退出/超时/SIGINT/SIGTERM）+ SIGKILL 残留恢复命令 `npm run smoke:prune-iso`。
+- `server/scripts/smoke-db-guard.ts` 子进程 DB 守卫：只认 `dev.smoke-*.db`，路径归一后反真实库（含别名），零绕过开关。
+- `server/scripts/smoke-net-guard.mjs` 网络网守（**Node 层入口隔离，非 OS 级**）：封 fetch/http/https/net/tls/dgram/
+  WebSocket/dns/child_process/worker_threads；仅允许 `listen(0)` 数值 loopback 临时端口 + 显式登记精确命中。
+- `server/scripts/smoke-run.ts` 引导入口（含 `selftest:*` 自检与 13 条网络反向用例）。
+- 十项验收台 `npm run verify:smoke-iso`（正向隔离/真实库反向被拒/env 失败即退/网络阻断/断言保留/四连/原库指纹一致/
+  清理矩阵/空库证明/网络反向）——2026-11-13 实测 **10/10 通过**。
+
+### 变更
+- `npm run smoke:lint / smoke:style / smoke:angles` **命令名不变**，执行体改走隔离运行器——今后三条标准冒烟
+  永远只跑隔离库，直跑 `smoke-*.ts` 会被拒绝。行为习惯变化：直跑被拒属预期，无任何绕过通道。
+- `.gitignore` 增加 `dev.smoke-*.db`。
+
+### 修复
+- 无（本项为测试基建，不触碰 `server/src/**`、Prisma Schema、真实数据与业务逻辑）。
+
+### 验收
+- typecheck 绿；smoke:lint **116 项** / smoke:style **33 项** / smoke:angles **30 项（当场计数）** 全 PASS；
+  真实 `dev.db` 全程指纹一致（`fea0f123…`）。详见 `docs/restructure/T0-ACCEPTANCE-REPORT.md`。
+
+## 2026-11-12（夜）· 重构第一阶段：项目审计（文档交付，未动代码）
+
+### 新增
+- `docs/AUDIT-REPORT.md` 项目现状审计报告：调用链/Prompt 分布/问题清单 P1-P14（带代码证据）/
+  四类模块清单/数据库调整方案/对 SECOND-OPINION 5 问的审计意见。
+- `docs/RESTRUCTURE-CHECKLIST.md` 重构实施清单：阶段 2-7 逐文件改造、验收门禁、PLAN §17 交付物对照。
+
+### 变更
+- 无代码变更（按 PLAN §16.1 先审计后动工）。
+
+### 修复
+- 无。
+
 ## 2026-11-12（傍晚：只改提示词，用数据决定要不要写代码）
 
 ### 新增

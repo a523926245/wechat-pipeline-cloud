@@ -6,7 +6,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { AUTO_PUBLISH } from '../../constants.ts';
-import { IS_SQLITE, NODE_ENV } from '../../config.ts';
+import { NODE_ENV } from '../../config.ts';
 import { checkDb, prisma } from '../../db.ts';
 import { BadRequestError } from '../../errors.ts';
 import { ANGLE_SCOPE_META, PIPELINES, PIPELINE_SPEC } from '../../services/pipeline.ts';
@@ -39,7 +39,7 @@ systemRouter.get(
       ok: db,
       env: NODE_ENV,
       db: db ? 'up' : 'down',
-      driver: IS_SQLITE ? 'sqlite' : 'mysql',
+      driver: 'mysql',
       // 暴露出来是为了让运维一眼确认红线没被打开
       autoPublish: AUTO_PUBLISH,
       time: new Date().toISOString(),

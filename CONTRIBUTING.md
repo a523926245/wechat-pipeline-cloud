@@ -5,11 +5,11 @@
 ## 开发环境
 
 - Node.js 22+（TypeScript 直跑 `--experimental-strip-types`，无构建步骤）
-- 本地数据库用 SQLite（无需 MySQL）；生产用 MySQL 8
+- 数据库用 MySQL 8（本地开发同样用 MySQL，建库建号见 `deploy/README.md`）
 
 ```bash
 cd server && npm install
-npm run schema:sqlite && npm run sqlite:generate && npm run sqlite:push
+npm run prisma:deploy
 npm run seed:admin
 npm run dev        # 后端 :8787
 
@@ -20,8 +20,8 @@ cd web && npm install && npm run dev   # 前端 :5173
 
 1. `cd server && npm run typecheck` 全绿
 2. `cd web && npm run typecheck && npm run build` 全绿（两遍 vue-tsc 必须**串行**，并行会因 .tsbuildinfo 冲突报假错）
-3. 相关 `npm run smoke:*` 全过（共享同一个 SQLite，**必须串行**；输出不要接 `| head`，会让清理不执行留脏数据）
-4. 改了 `prisma/schema.prisma` → 必须重跑 `npm run schema:sqlite`（SQLite 版是自动生成的产物，勿手改）
+3. 相关 `npm run smoke:*` 全过（lint/style/angles 走 MySQL smoke 库隔离，**必须串行**；输出不要接 `| head`，会让清理不执行留脏数据）
+4. 改了 `prisma/schema.prisma` → 必须重跑 `npm run prisma:generate`（并生成/应用迁移）
 5. 改了文风相关 → 只改三处真源（文风配置页 / `config/style_dna.json` / `writer.ts` SYSTEM_PROMPT），不硬编码文案
 6. 更新 `docs/DEVLOG.md`（做了什么）与 `CHANGELOG.md`（使用者可感知的变更）
 

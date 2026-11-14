@@ -31,7 +31,7 @@
 
 - [ ] `app.env` 权限 600，含数据库口令与 `APP_SECRET_KEY`
 - [ ] 生产走 HTTPS（nginx TLS），cookie 为 httpOnly + sameSite=lax
-- [ ] 生产机**不跑** `schema:sqlite`/`sqlite:generate`（会覆盖 MySQL client）
+- [ ] schema 变更后在生产机重跑 `npm run prisma:generate`（client 与 schema 必须一致）
 - [ ] 数据库账号仅本机/内网可连，禁用 root 远程
 - [ ] 管理员口令强且唯一；忘口令救济只走服务器 CLI（`npm run seed:admin -- --reset-pass`）
-- [ ] 定期备份 `dev.db`/MySQL（删账号会级联删文章，备份是唯一后悔药）
+- [ ] 定期备份 MySQL（删账号会级联删文章，备份是唯一后悔药）

@@ -206,7 +206,7 @@ curl -sI http://127.0.0.1/assets/$(ls web/dist/assets | head -1) | grep -i cache
 |---|---|
 | `systemctl start` 立刻失败，`status=203/EXEC` | `ExecStart` 的 node 路径不对（systemd 不读 login shell 的 PATH）。`which node` 后 `sed -i` 改 |
 | 服务起不来，日志说 `APP_SECRET_KEY 必须…` | app.env 没被读到。检查 `EnvironmentFile` 路径、文件权限、以及值**是否带了引号**（systemd 不剥引号） |
-| 界面 500，日志 `Expected String`（Json 字段） | 在生产机上跑过 `schema:sqlite` / `sqlite:generate`，SQLite 版客户端覆盖了生成目录。重跑 `npm run prisma:generate` |
+| 界面 500，日志 `Expected String`（Json 字段） | 生成目录的 client 与 schema 不一致（历史原因如误跑过已废除的 SQLite 生成链）。重跑 `npm run prisma:generate` |
 | 前端能看封面缩略图，推到微信没封面 | 两个可能：① 库里 `coverPath` 是旧机器的绝对路径 → 跑 `npm run fix:cover-paths -- --apply`；② Nginx 把 `/api/content` 路径 rewrite 了 |
 | 每次推送都往永久素材库传一张新图 | 老版本行为。新代码会回填 `coverMediaId` 并复用；若仍复现，检查 `Article.coverUploaded` 是否有值 |
 | 生图/写作接口 504 | Nginx `proxy_read_timeout`（330s）小于后端 `LLM_TIMEOUT_MS`（300s）时就会掐断。两者要一起调 |

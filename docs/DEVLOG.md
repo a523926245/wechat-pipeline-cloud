@@ -1303,3 +1303,221 @@ Agnes-image（62）是用户重建的，Key 在。
 - `joinVariantBlocks` 统一用 `---` 拼接（多于一条时），保证「点开看一眼再保存」不会改格式——
   实测三个维度的回写都**逐字节相同**。
 - 冒烟补 4 项：有 `---` 按块切、无 `---` 退回按行、`## ` 切小节。`smoke:style` 29 → **33 项**。
+
+## 2026-11-12（夜）· RESTRUCTURE-PLAN-V1 第一阶段：项目审计（未动代码）
+
+**背景**：用户提供《RESTRUCTURE-PLAN-V1.md》（整体重构方案）与《SECOND-OPINION.md》
+（形态一致性实测数据 + 5 问），要求先审计不动代码，输出审计报告与重构实施清单。
+
+**产出**
+- `docs/AUDIT-REPORT.md`——现状审计报告：架构/流程/DB 盘点/选题与写稿调用链/Prompt 分布/
+  问题 P1-P14（带文件行号证据）/可保留-需重构-需新增-需废弃四清单/数据库调整方案/
+  4 个冲突裁决点 + 对 SECOND-OPINION 5 问的审计意见。
+- `docs/RESTRUCTURE-CHECKLIST.md`——重构实施清单：阶段 2-7 逐文件改动、验收门禁
+  （typecheck + smoke:lint/style/angles）、附 PLAN §17 交付物对照。
+
+**审计关键发现（新增事实）**
+- `config/topic_seeds.json` 是死文件（无代码读取）；`dedup.ts` 的 `judgeAngle` 三层判重
+  是**死代码**（线上扩库只有 normalize 精确去重）；`Article.qualityJson` 死字段。
+  → 方案 §4.1「取消种子驱动」已自然发生，但去重比方案描述的更弱。
+- `style-prompts.ts` 迁移区 v2→v15 约 900 行 + Setting 里 14 个迁移标志 = P4 实证。
+- 方案要求的 8 个新实体全部不存在；TaskRun/RunLog/StylePrompt/Setting 可承接一半语义。
+- dev.db 盘点：6 赛道、Angle 33（21 未用）、Article 12（全 draft）、StylePrompt 41 行。
+
+**待用户拍板（审计 §13/§15）**
+1. 默认兜底 vs「配置非空不做兜底」的两步走方案
+2. reflowParagraphs 去留（不打补丁约束的边界）
+3. 门禁数字按形态参数化（FORM-ARCHITECTURE 三道闸）
+4. TrackContract 砍半范围（form+reviewPolicy 先落）
+5. Embedding 去重实现路径、事实核验来源白名单、审核模型角色归属
+
+**下一步**：等裁决 → 阶段 2（赛道配置与 Prompt 体系）动工。
+
+## 2026-11-12（晚）· 重构设计基线入库 + 实施前检查（docs/restructure/）
+
+**产出**：`docs/restructure/` 文档集——00-FINAL-EXECUTION-CHARTER（用户定稿总纲，含五项核心验收指标口径）、01-08 八份审查文档、README（阅读顺序+决策登记表）、09-PRE-IMPLEMENTATION-CHECK（实施前检查：代码-文档差异/决策落实/migration baseline 方案/Python 本机流水线盘点/阶段 0-1 文件清单/风险与测试计划）。
+
+**用户拍板**：D1 选题 status+used 双维度+TopicReview（不建 TopicCandidate）；D2 reflow 先对照测试再定默认；D3 门禁只参数化赛道变化项；D4 TrackContract=form+reviewPolicy、N 版本行+生效指针；D5 审核复用 write 角色（带验证条件）；D6 配置两步走。另有 RBAC 矩阵、expiresAt/maxOAAccounts 处置、legacy 追溯、迁移安全观（down≠安全）、UI 三批次、去重降级语义（判重失败阻止自动升格）、五项验收指标（分母/周期/来源口径）。
+
+**实施前检查关键发现**：Python 本机流水线与云端**已分叉**——双选题库（data/angles/*.json vs Angle 表，used 互不相通）、文风双真源、同批公众号账号、双调度器 → 决策 X（共存方式三选一）未决前，云端自动化不得对本机在产账号开启写稿+推送。
+
+**状态**：只读检查完成，未改任何代码/数据库。等用户授权阶段 0 与 1A。
+
+## 2026-11-12（晚 20:28）· 切换日：本机流水线停用，云端成为唯一系统
+
+用户拍板「停掉本机的，现在不需要了」，替代式切换当即执行：
+- WorkBuddy 自动化「公众号每日创作并推送草稿」（06:00）**PAUSED**（automation_update 核实；任务保留可逆）。
+- 本机 `wechat-pipeline` 转只读蓝本归档；**文风双真源作废**（唯一真源=云端 StylePrompt）。
+- ⚠️ 生产空窗：云端 User.automationMode 全为 manual，每日自动出稿为 0；恢复产稿=按账号调 auto_draft / auto_draft_push（群发永远人工）。
+- 决策 X 关闭；`docs/restructure/README` 与 `09-PRE-IMPLEMENTATION-CHECK` 已更新。
+
+## 2026-11-13 · 阶段 0 · T0：冒烟测试隔离化（授权范围仅 T0，完成后停下等验收）
+
+**授权**：仅 T0（T1–T8 UI 改造不在授权内）。机制真源=`docs/restructure/T0-SAFETY-SUPPLEMENT.md`（v3）；
+概要=`STAGE0-IMPLEMENTATION-PLAN-V2.md` §二；修订背景=`T0-V3-REVISION-DIFF.md`。V1 作废文档零引用。
+
+**交付**（验收报告全文见 `docs/restructure/T0-ACCEPTANCE-REPORT.md`）
+- 四件套：`smoke-isolated.ts`（795 行，运行器+十项验收台）/ `smoke-db-guard.ts`（106 行）/
+  `smoke-net-guard.mjs`（439 行，Node 层网络入口隔离，非 OS 级）/ `smoke-run.ts`（184 行，引导入口）。
+- 三 smoke 胶水：lint/angles 各 **仅 +1 行**端口登记；`smoke-style-prompts.ts` **零改动**（无 app.listen）。
+- `package.json`：`smoke:lint|style|angles` 命令名不变、改走隔离运行器；新增 `verify:smoke-iso` / `smoke:prune-iso`。
+- `.gitignore` +`dev.smoke-*.db`。
+
+**实测验收（2026-11-13 真实输出）**
+- 四连全绿：typecheck exit=0；smoke:lint **116 项**；smoke:style **33 项**；smoke:angles **30 项（当场计数）**。
+- `npm run verify:smoke-iso` **10/10 通过**（正向隔离/真实库反向被拒×3 形态/env 失败即退×3/网络阻断/13 条网络反向/
+  原库 SHA-256 一致 `fea0f123…`/清理矩阵五路径+SIGKILL 残留 prune 恢复/断言保留/四连/空库证明 15 表×0 行）。
+
+**与 v3 设计差异（实测修正，细节见验收报告 §4）**：①表名用物理名（`OAAccount`→`@@map("Account")`）；
+②`die()` 须自行清理（process.exit 跳 finally）+ exit 兜底；③dns 数值 IP **同步短路**（Node listen→lookupAndListen
+回调恒异步，破坏同步 bind/取端口语义）；④listen 不支持 options.lookup（同步语义由③保证）；⑤connect 强制
+数值 lookup 封「自定义 lookup 重定向」旁路（规则 4 加严）；⑥Node normalizeArgs 预归一化数组形态须先展开
+（undici/fetch 实证）；⑦dns.Resolver 实例通道补封；⑩target 映射/hang 保活/scanWriters 接 probePort/
+onSignal 延迟清理（Windows 句柄 EBUSY）/正则补 `-journal` 等实现期修复。
+
+**经验沉淀（写网守/运行器必读）**
+- Node `Server.listen(0)` 无 host 是**同步 bind**（address() 立即可读）；带 host 走 dns.lookup **异步**回调再 bind，
+  且**无视 options.lookup**。冒烟脚本全部依赖同步取端口 → 网守必须对数值 IP 同步短路 dns.lookup。
+- Node `net.connect` 内部以 `normalizeArgs` 预归一化的 `[options, cb]` **数组**调 `socket.connect`——
+  包装 Socket.prototype.connect 时必须先展开数组形态，否则把数组当 options、`.port` 取不到误杀。
+- `process.exit` 跳过 finally：runner 的 die() 必须自行清理 + `process.on('exit')` 兜底，否则失败路径留残留。
+- Prisma 模型名≠表名：`@@map` 存在时（OAAccount→Account）凡按 sqlite_master 查表必须用物理表名。
+
+**状态**：T0 完成，十项验收 10/10。**停在此处等 T0 验收；未获 T1 授权不进入 UI 改造。**
+
+**补充（2026-11-13 13:0x · 正式验收材料，未改任何代码）**：按验收要求重跑全套并逐字留档——
+typecheck/lint 116/style 33/angles 30/verify 10/10 全绿复现；dev.db 前后指纹一致（`fea0f123…`，size=974848，
+mtime 未变=零写入强证据）；`T0-ACCEPTANCE-REPORT.md` 扩为正式验收版（996 行，含 verify 全输出、13 条网络
+反向用例逐条入口/目标/预期/实际/退出码、基线对照（lint 116/style 33/angles 30 均有 T0 前文档出处）、
+git diff 全文、放行机制 grep 实证（无 SMOKE_ALLOW_LIVE_DB/SMOKE_NET_ALLOW）、16+2 条未隔离命令风险台账
+（禁止直接执行））；原始输出 8 个 txt 留档 `docs/restructure/T0-ACCEPTANCE-LOGS/`。等用户与 ChatGPT 正式验收。
+
+## 2026-11-13（下午）· T1-A 只读检查（T1 正式开工，仅只读，零实施）
+
+**授权**：T1（数据库基线与核心生成基础设施）开工；立即执行项仅 T1-A 只读检查，报告提交后停审。
+T1 拆 T1-A 基线迁移 / T1-B TrackContract / T1-C PromptVersion / T1-D GenerationRun / T1-E Renderer，
+每子任务「实施→测试→汇报→停审」，严禁一口气做完。
+
+**只读检查结论**（报告：`docs/restructure/T1-A-READONLY-REPORT.md`）
+- T0 交付完好（795/106/439/184/996 行逐一吻合）；Git 状态与验收时一致。
+- SQLite：15 表、**无 `_prisma_migrations`**（从未有正式迁移，全靠 db push）、journal_mode=delete；
+  实际库↔schema.sqlite.prisma **零漂移**（migrate diff = empty migration）；双 schema 模型/字段名逐一相等；
+  生成器输出逐字节新鲜。数据规模小但真实（Article 12 / Angle 33 / StylePrompt 42 …）。
+- MySQL：**未执行**——本机 3306 有 MySQL 8.0.30 监听但无凭据（样例凭据全 Access denied）；
+  阻塞 Baseline，已给用户只读账号/自查命令二选一（报告 §10）。
+- 三方案（Baseline / 备份恢复 / 隔离演练）已成文待审：MySQL migrations 链 + SQLite db push 等价验证
+  双轨；Baseline 须来自实际库实测；首次 deploy 必 `migrate resolve --applied 0_init`（deploy/README 已预写）。
+- **状态：停审。** 审核通过 + MySQL 只读检查补齐后才实施 T1-A；不自动进 T1-B。
+
+## 2026-11-13（下午）· T1-A 方案二次审核与修订（纯文档，零数据库操作）
+
+- **授权范围**：仅方案重评与文档修订；未执行 db push / migrate dev / deploy / resolve，未动 Schema/业务代码/T0 四件套，未进 T1-B。
+- **实测新事实**（全部只读）：①T0 冻结面绑定 `smoke-isolated.ts:258` 的 `prisma/schema.sqlite.prisma` 路径；②Prisma 5.22 migrations 目录=schema 同级且不可配置（探针实证）→ 双 Prisma 链在同一 `prisma/` 目录必争用；③`migrate resolve` 仅登记（CLI 原文）；④`migrate diff` 跨 provider 不支持（官方原文）；⑤本机 3306=Windows 服务 `MySQL`@D:\Soft\MySql\mysql-8.0.30（手动安装版）；生产=Linux（systemd/Docker 两路线），库名 `wechat_pipeline`，历史靠 db push 无迁移史。
+- **架构结论**：原方案（MySQL 链 + SQLite db push）修订为**方案 C「单一变更源·双独立迁移链·门禁执行」**——MySQL=Prisma Migrate；SQLite=独立轻量链（`prisma/sqlite-migrations/` + journal 表 + runner，SQL 人审入库、数据保全式）；db push 仅限一次性/隔离库。「结构指纹」升级为三级等价性验证。备选 B1（解冻 T0 一行）/ A-加固（最低线）。
+- **交付五文档**：`T1-A-ARCHITECTURE-REVIEW.md`（A/B/C 六维对比+8 实测事实）、`T1-A-BASELINE-REVISED.md`（登记型基线+八步门禁+D1-D5 防误判）、`T1-A-BACKUP-RESTORE-REVISED.md`（S1-S6/M1-M5 实操验收，全部【未执行】）、`T1-A-MYSQL-READONLY-CHECK.md`（只读脚本包+两凭据方案）、`T1-A-DECISION-REPORT.md`（七问七答+授权清单+风险 R1-R9）。前轮报告 §7-§9 已挂修订指向。
+- **状态：停等审核。** 未获实施授权不建 Baseline/迁移文件；MySQL 只读检查等凭据交付方式选定。
+
+## 2026-11-13（晚）· T1-A 补充决策：统一 MySQL（双库方案作废）+ 只读检查
+
+- **用户决策**：本机 MySQL 8.0.30 为唯一正式开发数据库；未来测试与生产统一 MySQL；SQLite 退出正式开发库；`schema.prisma` 单真源；Prisma Migrate 唯一迁移机制；不再做 SQLite 独立迁移链/自研 Runner。**上一轮双库迁移架构（方案 C 及五文档）整体作废归档**（文档头部已挂取代指向）。
+- **只读检查实测**：本机 MySQL 服务 Running（服务名 `MySQL`，D:/Soft/MySql/mysql-8.0.30，Ver 8.0.30 Community）；datadir 目录级清点 8 个库（crm/wechat_publisher/wx_task_pocket 等其他项目库 + 系统库），**无 `wechat_pipeline`**——本机 MySQL 未被本项目用过，全新起点、无 Baseline 误判风险。root 连接 Access denied（无凭据）→ 用户权限检查【未验证】，待用户自放凭据到 server/.env（不进聊天）。
+- **关键影响发现**：Prisma client 单 provider（SQLite/MySQL 共用生成目录，db.ts 注释原文）→ 切 MySQL 后 T0 SQLite 隔离冒烟当场失效，**T0-v2 隔离 MySQL 化是切换关键路径**（网守需放行 loopback:3306、db-guard 改 smoke_ 库名守卫、指纹改表级 checksum、DROP DATABASE 清理）。同实例多项目库共存→库名白名单防误删。
+- **交付六文档**：`T1-A-MYSQL-LOCAL-READONLY-REPORT.md`、`T1-A-SQLITE-DEPENDENCY-INVENTORY.md`（A-J 十类依赖+处置表）、`T1-A-MYSQL-SWITCH-IMPACT.md`、`T1-A-T0-ISOLATION-COMPAT-PLAN.md`（四件套最小改动面，待授权）、`T1-A-PRISMA-MIGRATE-INIT-PLAN.md`、`T1-A-ROLLOUT-PLAN.md`（P0-P4 分阶段+授权项 a/b/c）。
+- **数据底账**：dev.db 15 表 158 行（Article 12/Angle 33/StylePrompt 42/Setting 24/…）待搬迁（建议搬）；指纹全程 `fea0f123…` 未变。
+- **状态：停等审核。** 授权 (a) T0-v2 改造 / (b) MySQL 建库切换搬迁 / (c) SQLite 清理 逐项单点授权，不进 T1-B。
+
+## 2026-11-13（下午）· T1-A 方案 REV2：按审核意见修订（纯文档）
+
+- **审核意见吸收**：T0-v2 安全设计 10 条（wpc_smoke_<runId> 专属前缀/runId 内部生成双校验/marker 归属表/清理三查 fail-closed/禁宽泛模式删除/并发 4 用例+清理失败重试保留/四账号权限边界/禁 root 进测试/网守 MySQL 覆盖表）；P1 拆 P1-A 静态验收、P2 拆 P2-A 初始化切换 + P2-B 完整运行验收（SQLite client 下不得称 T0-v2 已验收）；Init 修订 G1-G4 门禁（先确认连接目标再 migrate）、迁移目录名以实际生成为准、shadow database 专节、generate V1-V3、migrate diff 双向 empty、空库门禁；搬迁九项检查+三模式+幂等断点+前后指纹；保护机制=规范化行级 SHA-256（行/表/库三级摘要，废 CRC32/表数唯一证明）；P4 回归边界六条（mock 草稿箱/AUTO_PUBLISH=false/LLM 单独授权）。
+- **交付**：重写 T0-ISOLATION-COMPAT-PLAN / PRISMA-MIGRATE-INIT-PLAN / ROLLOUT-PLAN（REV2），同步修 MYSQL-SWITCH-IMPACT（3 处）/ SQLITE-DEPENDENCY-INVENTORY（2 处），新增 T1-A-REVISED-DECISION-REPORT（六节收口：修改清单/意见逐项处理/未解决问题/P1-P2 依赖/账号终设计/每阶段范围风险验收授权）。
+- **红线**：本轮纯文档——未动代码/Schema/T0 四件套/migrations/.env/dev.db，零 MySQL 写操作。**文档修订≠实施授权。**
+- **状态：停等审核。** 授权 (a) P1-A 改四件套 / (b) P2-A 切换搬迁 / (c) P3 清理，逐项单点。
+
+## 2026-11-13（傍晚）· T1-A 方案 REV3：按 ChatGPT 审核意见修订（纯文档）
+
+- **8 组审核意见全部落点**：①Shadow 真实命名 `prisma_migrate_shadow_db_<后缀>`（schema-engine 二进制实测，REV2 命名错误勘误）+ 自动/固定 shadowDatabaseUrl 两模式评估（主方案=预建字面库 wpc_shadow，零全局权限；模式授权残留三查）；②五账号模型（wpc_migrate/wpc_app 应用迁移分离、wpc_smoke 零常驻权限+逐 runId **字面**转授、wpc_ro **必需**六文档统一）+「前缀级≠runId 级」显式声明 + SHOW GRANTS 含角色/CURRENT_USER/全局权限拒跑；③网守覆盖如实降级——**Prisma Query Engine 走 tokio 原生 socket（DLL 二进制实测）不被 Node 网守覆盖**，DB 目标=db-guard URL 校验+账号 host 绑定兜底，OS 级 W1 防火墙/W2 Sandbox 可选、默认 Node 层表述；④GET_LOCK 同物理连接铁律 R1-R6（专用单连接/PID+启动时间双查防重用/断开即重查/一切删除路径过互斥）；⑤SHA-256 无歧义编码（类型 tag+NULL+长度前缀、RFC 8785 JCS、DECIMAL 定标、复合主键全列排序、SQLite 指纹含 -wal/-shm/-journal）；⑥搬迁补强（FK 运行时拓扑推导、次级 UNIQUE 预检、dry-run 零写入证明、幂等/断点两个实测证明）；⑦migrate diff --exit-code、四类对象（视图/触发器/过程/事件）补查、G1/G2 顺序矛盾修复（G2 验证用 G1 写入的 URL）、身份验证经 Prisma 连接、migrate dev 写入行为明示（reset=清库）；⑧事实勘误：库名 **22 字符**、Windows lower_case_table_names=**1**、collation 回归大小写+重音双维度、P3→P4 串行依赖图统一、P2-B 临时库写入含在 (b2)。
+- **交付**：重写 T0-ISOLATION-COMPAT-PLAN（277 行）/ PRISMA-MIGRATE-INIT-PLAN（260 行）/ ROLLOUT-PLAN（108 行）/ REVISED-DECISION-REPORT（170 行，REV3 收口：修改清单/P0 解决说明/U1-U5 未解项/(a)(b1)(b2)(c) 边界/五账号 SQL/决策 D1-D6/零变更声明）；同步修 MYSQL-SWITCH-IMPACT（6 处）/ SQLITE-DEPENDENCY-INVENTORY（2 处）。
+- **实测新证据**：schema-engine 二进制 shadow 命名/建删语义；query_engine DLL tokio/TcpStream/mysql_common（网守不覆盖实证）；MySQL 手册「CREATE DATABASE 需该库 CREATE 权限」+ 通配符授权废弃/partial_revokes 反转语义；GET_LOCK 连接级语义。**U3（库级 CREATE 是否够建临时库）标为 G4 探针实测定案项**。
+- **红线**：本轮纯文档——零代码/零 DB 写入/零 env/零真实数据（dev.db 指纹 `fea0f123…` 未变）。**文档修订≠实施授权。**
+- **状态：停等审核。** 授权 (a) P1-A / (b1) 结构段 / (b2) 搬迁段+P2-B 临时库 / (c) P3，逐项单点。
+
+## 2026-11-13（傍晚二）· T1-A 方案 REV4：任务书收敛定稿（纯文档）
+
+- **任务书**：REV4 修订与实施准备——不过度设计、先保核心功能、控制方案规模、本轮收敛（除新 P0 不再加审核轮次）。P0-1~8 必修 + P1-1~8 最简方案。
+- **P0-1 定案**：node:sqlite 只读逐表 COUNT(*) → **15 表合计 159 行**（REV3「158」为总计笔误，明细无误）；迁移验收基准=15 表 159 行+逐表行级摘要全等。dev.db 指纹 `fea0f123…`/974848 全程未变（无 -wal/-shm/-journal）。
+- **P0 关键修订**：①shadow/wpc_smoke 归属识别**不依赖库内标记**（P0-2/3：marker 表整体取消，改父进程注册表=授权真源 + 库名/配置/权限/白名单识别 wpc_shadow）；②**五账号职责分离**（P0-4：wpc_migrate 仅迁移、wpc_runner 建管清临时库且无业务库权限、wpc_smoke 零常驻逐 runId 字面转授、wpc_ro、wpc_app）；③**八步清理顺序**（P0-7：确认子进程退出→锁→重核归属→REVOKE→验证 REVOKE→DROP→验证消失→解锁，REVOKE 失败不得 DROP）；④临时库显式 utf8mb4/utf8mb4_unicode_ci（P0-8）；⑤唯一键 collation 冲突预检+禁通用 UPSERT+PK 原值搬运（P0-5）；⑥指纹规范定稿：NULL≠空串、Unicode 不归一化、BigInt/DECIMAL 定标、时间统一 UTC 毫秒、PK 声明序、JCS、不可转换即报错（P0-6）。
+- **P1 结论**：修复 P1-1 八步初始化顺序（建库建号先行）/P1-2 Prisma 规则（禁 force-reset、状态不明即中止）/P1-3 Windows Node 包装注入 env+密码脱敏/P1-4 权限核验补 partial_revokes、skip_name_resolve、角色/P1-6 源快照纪律/P1-7 FK 拓扑序优先+孤儿检查/P1-8 账号分离（并入 P0-4）；**延期 P1-5 W1/W2 防火墙**（非前置、不阻塞切换）。
+- **交付六文档（REV4）**：重写 T0-ISOLATION-COMPAT-PLAN / PRISMA-MIGRATE-INIT-PLAN / ROLLOUT-PLAN / REVISED-DECISION-REPORT（P0 8/8 修复 + P1 逐项结论 + U1/U2 + 五账号 SQL + (a)(b1)(b2)(c) + D1-D3 + 零变更声明）；同步修 MYSQL-SWITCH-IMPACT / SQLITE-DEPENDENCY-INVENTORY。未解仅 2 项（U1 模式授权建库能力→G4 探针、U2 --exit-code 值→实施期实测）。
+- **红线**：纯文档轮——零代码/零 DB 写入/零 env/零真实数据。**文档修订≠实施授权。**
+- **状态：停等审核。** REV4 为收敛版，除新 P0 不再加轮次；授权 (a)/(b1)/(b2)/(c) 逐项单点。任务书原文在 P1-8「生产环境同样遵…」处截断，按「生产环境同样遵守账号分离」补全。
+
+## 2026-11-13（傍晚三）· T1-A 方案 REV4.1：按外部审核「必须修订」8 项落点（纯文档）
+
+- **审核结论**：REV4 总体**有条件通过**，架构不推翻（不加账号/不回 marker/不重做网络隔离）。**P1-A 有条件通过**（完成 A1-A3 后可启动）；**P2-A 暂缓**（须 B4-B8+G4 实测）；P2-B/P3/P4 原计划。
+- **A 组（P1-A 前）**：A1 注册文件可信性如实降级——**内存注册表=运行期唯一授权真源**，注册文件仅恢复线索（Windows 同用户 ACL 可篡改，不宣称安全边界），prune 以 OS 进程启动时间实测复核，无法证明归属即拒删；A2 .env 增 **SMOKE_DATABASE_URL/SMOKE_DB_PORT**，子进程只收临时库一份凭据，selftest 反例补 wpc_ro；A3 指纹 FLOAT 4 字节/DOUBLE 8 字节分宽、JCS 数字 IEEE754 双精度安全检查、T 类以只读实测为准（**源=INTEGER Unix 毫秒**，断言 typeof 不猜时区）、类型前提断言（**当前 15 表无 Float/Decimal**——只读盘点实测 INTEGER45/TEXT74/BLOB3/BOOLEAN6/DATETIME31）。
+- **B 组（P2-A 前）**：B4 包装脚本**必须覆盖 DATABASE_URL=MIGRATE_DATABASE_URL**（Prisma 不自动用后者）+ 执行后实测 CURRENT_USER()；B5 diff 改 **--from-schema-datasource/--to-schema-datasource**（命令行零密码）+ exit-code 语义 0/2/1；B6 **取消 _wpc_migration_progress**（159 行用 PK 存在性+摘要足够，diff empty 不破坏）；B7 dry-run=无持久化写入（允许会话级 TEMPORARY TABLE 预检）、NULL 对齐 MySQL UNIQUE、前缀索引按 Sub_part；B8 回退两档（P1-A 单独 commit，完整回退含 T0-v1 revert，仅应用回退须标注）。另修 migrate status 表述（非 drift 检测）。
+- **交付**：修订 T0-ISOLATION-COMPAT / PRISMA-MIGRATE-INIT / ROLLOUT 三份 + 重写 REVISED-DECISION-REPORT（REV4.1 收口）；IMPACT/INVENTORY 无涉及不改。只读盘点（Schema 字段类型+DateTime 存储格式）为 A3 提供实测依据。
+- **红线**：纯文档轮——零代码/零 DB 写入/零 env/零真实数据（dev.db 指纹 `fea0f123…`/974848 未变）。**审核通过≠实施授权。**
+- **状态：停等实施授权。** P1-A 待 (a)；P2-A 待 (b1)/(b2)+G4；D1-D3 待确认。
+
+## 2026-11-13（晚）· 重构方向调整：基于现有成果最终收敛（REV 系列终止）
+
+- **用户指令**：《项目重构方向调整》——不推翻重来，保留已成果（T0 等），废弃过度设计，数据库走简单路线，本轮纯文档。**REV 轮次到此终止**（不再有 REV5+）。
+- **现状核对（只读）**：T0 已实施验收 10/10 但**四件套未 git 提交**（风险，建议 S1 前单独 commit）；REV4.1 全部零实施；.env 仍 `file:./dev.db`（SQLite 运行中）；`prisma/migrations` 不存在；dev.db 15 表 159 行；MySQL `wechat_pipeline` 尚未创建。
+- **方案定稿**：`docs/restructure/RESTRUCTURE-2.0-CONVERGED-PLAN.md`（十节完整版）——数据库=一库一账号三具名库（wechat_pipeline / _shadow / _smoke + wpc_app，root 仅建号）；**空库起步不迁数据**；Prisma Migrate 建 baseline；测试隔离=固定 smoke 库+T0 最小适配（语义保留、载体换）。
+- **废弃（REV4.1 未实施项）**：五账号、动态测试库、动态 GRANT/REVOKE、进程注册表、GET_LOCK、prune 平台、多层回滚、数据搬迁+指纹+断点幂等、collation 预检、W1/W2（维持延期）。
+- **保留**：T0 全部已验收机制与命令、业务系统、安全红线、隔离铁律、固定 shadow（migrate dev 需要）、切换单独 commit 回退锚点。
+- **后续阶段重排**：S1 MySQL 空库初始化切换（下一步）→ S2 SQLite 遗留清理 → S3 原 T1-B~E 抽象裁剪（先裁决表报批）→ S4 业务与内容质量 → S5 UI/UX → S6 回归收尾。原路线图阶段 0-5 并入 S3-S6。
+- **红线**：纯文档轮——零代码/零 DB/零 env/零 schema；dev.db 只读未动。**状态：停等审核；审核≠实施授权，S1 待建库授权与三库命名/密码确认。**
+
+## 2026-11-13（晚二）· 2.0 方案五项技术校准 + docs 全目录盘点
+
+- **校准（只改 RESTRUCTURE-2.0-CONVERGED-PLAN.md）**：①账号 Host 定为 `'wpc_app'@'127.0.0.1'`、连接统一 127.0.0.1:3306（本机实测 my.ini 仅 port=3306、无 skip_name_resolve/bind-address 显式配置、0.0.0.0:3306 监听、TCP 探通；Prisma 仅 TCP，localhost 有 ::1/反解双不确定性）+ 建号后三项连接验证；②T0 适配逐项映射（§4.1 十组件判定 + §4.2 十项验收台 MySQL 化映射，仅②⑦换载体；prune-iso S1 空壳 S2 退役）；③术语统一：空库初始化=初始迁移，**不需要 baseline**；④wpc_app 权限矩阵（Prisma 官方：固定 shadow 按库名授权 CREATE/ALTER/DROP/INDEX/REFERENCES 即可，**无需 \*.\***；三库零全局权限）；⑤修正内部不一致：#17 误入 A 类→C、C 计数 14→15、T1-B~E 归 S3（误写 S4）、T1-A 份数 32→13、统一「一个业务库、两个辅助库、一个项目账号」口径。
+- **盘点**：`docs/restructure/DOC-INVENTORY-REPORT.md`（唯一新增文档）——51 文件递归定性：CURRENT 6 / ACCEPTED 13 / REFERENCE 15 / ARCHIVED 5 / SUPERSEDED 9 / OBSOLETE 3；三代方案冲突裁决、决策沿革、有效决策清单、AI 必读/按需/禁用规则；**结论：不需要 PROJECT_GUIDE.md**。
+- **红线**：除上述两文件外零改动（零代码/零 Schema/零 migrations/零 env/零数据库/未动 T0/未动历史文档）。**状态：停点等审核；S1 仍未授权。**
+
+## 2026-11-13（夜）· S1-1 MySQL 建库建号 — 已执行并通过自动验收
+
+- **授权范围**：仅 S1-1（建库建号+验收）。未动 .env/schema/T0 代码/业务代码/dev.db，未进 S1-2。
+- **执行**：三库 `wechat_pipeline` / `wechat_pipeline_shadow` / `wechat_pipeline_smoke`（utf8mb4 / utf8mb4_unicode_ci）+ 账号 `wpc_app`@`127.0.0.1` + 三库 GRANT ALL；无 FLUSH PRIVILEGES、无 *.* 授权、无 GRANT OPTION、无额外账号。
+- **验收 7.1-7.5 全过**：三库字符集正确且空库（0 表）；CURRENT_USER()=`wpc_app`@`127.0.0.1`、VERSION()=8.0.30；SHOW GRANTS 仅三库级 + USAGE 空行（零全局权限）；三库独立连接 DATABASE() 各自正确；他项目库（crm/test_db/wechat_publisher/wx_task_pocket/wx_task_pocket_shadow_diff）零操作、原样在列。
+- **凭据纪律**：管理员凭据来自本机既有本地凭据（在进程内使用，未打印/未进 argv/未落新文件/未进对话）；wpc_app 密码生成后存 `C:/Users/YaoZhaoYang/.wpc_app.cred`（项目目录外，S1-2 写入 server/.env 后删除），对话与日志零凭据。
+- **状态：停点。等 S1-2 单独授权。**
+
+## 2026-11-13（夜）· S1-0 Commit A：T0 四件套提交入库（补记，时序在 S1-1 前）
+
+- **授权**：S1 开工前准备——仅 Git 提交（裁决=选项 A 按原样提交），零代码改动。
+- **Commit A `5ad4f46`**「T0: add isolated smoke test infrastructure」：21 文件 +3579/−3（核心 8=四件套+package.json+lint/angles 端口胶水+.gitignore；T0 验收证据 13=验收报告+LOGS×8+SAFETY-SUPPLEMENT+STAGE0 计划×2+V3 修订 diff）。暂存集合全等比对 MATCH-EXACT；`git diff --cached --check` 的 16 处尾随空格全在 ACCEPTED 留档（验收报告 7+6 号日志 7+8 号日志 2），按已知例外豁免、未改动任何证据文件。
+- **状态：完成。** T0 回退锚点成立；工作区余 CHANGELOG/DEVLOG 未提交改动与 30 个 untracked 重构文档，留待后续阶段。
+
+## 2026-11-14（上午）· S1-2 MySQL 切换完成（含 R1 故障恢复）— Commit B
+
+- **授权**：S1-2 自动执行与验收 → R1 故障恢复（优先 dbgenerated 方案）→「继续完成 S1-2」（授权 `npx prisma migrate deploy`）。
+- **切换面**：server/.env 整体重写（双 URL→`wpc_app`@127.0.0.1 三库，root 凭据串与重复键清除，`.wpc_app.cred` 消费后删除）；schema.prisma 增 shadowDatabaseUrl；三库独立连接与 shadow 断言全过。
+- **R1 故障恢复（MySQL 1101）**：初始迁移 P3018/1101「contentWechat can't have a default value」（MySQL 8 禁 TEXT 字面默认，1.0 schema `@default("")` 直搬所致）→ 按纪律停报后修复为 `@default(dbgenerated("('')"))`（migration.sql 第 132 行 `LONGTEXT NOT NULL DEFAULT ('')` 表达式默认，migrate diff 验证全文仅此一行差异）；备选「移除 @default」因 `src/cli/migrate.ts` create payload 省略 contentWechat 被排除。`migrate resolve --rolled-back` 登记失败记录 → 按外键序删 7 张 0 行残表 → 重新应用。
+- **环境事实**：非交互环境下 `prisma migrate dev`（含 `--create-only`）一律被拒（11-13 空历史能跑通的旧结论作废）；用户授权的 `migrate deploy` 为官方非交互路径——成功重应用 `20261113145706_init`，15 表建全（applied 记录新插，rolled-back 行留作历史）。
+- **收尾**：health 先报 db:down=旧 SQLite client 产物残留，`npx prisma generate` 重生成 MySQL client 后恢复（ok:true / db:up / driver:mysql / autoPublish:false；教训：换 schema 必须重新 generate，typecheck 结论必须在 generate 之后跑）；shadow 库 15 张空表=迁移命令 shadow 重放残留（设计用途，未手清）；`server/_prisma_migrations` 0 字节意外文件授权删除；dev.db 指纹 `fea0f123…` 全程未变。
+- **Git：Commit B `80a6e1a`**「S1-2: switch database to MySQL with initial migration」（3 文件：schema.prisma、`migrations/20261113145706_init/migration.sql`、migration_lock.toml；S1-2 完成时按纪律未提交，S1-3 任务书授权补交）。
+- **口径修正（S1-3 发现）**：S1-2 报告中的 typecheck✓ 实为旧 SQLite 类型产物，真实结论以 S1-3-R2 后 typecheck 0 为准。
+- **状态：完成（S1-2 验收过）。**
+
+## 2026-11-14（中午）· S1-3 T0 冒烟适配 MySQL + R1/R2 类型收敛（S1 收官）
+
+- **授权**：S1-3 执行（T0 冒烟适配 MySQL）→ R1（A 类修复+B 类只读调查）→ R2（补 enum+最终验收）；安全隔离红线全程保持（真实库只读、禁 db push/reset/force-reset、他项目库零触碰）。
+- **冒烟适配（仅 2 文件）**：`smoke-db-guard.ts` 库名白名单重写（只许 `wechat_pipeline_smoke`，拒 file:/业务库/shadow/错主机/错端口）；`smoke-isolated.ts` 载体换固定 smoke 库（run 前清空+migrate deploy、run 后清空；真实库保护=业务库表 COUNT+CHECKSUM 指纹+dev.db 文件指纹双保险）。smoke-run / net-guard / 三测试模块零改动。
+- **R1 类型收敛**：A 类 13 处 JSON null（任务书写 15、tsc 实测 13）→ `?? Prisma.DbNull`（db-json.ts 契约：null=未赋值→DB NULL）落 6 文件（models/panels/write/planner/publisher/scheduler）；B 类 8 处=enum 缺值（ModelRole 缺 `comic_panel_fallback`、ModelProtocol 缺 `modelscope_qwen_image_mcp`），只读调查证实为实配活功能（漫画格同心跳 MCP 备选降级通道，dev.db 存量实证），根因=model-registry.ts 本地联合类型值集比 schema enum 多 2。
+- **R2 补 enum**：schema 两 enum 各补 1 值 + 迁移 `20261114035440_add_missing_enum_values`（migrate diff 生成 2 条 ALTER TABLE MODIFY，deploy 应用）；**typecheck 0 errors**，S1-3 验收⑥闭环。
+- **验收**：三冒烟计数不降 lint **116** / style **33** / angles **30** 全 PASS；verify:smoke-iso **10/10**（业务库/shadow/file: 等负向反例全拒、SIGKILL 残留重建恢复）；应用 ok:true db:up；业务库 15 表 0 行不变、smoke 始终隔离 0 表、dev.db 指纹不变、他库零触碰。验收记录 `docs/restructure/T0-MYSQL-ADAPT-REPORT.md`。
+- **Git**：本阶段+R1+R2 改动未提交（smoke 脚本 2+业务文件 6+schema enum 补值+迁移目录 `20261114035440_add_missing_enum_values`）；S1-2 成果 Commit B `80a6e1a` 已入库。
+- **状态：完成，S1 全部收官（typecheck 0）。**
+
+## 2026-11-14（下午）· S2 SQLite 遗留清理与文档收口
+
+- **授权**：S2 仅清理与文档收口；禁删 dev.db/备份、禁改 MySQL 结构与业务代码、不进 S3。
+- **删除**：`prisma/schema.sqlite.prisma`、`scripts/gen-sqlite-schema.mjs`；npm 入口 7 个（schema:sqlite / sqlite:generate / sqlite:push / migrate / migrate:dry / smoke:migrate / smoke:prune-iso）；smoke-isolated 的 prune 子命令整段退役（verify ⑧ 自带恢复、不依赖它）。
+- **保留（有依赖）**：`src/cli/migrate.ts`+`migrate-key.ts`+`scripts/smoke-migrate.ts` 源码（migrate-key 被 `fix-article-idem.ts` 引用）；smoke-isolated 的 `file:./dev.db` 守卫反例；auth/users/ownership/cover 等直跑冒烟入口（非 SQLite 专属）。
+- **兼容代码清理**：config.ts（DATABASE_URL 必填 fail-fast，删 IS_SQLITE/devMasterKey）；db.ts（withLock 删 SQLite 旁路，恒走 GET_LOCK）；db-json.ts（删 isSqlite，packJson 约定保留）；system.ts（driver 恒 'mysql'）。CI（.github/workflows/ci.yml）裁剪为 prisma generate+typecheck+web build（DB 冒烟 CI 恢复留 S6）。
+- **文档收口**：T1-A 系列 13 份挂「⚠️ 已被取代」标记（历史正文不改写）；`docs/restructure/README.md` 加 AI 阅读规则 5 条+状态更新；schema 注释清 baseline/SQLite 降级术语；README/CONTRIBUTING/SECURITY/deploy/README.md 清失效命令引用；dev.db+8 备份标注「历史数据，不参与运行」。
+- **验收 10/10**：validate✓ / typecheck 0✓ / 启动 health driver:mysql✓ / 三冒烟 116+33+30✓ / verify 10/10✓ / 废弃 SQLite 配置零残留✓ / dev.db+8 备份 9 文件 SHA256 全 MATCH✓ / 业务库 15 表 0 行+3 迁移记录不变、他库零触碰✓ / Git diff 无业务逻辑意外变化✓。
+- **Git：未提交**（与 S1-3 累计改动一并留待后续统一提交）。
+- **状态：完成，S2 验收通过（2026-11-14）。S3 未授权不进。**

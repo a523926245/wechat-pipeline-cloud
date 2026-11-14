@@ -17,10 +17,10 @@
 ## 快速开始（本地开发）
 
 ```bash
-# 后端（Node 22+；本地用 SQLite，无需 MySQL）
+# 后端（Node 22+；需 MySQL 8，建库建号见 deploy/README.md）
 cd server
 npm install
-npm run schema:sqlite && npm run sqlite:generate && npm run sqlite:push   # 建本地库
+npm run prisma:deploy     # 建表（server/.env 配好 DATABASE_URL 后）
 npm run seed:admin        # 建管理员（口令随机打印一次）
 npm run dev               # http://127.0.0.1:8787
 
@@ -70,10 +70,10 @@ docker compose exec app node --experimental-strip-types scripts/seed-admin.ts
 ## 技术栈
 
 **后端** Node 22 + TypeScript（`--experimental-strip-types`，源码即运行产物，**相对 import 必须带 `.ts` 后缀**）+ Express 4 + Prisma
-**数据库** MySQL 8（utf8mb4，生产）/ SQLite（本地开发，由 `scripts/gen-sqlite-schema.mjs` 从 MySQL 真源自动降级生成，只维护一份 schema）
+**数据库** MySQL 8（utf8mb4，唯一运行库）；历史 SQLite 数据（`server/prisma/dev.db*`）仅归档、不参与运行
 **前端** Vue3 + TypeScript + Element Plus + Vite（不用 wangEditor，改稿页语义化 HTML 源码编辑 + 实时预览）
 
-⚠️ 切回 MySQL 前必须 `npm run prisma:generate`；生产机绝不能跑 `schema:sqlite`/`sqlite:generate`（会覆盖生成的 client）。
+⚠️ 改 `prisma/schema.prisma` 后必须 `npm run prisma:generate` 重新生成 client。
 
 ## 目录结构
 
@@ -98,8 +98,7 @@ server/
     api/routes/     路由（auth/users/credentials/articles/plan/scheduler/…）
     cli/            migrate · inspect · scheduler
   prisma/schema.prisma           MySQL 真源（数据字典）
-  prisma/schema.sqlite.prisma    自动生成勿手改
-  scripts/        smoke:* 冒烟 · seed-admin · migrate-automation · gen-sqlite-schema
+  scripts/        smoke:* 冒烟 · seed-admin · migrate-automation
 web/              前端（Vue3 + Vite + Element Plus）
 config/           style_dna.json · topic_seeds.json · comic_templates.json
 deploy/           systemd / Nginx / logrotate / 一键安装（见 deploy/README.md）
@@ -114,16 +113,14 @@ cd server
 npm run typecheck                  # 类型检查
 npm run dev                        # 开发启动（热重载）
 npm run seed:admin                 # 幂等建管理员（首启必跑；-- --reset-pass 重置口令）
-npm run schema:sqlite && npm run sqlite:push   # 本地 SQLite 建/同步表
+npm run prisma:deploy                          # 建/同步表（MySQL）
 npm run scheduler                  # 调度守护（常驻 60s 心跳）
 npm run scheduler:once -- --force  # 立即补跑一次
 
-# 迁移（本机 JSON → 云库）
-npm run migrate:dry                # 预检
-npm run migrate -- --apply
+# 一次性运维
 npm run migrate:automation -- --dry   # 旧调度三键 → 每用户 automation_mode（预览）
 
-# 冒烟（共享同一个 SQLite，必须串行；输出不要接 | head）
+# 冒烟（lint/style/angles 走 MySQL smoke 库隔离，必须串行；输出不要接 | head）
 npm run smoke:auth          # 鉴权（公开路径/口令登录/会话/登出/令牌已退场）
 npm run smoke:users         # 多用户（注册/审批/权限矩阵/过期降只读）
 npm run smoke:ownership     # 水平越权（他人账号/文章全 404、配额、级联删文）
@@ -132,7 +129,6 @@ npm run smoke:lint          # 成稿体检门禁（90 项）
 npm run smoke:style         # 文风配置与三维变体（29 项）
 npm run smoke:angles        # 选题库 CRUD 与消费态
 npm run smoke:cover         # 封面链路（换号重传/相对路径）
-npm run smoke:migrate       # 迁移幂等（14 项）
 npm run smoke:models        # 模型域（需空表或 --force；跑完 npm run model:local 恢复）
 npm run smoke:p2            # 产线/并发退避/仪表盘分组
 npm run smoke:comic-align / smoke:comic-qc / smoke:quote-card   # 漫画产线
