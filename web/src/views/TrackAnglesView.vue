@@ -40,6 +40,7 @@ import {
   listTracks,
   reassignOffIpAngles,
   releaseAngle,
+  rescoreAngle,
   reviewAngle,
   updateAngle,
 } from "../api/index.ts";
@@ -48,6 +49,7 @@ import StateError from "../components/StateError.vue";
 import RowActions, { type RowAction } from "../components/RowActions.vue";
 import { useBatchDelete } from "../composables/useBatchDelete.ts";
 import type {
+  AngleDupHit,
   AngleItem,
   AngleReviewVerdict,
   AngleScopeFilter,
@@ -276,6 +278,17 @@ const form = reactive({
   scope: "article" as AngleScopeFilter,
 });
 
+// S4-2 去重拦截：L0/L1 命中 400 时在对话框内展示命中明细（为什么不能保存），不关弹窗。
+const dedupError = ref<{ level: string; hits: AngleDupHit[] } | null>(null);
+
+/** 命中明细一行文案：级别 + 内容/标题 + 相似度 + 来源赛道。 */
+function dupHitLine(h: AngleDupHit): string {
+  const pct = `${Math.round(h.score * 100)}%`;
+  const track = h.trackName ? `（赛道：${h.trackName}）` : "";
+  const label = h.sourceType === "article" ? "历史文章" : "现有选题";
+  return `[${h.level}] ${label}：${h.targetText} · 相似度 ${pct}${track}`;
+}
+
 const rules: FormRules = {
   theme: [{ max: 64, message: "主题不能超过 64 字", trigger: "blur" }],
   content: [
@@ -295,6 +308,7 @@ function openCreate() {
   form.content = "";
   // 新增时默认跟随当前筛选的切片：正在看漫画选题，新增的自然也该是漫画的
   form.scope = scope.value === "all" ? "article" : scope.value;
+  dedupError.value = null;
   dialogVisible.value = true;
   void nextTick(() => formRef.value?.clearValidate());
 }
@@ -304,6 +318,7 @@ function openEdit(row: AngleItem) {
   form.theme = row.theme;
   form.content = row.content;
   form.scope = row.scope ?? "article";
+  dedupError.value = null;
   dialogVisible.value = true;
   void nextTick(() => formRef.value?.clearValidate());
 }
@@ -318,6 +333,7 @@ async function submitForm() {
 
   const content = form.content.trim();
   saving.value = true;
+  dedupError.value = null;
   try {
     if (form.editingId === 0) {
       const res = await createAngle({
@@ -327,6 +343,7 @@ async function submitForm() {
         scope: form.scope,
       });
       ElMessage.success(res.message ?? "选题已新增");
+      showDedupWarnings(res.dedupWarnings);
     } else {
       const res = await updateAngle(form.editingId, {
         theme: form.theme.trim(),
@@ -334,14 +351,37 @@ async function submitForm() {
         scope: form.scope,
       });
       ElMessage.success(res.message ?? "已保存");
+      showDedupWarnings(res.dedupWarnings);
     }
     dialogVisible.value = false;
     await load();
   } catch (e) {
+    // S4-2：L0/L1 命中 → 400 带结构化明细，对话框内展示命中信息，不关弹窗。
+    const detail = (e as { detail?: unknown }).detail as
+      | { level?: string; hits?: AngleDupHit[] }
+      | undefined;
+    if (
+      detail &&
+      (detail.level === "L0" || detail.level === "L1") &&
+      Array.isArray(detail.hits) &&
+      detail.hits.length > 0
+    ) {
+      dedupError.value = { level: detail.level, hits: detail.hits };
+    }
     ElMessage.error(errMsg(e, "保存失败"));
   } finally {
     saving.value = false;
   }
+}
+
+/** L2 历史文章标题相似：允许保存，只提示（展示历史文章标题），不做阻断式错误。 */
+function showDedupWarnings(warnings?: AngleDupHit[]) {
+  if (!warnings || warnings.length === 0) return;
+  const titles = warnings.slice(0, 2).map((h) => h.targetText).join("、");
+  const more = warnings.length > 2 ? " 等" : "";
+  ElMessage.warning(
+    `与 ${warnings.length} 篇历史文章标题相似（仅提示，不影响保存）：${titles}${more}`,
+  );
 }
 
 // ── AI 扩库 ──
@@ -545,6 +585,24 @@ async function changeScope(row: AngleItem, next: AngleScopeFilter) {
  */
 const reviewingId = ref<number | null>(null);
 
+// ── 重新评分（R1）：approved 编辑退回的候选须重评后才能再过审 ──
+const rescoringId = ref<number | null>(null);
+
+async function rescore(row: AngleItem) {
+  if (rescoringId.value !== null) return;
+  rescoringId.value = row.id;
+  try {
+    const res = await rescoreAngle(row.id);
+    if (res.rescored) ElMessage.success(res.message ?? "已重新评分");
+    else ElMessage.warning(res.message ?? "重新评分失败，仍需重评后才能审核通过");
+    await load();
+  } catch (e) {
+    ElMessage.error(errMsg(e, "重新评分失败"));
+  } finally {
+    rescoringId.value = null;
+  }
+}
+
 function statusText(s: AngleStatus): string {
   return (
     { candidate: "候选待审", needs_revision: "待修改", approved: "已通过", rejected: "已拒绝" } as const
@@ -645,6 +703,15 @@ function reviewVerdictText(v: AngleReviewVerdict): string {
 
 function angleActions(row: AngleItem): RowAction[] {
   const actions: RowAction[] = [{ command: "edit", label: "编辑", icon: Edit }];
+  // R1 待重新评分：approved 编辑退回的候选必须先重评才能过审——把入口放在审核按钮之前
+  if (row.rescoreRequired) {
+    actions.push({
+      command: "rescore",
+      label: "重新评分",
+      icon: Refresh,
+      loading: rescoringId.value === row.id,
+    });
+  }
   // 审核操作只出现在可流转状态（approved / rejected 是终态，后端也会拒）。
   if (row.status === "candidate" || row.status === "needs_revision") {
     actions.push({
@@ -730,6 +797,7 @@ function scopeTitle(s?: string): string {
 
 function onAngleCommand(cmd: string, row: AngleItem) {
   if (cmd === "edit") openEdit(row);
+  else if (cmd === "rescore") void rescore(row);
   else if (cmd === "release") void release(row);
   else if (cmd === "delete") void remove(row);
   else if (cmd === "reviews") void openReviewRecords(row);
@@ -929,7 +997,7 @@ function onAngleCommand(cmd: string, row: AngleItem) {
           </template>
         </el-table-column>
         <!-- 审核态（S4-1）：candidate/needs_revision/approved/rejected，与消费态（已用/未用）是两个维度 -->
-        <el-table-column label="审核" width="104">
+        <el-table-column label="审核" width="150">
           <template #default="{ row }">
             <el-tag :type="statusTagType(row.status)" size="small">
               {{ statusText(row.status) }}
@@ -940,6 +1008,36 @@ function onAngleCommand(cmd: string, row: AngleItem) {
               :title="`已完成 ${row.reviewRound} 轮审核`"
               >R{{ row.reviewRound }}</span
             >
+            <!-- S4-2：去重命中提示（L2 历史文章相似为主）——悬停看明细 -->
+            <el-popover
+              v-if="row.dedupHits && row.dedupHits.length > 0"
+              placement="left"
+              :width="340"
+              trigger="hover"
+            >
+              <template #reference>
+                <el-tag
+                  type="warning"
+                  size="small"
+                  effect="plain"
+                  class="dedup-tag"
+                  title="保存时与历史文章/现有选题的去重命中（仅提示，不影响保存）"
+                  >去重</el-tag
+                >
+              </template>
+              <div class="dedup-pop">
+                <div class="wb-muted dedup-pop-title">
+                  去重命中（保存时快照；L2 仅提示，不拦截）
+                </div>
+                <div
+                  v-for="(h, i) in row.dedupHits"
+                  :key="i"
+                  class="dedup-hit-line"
+                >
+                  {{ dupHitLine(h) }}
+                </div>
+              </div>
+            </el-popover>
           </template>
         </el-table-column>
         <!-- 六维评分（0-5/维，总分=等权合计 0-30）：只做排序与人工参考，无阈值、不自动批准 -->
@@ -1106,6 +1204,21 @@ function onAngleCommand(cmd: string, row: AngleItem) {
           </div>
         </el-form-item>
       </el-form>
+      <!-- S4-2：L0/L1 重复拦截——展示命中选题、相似度与来源赛道，说明为什么不能保存 -->
+      <el-alert
+        v-if="dedupError"
+        type="error"
+        show-icon
+        :closable="false"
+        class="dedup-alert"
+      >
+        <template #title>
+          {{ dedupError.level === "L0" ? "与现有选题完全重复（L0）" : "与现有选题高度相似（L1）" }}，不能保存
+        </template>
+        <div v-for="(h, i) in dedupError.hits" :key="i" class="dedup-hit-line">
+          {{ dupHitLine(h) }}
+        </div>
+      </el-alert>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="saving" @click="submitForm"
@@ -1203,6 +1316,13 @@ function onAngleCommand(cmd: string, row: AngleItem) {
             <span v-else class="wb-muted">未评分</span>
           </div>
           <div v-if="r.reason" class="review-reason">{{ r.reason }}</div>
+          <!-- S4-2：审核时刻的去重命中快照（TopicReview.dupHits，历史记录不随后续重判改写） -->
+          <div v-if="r.dupHits && r.dupHits.length > 0" class="review-duphits">
+            <div class="wb-muted">去重命中快照：</div>
+            <div v-for="(h, i) in r.dupHits" :key="i" class="dedup-hit-line">
+              {{ dupHitLine(h) }}
+            </div>
+          </div>
         </div>
       </div>
       <template #footer>
@@ -1295,5 +1415,33 @@ function onAngleCommand(cmd: string, row: AngleItem) {
 
 .offip-tag {
   margin-left: var(--wb-space-1);
+}
+
+/* S4-2 去重命中展示 */
+.dedup-alert {
+  margin-top: var(--wb-space-2);
+}
+
+.dedup-tag {
+  margin-left: 4px;
+}
+
+.dedup-pop-title {
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+
+.dedup-hit-line {
+  font-size: 12px;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.review-duphits {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--el-fill-color-light);
+  font-size: 12px;
 }
 </style>

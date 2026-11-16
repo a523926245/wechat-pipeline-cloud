@@ -25,6 +25,7 @@ import {
   listAngles,
   reassignOffIpAngles,
   releaseAngle,
+  rescoreAngle,
   updateAngle,
 } from '../../services/angles.ts';
 import { listTopicReviews, reviewAngle } from '../../services/topic-review.ts';
@@ -98,7 +99,7 @@ anglesRouter.get(
   }),
 );
 
-/** 手动新增一条选题（seq 自动取当前最大值 +1）。 */
+/** 手动新增一条选题（seq 自动取当前最大值 +1）。S4-2：L0/L1 重复 400 拒绝（detail 带命中明细），L2 历史相似只提示。 */
 anglesRouter.post(
   '/',
   asyncHandler(async (req, res) => {
@@ -110,7 +111,10 @@ anglesRouter.post(
       source: body.source,
       scope: body.scope,
     });
-    res.status(201).json({ ...item, message: '选题已新增' });
+    const warnNote = item.dedupWarnings && item.dedupWarnings.length > 0
+      ? `；注意：与 ${item.dedupWarnings.length} 篇历史文章标题相似（已记录，仅提示不拦截）`
+      : '';
+    res.status(201).json({ ...item, message: `选题已新增${warnNote}` });
   }),
 );
 
@@ -159,14 +163,38 @@ anglesRouter.get(
   }),
 );
 
-/** 编辑：只允许改 theme / content / scope（消费态不可改）。 */
+/** 编辑：只允许改 theme / content / scope（消费态不可改）。HF1：内容实质变更且原为 approved 时退回候选，返回体带退回提示。S4-2：L0/L1 重复 400 拒绝，L2 历史相似只提示。 */
 anglesRouter.put(
   ID_PATH,
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
     const body = updateSchema.parse(req.body);
     const item = await updateAngle(id, body);
-    res.json({ ...item, message: '已保存' });
+    const parts = [
+      item.reviewReset
+        ? '已保存；选题内容已修改，状态退回「候选待审」，旧评分已失效，需重新评分并人工审核通过后才能再用于创作'
+        : '已保存',
+    ];
+    if (item.dedupWarnings && item.dedupWarnings.length > 0) {
+      parts.push(`注意：与 ${item.dedupWarnings.length} 篇历史文章标题相似（已记录，仅提示不拦截）`);
+    }
+    res.json({ ...item, message: parts.join('；') });
+  }),
+);
+
+/**
+ * 重新评分（R1）：approved 编辑退回的候选必须重新取得有效六维评分才能再过审。
+ * 评分失败/缺失只落 scoreError、不清「待重新评分」标记，仍不可 approve。
+ */
+anglesRouter.post(
+  '/:id(\\d+)/rescore',
+  asyncHandler(async (req, res) => {
+    const id = idParam.parse(req.params.id);
+    const result = await rescoreAngle(id);
+    const message = result.rescored
+      ? `已重新评分（总分 ${result.scoreTotal ?? '-'}），可提交人工审核`
+      : `重新评分失败：${result.scoreError ?? '评分缺失或不完整'}；仍需重新评分并人工审核通过后才能再用于创作`;
+    res.json({ ...result, message });
   }),
 );
 

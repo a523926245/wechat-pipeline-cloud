@@ -22,7 +22,7 @@
 
 import { prisma } from '../db.ts';
 import { packJson } from '../db-json.ts';
-import { BadRequestError, NotFoundError } from '../errors.ts';
+import { BadRequestError, ConflictError, NotFoundError } from '../errors.ts';
 import { logger } from '../logger.ts';
 import { Prisma, type AngleStatus } from '@prisma/client';
 import { assertRoleUsable, chatComplete } from './llm.ts';
@@ -37,7 +37,16 @@ import {
   type AngleScoreMeta,
   type AngleScores,
   type CompleteFn,
+  type ScoredCandidate,
 } from './topic-review.ts';
+import {
+  checkAngleDup,
+  checkDupAgainstSnapshot,
+  loadDupSnapshot,
+  normalize,
+  type AngleDupCheckResult,
+  type AngleDupHit,
+} from './dedup.ts';
 
 /** 生成 scope=x 的选题时，会被同一产线同时看到的切片（用来决定「喂哪些现有选题给模型避重」）。 */
 function visibleScopes(scope: AngleScope): AngleScope[] {
@@ -72,22 +81,28 @@ const MAX_COUNT = 100;
 const FEEDBACK_LIMIT = 50;
 
 /**
- * 归一化：去掉所有空白，全角标点转半角，统一小写。
- * 用于判断两条选题是否实质相同——模型很容易换个标点或加个空格就"洗稿"成功。
+ * 归一化去重：S4-2 起统一用 dedup.ts 的 normalize（全仓唯一实现），
+ * 与判重入口同语义——同一内容在扩库精确比对与 L0 判定里结果一致。
  */
-function normalize(text: string): string {
-  return text
-    .replace(/\s+/g, '')
-    .replace(/[！-～]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
-    .replace(/[“”「」『』]/g, '"')
-    .replace(/[，、；]/g, ',')
-    .replace(/[。．]/g, '.')
-    .toLowerCase();
-}
 
 function clip(text: string, max: number): string {
   const t = text.trim();
   return t.length <= max ? t : t.slice(0, max);
+}
+
+/**
+ * L0/L1 命中 → 400 拒绝（手动新增 / 手动编辑共用）。
+ * detail 带结构化命中明细（级别、命中对象、相似度、来源赛道），供前端展示「为什么不能保存」。
+ */
+function dupBlockError(dup: AngleDupCheckResult): BadRequestError {
+  const top = dup.blockHits[0]!;
+  const levelText = top.level === 'L0' ? '完全重复（L0）' : '高度相似（L1）';
+  const more = dup.blockHits.length > 1 ? `（另有 ${dup.blockHits.length - 1} 处命中）` : '';
+  return new BadRequestError(
+    `与现有选题${levelText}，不能保存：「${clip(top.targetText, 40)}」相似度 ${(top.score * 100).toFixed(0)}%` +
+      `${top.trackName ? `，来源赛道「${top.trackName}」` : ''}${more}`,
+    { level: top.level, hits: dup.blockHits, warnings: dup.warnHits },
+  );
 }
 
 interface RawAngle {
@@ -367,14 +382,17 @@ export async function expandAnglesForTrack(
 
   const visScopes = visibleScopes(scope);
 
-  // 去重集合取**全赛道**：跨切片也不该出现字面重复的选题。
+  // 判重快照（S4-2 统一入口）：全赛道现有选题（含 rejected / 已用）+ 历史文章标题。
+  // 批次内互查靠把已接受候选推进快照实现（L0/L1 同语义）。
+  const dupSnapshot = await loadDupSnapshot();
+
+  // seq / 避让清单仍取本赛道（跨切片不该出现字面重复的选题）。
   const all = await prisma.angle.findMany({
     where: { trackId },
     orderBy: { seq: 'desc' },
     take: 500,
     select: { content: true, seq: true, scope: true },
   });
-  const seen = new Set(all.map((a) => normalize(a.content)));
   const maxSeq = all.reduce((m, a) => (a.seq > m ? a.seq : m), 0);
 
   // 喂给模型的「必须避开」只取本产线看得到的切片，免得被另一种口味的选题带偏。
@@ -406,6 +424,8 @@ export async function expandAnglesForTrack(
     source: string;
     scope: string;
     status: AngleStatus;
+    /** L2 历史标题命中（只提示不拦截），随行写入 metaJson.dedupHits。 */
+    dedupHits: AngleDupHit[];
   }[] = [];
   let skippedDuplicate = 0;
   let skippedOffensive = 0;
@@ -420,11 +440,23 @@ export async function expandAnglesForTrack(
       continue;
     }
     const key = normalize(c.content);
-    if (!key || seen.has(key)) {
+    if (!key) {
       skippedDuplicate += 1;
       continue;
     }
-    seen.add(key);
+    // S4-2 统一判重：L0 完全重复 / L1 高度相似（含跨赛道、含批次内已接受候选）→ 跳过不入库；
+    // L2 历史标题命中 → 保留候选，命中明细随行进 metaJson.dedupHits。
+    const dup = checkDupAgainstSnapshot(dupSnapshot, c.content);
+    if (dup.blocked) {
+      skippedDuplicate += 1;
+      logger.warn(
+        { trackId, theme: c.theme, level: dup.blockHits[0]?.level, hits: dup.blockHits.slice(0, 3) },
+        '扩库候选与现有选题重复（L0/L1），跳过不入库',
+      );
+      continue;
+    }
+    // 批次内互查：已接受候选进快照（id=0 标记批次内），后续候选与它同样过 L0/L1。
+    dupSnapshot.angles.push({ id: 0, content: c.content, trackId, trackName: track.name });
     rows.push({
       trackId,
       code: clip(`llm-${stamp}-${rows.length}`, 32),
@@ -435,6 +467,7 @@ export async function expandAnglesForTrack(
       scope,
       // D1：生成即候选。任何路径都不允许生成后直接进正式题库。
       status: 'candidate',
+      dedupHits: dup.warnHits,
     });
   }
 
@@ -453,8 +486,11 @@ export async function expandAnglesForTrack(
         scored += 1;
         scoreModel = 'write-role';
       }
+      const { dedupHits, ...row } = r;
       const meta: AngleScoreMeta = toScoreMeta(rec, opts.score ? 'mock-write' : 'write-role');
-      return { ...r, metaJson: packJson(meta) ?? Prisma.DbNull };
+      // L2 历史标题命中随行固化到 metaJson.dedupHits（无命中不写，避免造空数据）。
+      const metaWithDedup = dedupHits.length > 0 ? { ...meta, dedupHits } : meta;
+      return { ...row, metaJson: packJson(metaWithDedup) ?? Prisma.DbNull };
     });
     await prisma.angle.createMany({ data });
     logger.info({ trackId, count: rows.length, scored, scoreModel }, '选题六维评分完成');
@@ -586,6 +622,10 @@ export interface AngleItem {
   scoreSuggestion: string;
   /** 评分失败/缺失原因；空=已评分或未要求评分。 */
   scoreError: string | null;
+  /** 待重新评分标记（R1）：approved 编辑退回后为 true，重新评分成功后清除；带标记不可审核通过。 */
+  rescoreRequired: boolean;
+  /** S4-2 去重命中明细（metaJson.dedupHits 快照）：L2 历史标题提示为主，列表/审核展示用。 */
+  dedupHits: AngleDupHit[];
   /** 引用了该选题的文章数，删除提示要用 */
   articleCount: number;
   /**
@@ -689,6 +729,8 @@ function toItem(a: AngleRow): AngleItem {
     scoreTotal: meta?.scores?.total ?? null,
     scoreSuggestion: meta?.suggestion ?? '',
     scoreError: meta?.scoreError ?? null,
+    rescoreRequired: meta?.rescoreRequired === true,
+    dedupHits: meta?.dedupHits ?? [],
     articleCount: a._count.articles,
     offIp: findOffIpWords(`${a.theme ?? ''}${a.content ?? ''}`).length > 0,
     createdAt: a.createdAt.toISOString(),
@@ -815,8 +857,12 @@ export async function getAngle(id: number): Promise<AngleItem> {
  * 手动新增一条选题。
  * seq 取当前赛道最大值 +1（保证排产按序消费），code 需规避 @@unique([trackId, code])。
  * S4-1：手动新增同样进 candidate（评分缺失=未评分，不默认高质量、不自动批准）。
+ * S4-2：入库前统一判重（checkAngleDup）——L0/L1 命中返回 400（detail 带命中明细），
+ * L2 历史标题命中放行并写 metaJson.dedupHits，随返回体 dedupWarnings 提示前端。
  */
-export async function createAngle(input: AngleCreateInput): Promise<AngleItem> {
+export async function createAngle(
+  input: AngleCreateInput,
+): Promise<AngleItem & { dedupWarnings?: AngleDupHit[] }> {
   const track = await prisma.track.findUnique({ where: { id: input.trackId } });
   if (!track) throw new NotFoundError(`赛道 ${input.trackId} 不存在`);
 
@@ -825,6 +871,9 @@ export async function createAngle(input: AngleCreateInput): Promise<AngleItem> {
   const theme = clip(input.theme?.trim() || content.slice(0, 6), 64);
   const source = clip(input.source?.trim() || 'manual', 64);
   const scope = input.scope ?? 'article';
+
+  const dup = await checkAngleDup({ content });
+  if (dup.blocked) throw dupBlockError(dup);
 
   const agg = await prisma.angle.aggregate({
     where: { trackId: input.trackId },
@@ -836,11 +885,23 @@ export async function createAngle(input: AngleCreateInput): Promise<AngleItem> {
     const code = clip(`manual-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, 32);
     try {
       const created = await prisma.angle.create({
-        // D1：手动新增进候选，与扩库同语义；未评分（metaJson 不造数据）。
-        data: { trackId: input.trackId, code, seq, theme, content, source, scope, status: 'candidate' },
+        // D1：手动新增进候选，与扩库同语义；未评分（不造评分数据）。
+        // S4-2：有 L2 命中才写 metaJson.dedupHits（无命中保持 metaJson 空，不造数据）。
+        data: {
+          trackId: input.trackId,
+          code,
+          seq,
+          theme,
+          content,
+          source,
+          scope,
+          status: 'candidate',
+          ...(dup.warnHits.length > 0 ? { metaJson: packJson({ dedupHits: dup.warnHits }) ?? Prisma.DbNull } : {}),
+        },
       });
       logger.info({ id: created.id, trackId: input.trackId, source, scope }, '手动新增选题（进入候选，待人工审核）');
-      return await getAngle(created.id);
+      const item = await getAngle(created.id);
+      return dup.warnHits.length > 0 ? { ...item, dedupWarnings: dup.warnHits } : item;
     } catch (e) {
       if (isUniqueViolation(e)) continue;
       throw e;
@@ -849,34 +910,234 @@ export async function createAngle(input: AngleCreateInput): Promise<AngleItem> {
   throw new BadRequestError('选题编码冲突，请重试');
 }
 
-/** 只允许改 theme / content / scope，消费态字段（used/usedBy/usedDate）与审核态（status/reviewRound）不接受外部改写。 */
-export async function updateAngle(id: number, patch: AngleUpdateInput): Promise<AngleItem> {
-  const exists = await prisma.angle.findUnique({ where: { id }, select: { id: true, metaJson: true } });
-  if (!exists) throw new NotFoundError(`选题 ${id} 不存在`);
+/**
+ * 手动编辑选题。只允许改 theme / content / scope；消费态字段（used/usedBy/usedDate）
+ * 与审核轮次 reviewRound 不接受外部改写。
+ *
+ * HF1（审核绕过修复）——**内容实质变更判定**：
+ *   - theme（主题词）与 content（正文）承载选题的核心表达/内容实质（六维评分与人工审核
+ *     都基于 theme+content），二者任一发生**实际变更**（与现值不同）时：
+ *       ① 旧评分失效：metaJson.scores 置空并标注 scoreError，不给过期分数可乘之机；
+ *       ② 若当前为 approved → 退回 candidate：修改后的内容必须重新评分并经人工审核
+ *          才能再进正式池（TopicReview 审核记录与 reviewRound 原样保留，下一轮审核
+ *          round 继续 +1）。
+ *   - scope 是产线切片归属（管理元数据），只改 scope 不触发退回、不失效评分。
+ *   - 与现值相同的「空编辑」不算变更，不退回、不失效。
+ *   - candidate / needs_revision / rejected 的既有行为不变（只做①评分失效）。
+ *
+ * HF1-R1 增强：
+ *   - 退回分支写入 metaJson.rescoreRequired=true（待重新评分标记）——reviewAngle 对
+ *     带标记选题拒绝 approve，重新评分成功后才清除（见 rescoreAngle）。
+ *   - 并发安全：写入一律走**带前置条件的原子 updateMany（CAS）**，条件含读取快照的
+ *     content/theme（+ 回退分支限定 status='approved'、非回退分支限定非 approved）。
+ *     审核/其他编辑并发提交后条件失配 → 409 冲突（刷新重试），绝不出现
+ *     「正文已改但状态还是 approved」或「旧快照覆盖别人新写入」的中间态/丢更新。
+ *
+ * HF1-R2 增强（重评流程生命周期）：
+ *   - 回退分支同时置 metaJson.rescoreWorkflow=true（HF1 重评流程身份）——该选题在
+ *     **重新审核通过之前**受重评规则持续约束：每次实质修改都重新置 rescoreRequired=true，
+ *     必须重新评分；评分成功只清当次待评分状态，流程身份保留；approve 成功才清流程身份。
+ *   - 普通候选（无流程标记）的编辑永不误入流程。
+ *
+ * 原子性：正文写入、状态退回、评分失效、重评标记在同一事务内一次条件更新完成。
+ *
+ * S4-2 去重：正文实质变更时在同一事务内先统一判重（checkAngleDup，排除自身）——
+ * L0/L1 命中 400 拒绝保存（detail 带命中明细）；L2 历史标题命中只提示，
+ * 判重结果整体写入 metaJson.dedupHits（无命中写空数组清旧值；不碰 rescoreWorkflow /
+ * rescoreRequired 等无关元数据）。仅改 theme/scope 不重算（判重对象是正文）。
+ */
+export async function updateAngle(
+  id: number,
+  patch: AngleUpdateInput,
+): Promise<AngleItem & { reviewReset?: boolean; dedupWarnings?: AngleDupHit[] }> {
+  return await prisma.$transaction(async (tx) => {
+    const exists = await tx.angle.findUnique({
+      where: { id },
+      select: { id: true, theme: true, content: true, scope: true, status: true, metaJson: true },
+    });
+    if (!exists) throw new NotFoundError(`选题 ${id} 不存在`);
 
-  const data: { theme?: string; content?: string; scope?: string; metaJson?: string | typeof Prisma.DbNull } = {};
-  if (patch.theme !== undefined) data.theme = clip(patch.theme, 64);
-  if (patch.content !== undefined) {
-    const c = clip(patch.content, 500);
-    if (!c) throw new BadRequestError('选题内容不能为空');
-    data.content = c;
-    // 正文变了旧评分即失效：留空标注「内容已修改，评分失效」，不给过期分数可乘之机。
-    const prev = readScoreMeta(exists.metaJson);
-    data.metaJson = packJson({
-      ...(prev ?? {}),
-      scores: null,
-      scoreSource: 'none',
-      scoreModel: '',
-      scoredAt: new Date().toISOString(),
-      scoreError: '内容已修改，评分已失效（未重新评分）',
-    }) ?? Prisma.DbNull;
+    const fields: { theme?: string; content?: string; scope?: string } = {};
+    let themeChanged = false;
+    let contentChanged = false;
+
+    if (patch.theme !== undefined) {
+      const t = clip(patch.theme, 64);
+      fields.theme = t;
+      themeChanged = t !== exists.theme;
+    }
+    if (patch.content !== undefined) {
+      const c = clip(patch.content, 500);
+      if (!c) throw new BadRequestError('选题内容不能为空');
+      fields.content = c;
+      contentChanged = c !== exists.content;
+    }
+    // 改切片 = 把这条选题划给另一条产线（给漫画线补角度最快的一条路）。管理元数据，不触发退回。
+    if (patch.scope !== undefined) fields.scope = patch.scope;
+    if (Object.keys(fields).length === 0) throw new BadRequestError('没有需要保存的改动');
+
+    // S4-2：正文实质变更 → 事务内统一判重（排除自身）。L0/L1 拒；L2 记命中。
+    let dedupWarn: AngleDupHit[] | undefined;
+    if (contentChanged) {
+      const dup = await checkAngleDup({ content: fields.content!, excludeId: id }, tx);
+      if (dup.blocked) throw dupBlockError(dup);
+      dedupWarn = dup.warnHits;
+    }
+
+    // CAS 基线 = 本次事务读到的正文/主题快照：写入时若已被并发修改则条件失配 → 冲突。
+    const casBase = { id, content: exists.content, theme: exists.theme };
+
+    let reviewReset = false;
+    if (themeChanged || contentChanged) {
+      // 内容实质变了旧评分即失效：留空标注「内容已修改，评分失效」，不给过期分数可乘之机。
+      const prev = readScoreMeta(exists.metaJson);
+      const invalidate = {
+        ...(prev ?? {}),
+        scores: null,
+        scoreSource: 'none' as const,
+        scoreModel: '',
+        scoredAt: new Date().toISOString(),
+        scoreError: '内容已修改，评分已失效（未重新评分）',
+        // S4-2：正文变更的判重结果整体替换（含空数组清旧值，防旧命中残留误导）；
+        // 仅 theme 变更不动 dedupHits（判重对象是正文，结果仍有效）。
+        ...(contentChanged ? { dedupHits: dedupWarn ?? [] } : {}),
+      };
+      // R2：已进入 HF1 重评流程（rescoreWorkflow）的选题，在重新审核通过前每次实质修改
+      // 都重新要求重评——rescoreRequired 重新置 true（评分成功只清当次，流程身份仍在）。
+      const inWorkflow = prev?.rescoreWorkflow === true;
+
+      // 分支一：写入时仍是 approved → 退回 candidate + 进入/延续 HF1 重评流程（置双标记）。
+      // 用条件更新而非读值判定：并发审核刚把它改成 approved 时同样命中本分支，堵住竞态。
+      const rollback = await tx.angle.updateMany({
+        where: { ...casBase, status: 'approved' },
+        data: {
+          ...fields,
+          status: 'candidate' as AngleStatus,
+          metaJson: packJson({ ...invalidate, rescoreRequired: true, rescoreWorkflow: true }) ?? Prisma.DbNull,
+        },
+      });
+      reviewReset = rollback.count > 0;
+
+      if (!reviewReset) {
+        // 分支二：非 approved → 状态不动（candidate/needs_revision/rejected 既有语义）。
+        // R2：流程内的实质修改重置 rescoreRequired（必须重评）；普通候选只失效评分不误标。
+        const plainMeta = inWorkflow
+          ? { ...invalidate, rescoreRequired: true, rescoreWorkflow: true }
+          : invalidate;
+        const plain = await tx.angle.updateMany({
+          where: { ...casBase, status: { in: ['candidate', 'needs_revision', 'rejected'] } },
+          data: { ...fields, metaJson: packJson(plainMeta) ?? Prisma.DbNull },
+        });
+        if (plain.count === 0) {
+          throw new ConflictError('该选题刚刚被其他人修改或审核过，请刷新后重试');
+        }
+      }
+    } else {
+      // 非实质变更（仅 scope / 同值重存）：仍按读取快照 CAS，防与并发编辑互相覆盖。
+      const r = await tx.angle.updateMany({ where: casBase, data: fields });
+      if (r.count === 0) {
+        throw new ConflictError('该选题刚刚被其他人修改或审核过，请刷新后重试');
+      }
+    }
+
+    const row = await tx.angle.findUnique({
+      where: { id },
+      include: { _count: { select: { articles: true } } },
+    });
+    if (!row) throw new NotFoundError(`选题 ${id} 不存在`);
+    return {
+      ...toItem(row),
+      reviewReset,
+      ...(dedupWarn && dedupWarn.length > 0 ? { dedupWarnings: dedupWarn } : {}),
+    };
+  });
+}
+
+export interface RescoreResult extends AngleItem {
+  /** 本轮是否取得完整有效六维评分（false=调用失败/缺失/不完整，重评标记保留）。 */
+  rescored: boolean;
+}
+
+/**
+ * 对已有选题重新评分（R1：HF1 退回候选的硬门禁配套入口）。
+ *
+ * - 复用六维评分链路（scoreAngleCandidates，D5 复用 write 角色；测试可注入 Mock）。
+ * - **成功判定**：normalizeScores 校验通过的完整六维（scores 非 null）才算成功——
+ *   成功则写入新评分并清除 metaJson.rescoreRequired 标记（同一 metaJson 写入原子完成，
+ *   等效于「当前评分对当前内容有效」）。R2：流程身份 rescoreWorkflow 保留（评分只清当次
+ *   待评分状态，重新审核通过前流程约束持续）。
+ * - **失败语义**：调用失败/评分缺失/任一维越界 → scores=null + scoreError 落库，
+ *   rescoreRequired 标记**不清除**（无标记也不新造），仍不可 approve。
+ * - CAS：评分期间正文/主题被并发修改 → 评分结果作废（409 冲突，刷新后重评），
+ *   绝不把旧内容的分写到新内容上。
+ */
+export async function rescoreAngle(
+  id: number,
+  opts: { score?: CompleteFn } = {},
+): Promise<RescoreResult> {
+  const a = await prisma.angle.findUnique({
+    where: { id },
+    include: { _count: { select: { articles: true } } },
+  });
+  if (!a) throw new NotFoundError(`选题 ${id} 不存在`);
+  const track = await prisma.track.findUnique({ where: { id: a.trackId }, select: { id: true, name: true } });
+  if (!track) throw new NotFoundError(`赛道 ${a.trackId} 不存在`);
+
+  let rec: ScoredCandidate | undefined;
+  let callError = '';
+  try {
+    const map = await scoreAngleCandidates(
+      track.name,
+      [{ id: 1, theme: a.theme, content: a.content }],
+      opts.score,
+    );
+    rec = map.get(1);
+  } catch (e) {
+    // 典型：write 角色未绑定/停用/缺 Key（assertRoleUsable 抛出）——按评分失败处理。
+    callError = e instanceof Error ? e.message : String(e);
+    logger.warn({ id, err: callError }, '重新评分调用失败');
   }
-  // 改切片 = 把这条选题划给另一条产线（给漫画线补角度最快的一条路）。
-  if (patch.scope !== undefined) data.scope = patch.scope;
-  if (Object.keys(data).length === 0) throw new BadRequestError('没有需要保存的改动');
 
-  await prisma.angle.update({ where: { id }, data });
-  return await getAngle(id);
+  const rescored = Boolean(rec?.scores);
+  const prev = readScoreMeta(a.metaJson);
+  // R2：流程身份（rescoreWorkflow）评分成功/失败都保留——只有人工 approve 才结束流程。
+  const keepWorkflow = prev?.rescoreWorkflow === true ? { rescoreWorkflow: true } : {};
+  const meta: AngleScoreMeta = rescored
+    ? {
+        ...toScoreMeta(rec, opts.score ? 'mock-write' : 'write-role'),
+        // 成功只清「待重新评分」（当次），不清流程身份
+        rescoreRequired: false,
+        ...keepWorkflow,
+      }
+    : {
+        scores: null,
+        scoreSource: 'none',
+        scoreModel: '',
+        scoredAt: new Date().toISOString(),
+        riskHits: prev?.riskHits ?? [],
+        suggestion: prev?.suggestion ?? '',
+        rationale: prev?.rationale ?? '',
+        scoreError: callError || rec?.scoreError || '重新评分失败（评分缺失或不完整）',
+        // 失败不清标记：原样保留（无标记不新造——普通候选不强制重评门禁）
+        ...(prev?.rescoreRequired === true ? { rescoreRequired: true } : {}),
+        ...keepWorkflow,
+      };
+
+  const cas = await prisma.angle.updateMany({
+    where: { id, content: a.content, theme: a.theme },
+    data: { metaJson: packJson(meta) ?? Prisma.DbNull },
+  });
+  if (cas.count === 0) {
+    throw new ConflictError('该选题内容刚刚被修改，本次评分结果已作废，请刷新后重新评分');
+  }
+
+  logger.info({ id, rescored, flag: meta.rescoreRequired === true }, '选题重新评分');
+  const row = await prisma.angle.findUnique({
+    where: { id },
+    include: { _count: { select: { articles: true } } },
+  });
+  if (!row) throw new NotFoundError(`选题 ${id} 不存在`);
+  return { ...toItem(row), rescored };
 }
 
 /**

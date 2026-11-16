@@ -28,11 +28,12 @@
  */
 
 import { prisma } from '../db.ts';
-import { BadRequestError, NotFoundError } from '../errors.ts';
+import { BadRequestError, ConflictError, NotFoundError } from '../errors.ts';
 import { logger } from '../logger.ts';
 import { packJson, unpackJson } from '../db-json.ts';
 import { Prisma, type AngleStatus, type TopicVerdict } from '@prisma/client';
 import { assertRoleUsable, chatComplete } from './llm.ts';
+import type { AngleDupHit } from './dedup.ts';
 
 // ────────────────────────────────────────────────────────────
 // 六维评分：结构与纯函数（可单测，不碰网络与库）
@@ -65,7 +66,7 @@ export interface AngleScores {
   total: number;
 }
 
-/** Angle.metaJson 的形状（S4-1 约定；判重结果 dupHits 留给 S4-2）。 */
+/** Angle.metaJson 的形状（S4-1 约定；S4-2 起 dedupHits 存统一判重命中明细）。 */
 export interface AngleScoreMeta {
   scores: AngleScores | null;
   scoreSource: 'llm' | 'none';
@@ -75,6 +76,24 @@ export interface AngleScoreMeta {
   suggestion: string;
   rationale: string;
   scoreError?: string;
+  /**
+   * 去重命中明细（S4-2）：metaJson.dedupHits。保存时的 L2 历史标题命中快照
+   * （L0/L1 拦截保存，不会出现在已存行上）。编辑重算后整体替换；审核时固化进 TopicReview.dupHits。
+   */
+  dedupHits?: AngleDupHit[];
+  /**
+   * 待重新评分标记（S4-1-HF1-R1）：approved 选题因内容实质修改退回 candidate 时置 true，
+   * 重新评分成功（取得完整有效六维）后置 false。为 true 时人工审核拒绝 approve（见 reviewAngle）。
+   * 普通候选（手动新增/扩库）无此标记或为 false——不强制先评分才能审核（S4-1 语义保留）。
+   */
+  rescoreRequired?: boolean;
+  /**
+   * HF1 重评流程身份（S4-1-HF1-R2）：因 approved 实质修改退回时置 true，表示该选题已进入
+   * 「重评流程」——在**重新审核通过之前**每次实质修改都必须重评（rescoreRequired 重新置 true）。
+   * 评分成功只清 rescoreRequired、**不清本标记**（流程身份仍在）；人工审核 approve 成功才清除，
+   * 本轮重评约束结束。普通候选永远没有本标记。
+   */
+  rescoreWorkflow?: boolean;
 }
 
 /** 单条候选的评分结果（LLM 输出解析后）。 */
@@ -377,11 +396,16 @@ function reviewToRecord(r: {
 }
 
 /**
- * 人工审核一条选题：校验状态流转 → CAS 更新 Angle.status/reviewRound → 写 TopicReview 事件。
+ * 人工审核一条选题：校验状态流转 → R1 重评硬门禁 → CAS 更新 Angle.status/reviewRound → 写 TopicReview 事件。
  *
  * - verdict 只允许 approved / needs_revision / rejected（评分/LLM suggestion 不走这里）。
- * - 并发防重入：updateMany 带 status 前置条件，抢不到即报冲突。
- * - 评分缺失不影响人工审核（人可以无评分拍板），但记录里如实留空。
+ * - R1/R2 硬门禁：metaJson.rescoreWorkflow/rescoreRequired 标记的选题（HF1 重评流程），
+ *   只有「rescoreRequired=false 且当前评分有效」才允许 approve——重评后又编辑过的一律拦；
+ *   needs_revision / rejected 不受门禁影响（照常留痕）。approve 成功清流程身份（R2）。
+ *   普通候选（无标记）仍可无评分人工拍板（S4-1 语义保留）。
+ * - 并发防重入：updateMany 带 status/reviewRound/content/theme 前置条件（CAS），
+ *   审核期间选题被编辑（含退回）或被他人改状态 → 抢不到即 409 冲突，绝不把过期判断写到新内容上。
+ * - 评分缺失不影响普通候选的人工审核（人可以无评分拍板），但记录里如实留空。
  */
 export async function reviewAngle(id: number, input: ReviewInput): Promise<TopicReviewRecord> {
   const verdict = input.verdict;
@@ -392,7 +416,10 @@ export async function reviewAngle(id: number, input: ReviewInput): Promise<Topic
   const reviewedBy = (input.reviewedBy ?? '').trim().slice(0, 64);
 
   return prisma.$transaction(async (tx) => {
-    const a = await tx.angle.findUnique({ where: { id }, select: { id: true, status: true, reviewRound: true, metaJson: true } });
+    const a = await tx.angle.findUnique({
+      where: { id },
+      select: { id: true, status: true, reviewRound: true, metaJson: true, content: true, theme: true },
+    });
     if (!a) throw new NotFoundError(`选题 ${id} 不存在`);
 
     const allowed = REVIEW_TRANSITIONS[a.status as AngleStatus] ?? [];
@@ -402,24 +429,59 @@ export async function reviewAngle(id: number, input: ReviewInput): Promise<Topic
       );
     }
 
-    const nextRound = a.reviewRound + 1;
-    const cas = await tx.angle.updateMany({
-      where: { id, status: a.status as AngleStatus, reviewRound: a.reviewRound },
-      data: { status: verdict as AngleStatus, reviewRound: nextRound },
-    });
-    if (cas.count === 0) {
-      throw new BadRequestError('该选题状态刚被其他操作修改，请刷新后重试');
+    const meta = readScoreMeta(a.metaJson);
+    // R1/R2 硬门禁：HF1 重评流程中的候选（rescoreWorkflow/rescoreRequired 任一为真），
+    // 必须「rescoreRequired=false 且当前评分有效」才可再次通过——重评成功后又编辑过正文的
+    // （评分已失效/标记已重置）在这里同样被拦，不能仅凭曾经重评过放行。
+    // 普通候选（无流程标记）不受门禁影响（S4-1 语义：可无评分人工拍板）。
+    if (verdict === 'approved' && (meta?.rescoreRequired === true || meta?.rescoreWorkflow === true)) {
+      if (meta?.rescoreRequired !== false) {
+        throw new BadRequestError(
+          '该选题内容在审核通过后被修改过，当前处于「待重新评分」状态：请先重新评分，取得有效评分后再人工审核通过',
+        );
+      }
+      if (meta?.scores == null) {
+        throw new BadRequestError(
+          '该选题当前评分缺失或已失效（内容修改后旧评分作废）：请先重新评分，取得有效评分后再人工审核通过',
+        );
+      }
     }
 
-    const meta = readScoreMeta(a.metaJson);
+    const nextRound = a.reviewRound + 1;
+    // R2：approve 成功 = 本轮重评流程结束——同一 CAS 写入里清掉流程身份与待评分标记。
+    const endWorkflow = verdict === 'approved' && (meta?.rescoreWorkflow === true || meta?.rescoreRequired === true);
+    const cas = await tx.angle.updateMany({
+      where: {
+        id,
+        status: a.status as AngleStatus,
+        reviewRound: a.reviewRound,
+        // 内容/主题也进 CAS：审核期间被编辑 → 冲突，防「旧数据的审核结论」盖到新内容上
+        content: a.content,
+        theme: a.theme,
+      },
+      data: {
+        status: verdict as AngleStatus,
+        reviewRound: nextRound,
+        ...(endWorkflow
+          ? {
+              metaJson:
+                packJson({ ...(meta ?? {}), rescoreRequired: false, rescoreWorkflow: false }) ?? Prisma.DbNull,
+            }
+          : {}),
+      },
+    });
+    if (cas.count === 0) {
+      throw new ConflictError('该选题刚刚被修改或审核过，请刷新后重试');
+    }
+
     const row = await tx.topicReview.create({
       data: {
         angleId: id,
         round: nextRound,
         scoresJson: packJson(meta?.scores ?? null) ?? Prisma.DbNull,
         riskHits: packJson(meta?.riskHits ?? null) ?? Prisma.DbNull,
-        // dupHits 留空：判重链接入是 S4-2，本阶段不伪造命中数据。
-        dupHits: Prisma.DbNull,
+        // S4-2：固化审核时刻的去重命中快照（metaJson.dedupHits）——历史审核记录不随后续重判被改写。
+        dupHits: packJson(meta?.dedupHits && meta.dedupHits.length > 0 ? meta.dedupHits : null) ?? Prisma.DbNull,
         verdict: verdict as TopicVerdict,
         reason,
         model: meta?.scoreModel ?? '',

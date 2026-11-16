@@ -1577,3 +1577,90 @@ T1 拆 T1-A 基线迁移 / T1-B TrackContract / T1-C PromptVersion / T1-D Genera
 - **验收**：tsc 0 / vue-tsc×2 0 / lint 116 / style 41 / angles **64**（54+10）/ verify:smoke-iso 10/10。新增 26-28 组：四状态×两入口（三态拒+approved 挂稿 201/漫画过门禁）+ 不存在 angleId 原行为。
 - **数据库安全**：业务库零写入（15 表+_prisma_migrations 3 条，无 TopicReview=迁移仍未部署）；smoke 0 残留；dev.db `fea0f123…`+8 备份未动；他库零触碰。
 - **Git**：独立 commit（详见 git log）。**状态：完成，停等 S4-1 最终验收及业务库 Migration 授权。未进 S4-2。**
+
+## 2026-11-14（晚二）· S4-1 业务库 Migration 上线前核查 + 正式部署 —— SUCCESS
+
+- **上线前核查**（纯只读，`docs/restructure/S4-1-PRE-MIGRATION-CHECK-REPORT.md`，结论 PASS）：Git 干净、3365ca3/0fb2ffd 在链上；migration.sql 与「业务库→schema」实时 diff 逐句吻合（剔除 contentWechat 空操作漂移行）；业务库仅 20261114093000 待应用、无失败迁移、0 行数据；兼容边界=部署前选题/排产/审核不可用、部署后纯增量零影响。
+- **正式部署**（用户授权，`docs/restructure/S4-1-MIGRATION-DEPLOY-REPORT.md`）：执行前身份核验 `DATABASE()=wechat_pipeline` / `CURRENT_USER()=wpc_app@127.0.0.1` / `@@version=8.0.30` / `@@port=3306` 全符合 → `npx prisma migrate deploy` 一次成功，**仅应用** `20261114093000_add_angle_status_topic_review`。
+- **部署后验证全过**：migrate status=up to date；angle 新列 3/3（status 默认 candidate、reviewRound 0、metaJson NULL）；TopicReview 表 11 列+2 索引+级联外键；旧索引 Angle_trackId_used_seq_idx 已删、新索引 [trackId,status,seq] 已建；angle/topicreview/article 行数 0/0/0；迁移记录 finished_at=19:56:30、rolled_back_at=NULL、steps=1。
+- **安全**：他库零触碰；dev.db `fea0f123…`+8 备份哈希逐一一致；.env/账号/权限未动；AUTO_PUBLISH=false；零 LLM/微信调用；未用 resolve/db push/reset。
+- **勘误**：PRE 报告「TopicReview 12 列」系计数笔误，实为 11 列（字段清单无误），已在 DEPLOY 报告注记。
+- **状态**：S4-1 数据结构在业务库**正式启用**（六维评分/状态机/TopicReview/approved-only 消费生效）。两份报告未提交 Git（遵「不擅自提交」），留工作区待处置。**停等用户与 ChatGPT 验收；不进 S4-2。**
+
+## 2026-11-15 · S4-1-HF1 approved 编辑审核绕过修复 —— 完成停等验收
+
+- **问题**：`updateAngle` 改 content 只清评分不重置 status——approved 选题被编辑后仍是 approved、仍可被排产消费，新内容绕过人工审核（S4-2-0 核查 D-b 漏洞）。
+- **修复**（3 文件 +269/−30，`services/angles.ts` / `api/routes/angles.ts` / `scripts/smoke-angles.ts`）：updateAngle 加**内容实质变更判定**——theme+content 与现值不同（空编辑不算）→ 评分失效 + approved 退回 candidate（reviewRound 与 TopicReview 历史保留，下一轮 round 续 +1）；scope=管理元数据不触发；正文/退回/失效同一事务一次 UPDATE 原子完成；路由返回退回提示（前端零改动，list 重载即显示 candidate+评分失效）。
+- **判定规则拍板**：theme（主题词）与 content 同属内容实质（六维评分与人工审核都基于 theme+content），任一实际变更都触发；只改 scope 或同值重存不触发。
+- **验证**：tsc 0 / vue-tsc×2 0 / smoke:angles **81**（64+17，29 组含退回/失效/历史保留/元数据不误伤/三态不变/失败零部分更新/门禁拒/重评再 approved）/ lint 116 / style 41 / verify:smoke-iso 10/10；业务库指纹 MATCH 零写入；Schema/Migration 零变化。
+- **边界如实登记**：无独立「重评」API（S4-1 遗留），测试用写入新评分模拟重评通道；「必须重新评分才可再 approved」未做硬门禁（现状 review 不要求有分，与手动未评分选题可过审一致，如需硬门禁另议）；失败注入只覆盖校验层 400/404，DB 级失败靠单事务结构保证。
+- **Git**：按令未 commit。**状态：完成，停等人工验收。不进 S4-2，不碰 dedup.ts。**
+
+## 2026-11-15（晚）· S4-1-HF1-R1 重评硬门禁 + 编辑/审核并发竞态修复 —— 完成停等验收
+
+- **问题一（重评硬门禁）**：HF1 退回的候选不重评也能再过审，且无重评入口。修复：`metaJson.rescoreRequired` 标记（回退分支原子置位；rescoreAngle 评分成功清标记，失败/缺失/不完整保留）；reviewAngle 对 approve+带标记 400 拒绝（needs_revision/rejected 不受限）；新增 `rescoreAngle` 服务 + `POST /api/angles/:id/rescore` + 前端「重新评分」按钮。普通 candidate（无标记）不强制评分——S4-1 语义保留。
+- **问题二（并发竞态）**：updateAngle 读值判定回退存在「读 candidate 写时已被批准」窗口；reviewAngle CAS 不含内容存在「过期结论盖到新内容」窗口。修复：updateAngle 双分支条件原子更新（`where status='approved'` 回退分支 / 非 approved 分支，CAS 带 content/theme 快照）；reviewAngle CAS 扩至 content/theme；冲突一律 409「请刷新后重试」。无新锁/版本号/新表。
+- **验证**：tsc 0 / vue-tsc 0 / smoke:angles **109**（81+28；30 组含门禁矩阵 + RACE1/2 行锁强制确定性竞态（实测 273/271ms 锁等待）+ RACE3 真并发×5 不变量）/ lint 116 / style 41 / verify 10/10；业务库指纹 MATCH 零写入；Schema/Migration 零变化；HF1 81 断言原样通过、工作区修改全保留。
+- **边界登记**（R1 报告 §12）：清标记后再编辑可无分过审（与 S4-1 无分可过审一致，堵死需另定）；rescore 对 approved 开放（只刷新参考分）；409 需人工刷新重试。
+- **Git**：按令未 commit（8 文件 +757/−39 含 HF1 累计）。**状态：完成，停等人工验收。不进 S4-2，不碰 dedup.ts。**
+
+## 2026-11-15（深夜）· S4-1-HF1-R2 重评流程生命周期（封闭重复编辑绕过）—— 完成停等验收
+
+- **问题**：R1 的 rescoreRequired 是单标记——重评成功置 false 后，再次实质编辑只失效评分不重置标记 → 可未重评直接 approve（R1 报告 §12-1 自登记边界）。
+- **修复**：metaJson 增 `rescoreWorkflow` 流程身份键（回退分支双置位；rescore 成功只清 rescoreRequired 保留身份；流程内每次实质编辑重置 rescoreRequired；**approve 成功同 CAS 清双标记**=唯一出口）。reviewAngle 门禁升级为双校验（流程内须 rescoreRequired=false **且** scores 有效——不单凭 false 标记放行）。普通 candidate 永不入流程（S4-1 语义零变化）。
+- **验证**：smoke:angles **134**（109+25，31 组含多轮循环/漏洞封闭点/scope 与同值不触发/失败不清标记/评分有效性兜底/TopicReview 3 条保留）/ RACE1-3 原样通过（CAS 零退化）/ tsc 0 / lint 116 / style 41 / verify 10/10 / 业务库指纹 MATCH 零写入 / Schema 零变化 / 前端零改动。
+- **边界**（R2 报告 §10）：rejected 终态残留流程标记（无影响）；伪造高分+清标记可过门禁（人工终审兜底，不修）。
+- **Git**：按令未 commit（累计 8 文件 +971/−40 三轮叠加，5 份旧报告保留）。**状态：完成，停等人工验收。不进 S4-2。**
+
+## 2026-11-15（深夜二）· S4-2 统一选题去重机制 —— 完成停等验收
+
+- **目标**：统一 L0/L1/L2 判重入口，接入三个正式写入入口（扩库/手动新增/手动编辑），命中记录进 metaJson.dedupHits 与 TopicReview.dupHits，前端展示拦截明细与 L2 历史相似提示。
+- **规则（本轮业务裁决）**：L0 归一化完全相同 → 拦（扩库跳过/手动 400）；L1 dupScore≥SIM_ANGLE(0.45) → 拦（同赛道跨赛道一视同仁，命中展示相似选题/相似度/来源赛道）；L2 与历史文章标题 dupScore≥SIM_HISTORY(0.35) → **只提示不拦截**；rejected 等全状态参与 L0/L1；编辑排除自身；不按 theme 判重、不实施 theme_crowded、无主题上限。
+- **实现**：`dedup.ts` 统一入口 `checkAngleDup`（+`loadDupSnapshot`/`checkDupAgainstSnapshot` 批量路径）；normalize 全仓唯一（PUNCT 补「」『』，扩库 seen 与 L0 同语义）；judgeAngle 阈值改引 constants（消双真源，保留旧语义仅供离线对照）；历史范围=非空标题+实质正文（剥标签≥50 字）Article。三入口接线：expand（L0/L1 跳过+逐条 warn 日志+批次内互查）、createAngle、updateAngle（事务内判重，L0/L1 400 detail 带结构化命中）；L2 命中写 metaJson.dedupHits（无命中写空数组清旧值；spread 保留 rescoreWorkflow/rescoreRequired/自定义键）；reviewAngle 固化 TopicReview.dupHits 快照（历史记录不改写）。前端：新增/编辑弹窗 L0/L1 拦截明细（el-alert 命中列表）、L2 保存后 toast 展示历史标题、列表「去重」标签+popover、审核记录展示 dupHits 快照。
+- **夹具调整（既有用例语义不变，仅文案去模板化）**：smoke 旧夹具 3 处文案在新规则下会命中 L1（c1/c2「第 X 条选题」0.64；RACE3 五轮「第 N 轮…」模板互撞 0.82），改为互相独立文案——断言全部原样保留。这是新业务规则与旧夹具的冲突，不是回归。
+- **验证**：tsc 0 / vue-tsc×2 0 / smoke:angles **175**（134 旧 + 41 新 S42 组，覆盖实施指令第六节 20 项）/ lint 116 / style 41 / verify:smoke-iso **10/10**（含真实库前后指纹一致）；每轮 run `REAL-DB FINGERPRINT MATCH` 零写入；Schema/Migration 零变化（git diff 无 schema.prisma/migrations）；.env/AUTO_PUBLISH 未动；零 LLM/微信外呼（扩库评分均为 Mock 注入）。
+- **指纹基线注记**：当前业务库指纹 business sha256=`723a8027…` 与 HF1 期 `438f1d28…` 不同——期间用户正常使用系统（setting 15/styleprompt 44/user 1/usersession 1 行新增，迁移记录 4 行含 1 条已回滚 init，均为 2026-11-13/14 既有部署史），非本轮所致；本轮每轮运行前后指纹一致。建议以 `723a8027…` 重立基线。
+- **边界**：主题级换皮/跨赛道语义近似仍是词面盲区（S4-2-0 §7 M1-M3，交人工审核兜底）；并发双扩库 TOCTOU 理论仍在（单管理员低概率）；L2 阈值 0.35 作用于数字型标题的外推风险继续观察（只提示形态过渡）。
+- **Git**：按令未 commit（9 文件改动 + 本报告，HF1/R1/R2 修改与 6 份旧报告全部原样保留）。**状态：完成，停等人工验收。不进 S4-3。**
+
+## 2026-11-16 · S4-3 成稿体检（Lint）结果闭环 —— 完成停等验收
+
+- **授权**：S4-3 开工（代码实施 + 隔离测试 + 报告）。不给业务库 Migration 部署授权、不给 Git commit 授权。
+- **问题（改造前代码实证）**：`lintArticle()` 是纯函数，四处执行点全部「算完即弃」——`GET /:id/lint` 注释原文写着「只算不落库」、`PUT /:id/content` 报告只进响应体、`publisher` 门禁只留一行日志、writer 的 repair 报告不返回。`Article.qualityJson` 是死字段（零读写），且单列 Json 只能留最后一次结论，与「区分不同次检查」冲突，未复用。
+- **实现（最小闭环，不碰规则本体）**：
+  - Schema：新增 `ArticleLintRun`（articleId FK 级联 / trigger check|save|push / ok / errorCount / warnCount / statsJson / issuesJson / ruleJson / contentHash / createdAt，索引 [articleId,createdAt]）+ 迁移 `20261116120000_add_article_lint_run`（**只建表，不改既有列**）。
+  - `services/lint-store.ts`（新，162 行）：`recordLintRun`（不抛异常、失败必返 `saved:false+error` 并 error 日志）/ `latestLintRun` / `listLintRuns` / `htmlFingerprint`。
+  - 接线：`GET /:id/lint`→check、`PUT /:id/content`→save、`pushArticleToDraft` 门禁→push（通过与被拦都记）；`GET /:id/preview` 只读返回最近存档 + `lintRunStale`（存档正文指纹≠当前正文）；新增 `GET /:id/lint-runs`。门禁判定仍以现算报告为准，本表是留痕不是真源。
+  - 前端（仅改稿页）：体检面板加存档行（触发入口/时间/结论）、「存档已过期」标签、「重新检查」按钮（有未保存改动先拦）、「历史 N 次」popover（最近 20 条）、未存档告警条；保存/推送后自动刷新历史。
+- **验证（真实输出）**：typecheck 0 / vue-tsc ×2 0 / web build ✓ 19.33s / smoke:lint **138**（116+新增 22）/ smoke:style **41** / smoke:angles **175** / verify:smoke-iso **10/10**（ISO-EMPTY tables=17/17 rows=0，新表已计入空库证明）；每轮 `REAL-DB FINGERPRINT MATCH`。
+- **业务库安全**：改造前基线 OLD-SET sha256=`723a8027…`，改造后用同一 16 表口径重算**逐字节相同**；`ArticleLintRun` 在业务库 **ABSENT**（迁移未部署）；未跑 migrate deploy/db push/reset；零写入。口径说明：verify 输出的 `4becc576…` 是加入新表后的新表清单指纹（业务库该表 absent，前后一致即 MATCH），零写入比对以 `723a8027…` 为准。
+- **外部调用**：net guard 13 个反向用例全拦；推送用例止于门禁（日志实证“成稿体检未通过，已拦截推送”，未进 WechatClient）；零 LLM 调用；仅动 smoke 库。
+- **边界（如实登记）**：①生成时刻（writer repair 循环）不留痕——writer 返回体不带报告，planner 侧重算会造成两处真源，正确做法需扩 write 入口（另议）；②历史不自动清理（个人规模）；③只存 checks/relax 参数快照，不造规则版本号（S3 已裁 PromptVersion 不实施）；④列表页不展示最近体检（需聚合，与最少代码冲突）；⑤`GET /:id/lint` 读接口带写副作用（兼容既有语义与冒烟断言）；⑥**业务库未部署迁移前，新代码落库会 `saved:false` 并明确告警（不崩），不宜用于真实库日常使用**。
+- **待授权**：业务库 `prisma migrate deploy`（部署说明见报告 §10，回滚=DROP TABLE 纯新增表）。
+- **Git**：按令未 commit（新建 2 + 修改 9；HF1/R1/R2/S4-2 既有改动全部原样保留）。**状态：完成，停等人工验收。不进 S4-4。**
+
+## 2026-11-16 · S4-4-1 状态与选题回收修复（R1/R3/R4/R5）—— 完成停等验收
+
+- **授权**：S4-4-1 最小范围实施。**零 Schema 变更、零 Migration、业务库零写入、零外呼、未 commit。**
+- **R1 推送事实解耦**：删除文章时判定「送没送过微信」不再看 `status`（会被编辑→draft、改写/强调→updated、换封面→draft、重推失败→failed 覆盖），改看推送痕迹 `mediaId` / `pushDate` 任一非空（`article-delete.hasPushTrace`，两列均 NOT NULL，按 null 安全处理）。`article-delete.ts` 与 `accounts.ts` 两处判据同步；`deleteArticleById` 的 select 已移除 status，防后人再用。
+- **R3 引用检查**：单篇删除与删账号都改为**先删文章、再查剩余引用**（旧代码先归还再删、且不看其他引用），只有 `count(articles)=0` 且 `used=true` 才归还 —— 与 `angles.releaseAngle` 的既有保护对齐；避免「一个选题被多篇文章引用时误归还」。
+- **R4 手动建稿占题**：新增 `services/angle-claim.ts`（`claimAngleInTx` 条件更新 + `ANGLE_RELEASE_DATA` 字段单一真源）。`POST /articles` 带 angleId 时「占题 + 建稿」同事务（已占用 409、失败回滚）；`createComicDraft` 增 `claimAngle` 开关（手动传 true、planner 不传因已 reserve），LLM 调用移出事务，「占题+Article+ComicPanel+TaskRun」同事务。S4-1 审核门禁原样保留（新增断言：未审核仍 400 且不占用）。
+- **R5 预留补偿**：planner 两分支逐条 try/catch + 批次 `finally` 兜底；`releaseReservedAngles(ids, accountId, reason)` 三重闸门（本次预留集合 / 该账号归属 / 无文章引用）；失败项进 `created[]` 并写 `TaskRun.status=failed + errorCode + errorMessage`（不再恒 success），单条失败不中断同批。
+- **测试基础设施（必要）**：`smoke:bulk` 原本**直跑、连的是 .env 业务库**，已接入 `smoke-isolated`（`smoke-run` target 加 `bulk` + 脚本补 `__SMOKE_NET__` 端口登记 + npm 脚本改 `run bulk`，命令名不变）。这是「所有测试必须隔离」的前提，不是范围扩大。
+- **夹具适配（断言语义未变）**：bulk 旧夹具给未推送草稿填了 `pushDate: '2026-11-11'`（R1 后会判成「曾推送」）→ 改 `''`；已推送那条补 `mediaId`；第 8 节 `protocol:'openai'`→`openai_chat`、role 字符串→`write`/`revise`（原值非法枚举，该节在 MySQL 下从未跑通），"用户原有绑定"断言改为自建对照绑定（隔离库是空库）；angles 26/27 组改用新造的未占用 approved 选题（x2/x3 已被排产消费占用，按新语义再挂稿必然 409）。
+- **新增断言**：bulk 33 项（9 推送事实保护 8 条 / 10 多文章引用 7 条 / 11 手动建稿占题 12 条 / 12 排产补偿 6 条）+ angles 1 项 = 34 项。
+- **验证（真实输出）**：tsc 0 / vue-tsc ×2 0 / web build ✓ 7.26s / smoke:lint **138** / style **41** / angles **176**（175+1）/ bulk **65 项全通过** / verify:smoke-iso **10/10**（ISO-EMPTY 17/17）；每轮 `REAL-DB FINGERPRINT MATCH`。
+- **业务库零写入**：16 表口径 sha256 仍为 `723a8027…`（与 S4-4-0 基线逐字节相同）；`ArticleLintRun` 仍 ABSENT；dev.db `fea0f123…` 未动。
+- **未解决（如实登记）**：①pushed 重复推送仍会新建第二份微信草稿（R1 不解决，需独立决策 updateDraft 复用）；②漫画建稿**成功**占题未端到端（隔离环境剥离 APP_SECRET_KEY → mock 模型过不了 `requireApiKey`，又不许真 LLM；已用同一 `claimAngleInTx` 由文章入口端到端覆盖 + 漫画失败路径验证不误占）；③排产「批次中途异常」用函数级用例覆盖（12.4），未构造真实中途抛错；④并发 read-modify-write（P2-5）与 dashboard updated 分桶（P2-1）按令未做。
+- **Git**：按令未 commit（新建 1：angle-claim.ts；修改 11；HF1/R1/R2/S4-2/S4-3 既有改动原样保留）。**状态：完成，停等人工验收。不进 S4-5。**
+
+## 2026-11-16（午）· S4-4-1-R5-HF1 排产补偿 pending 生命周期修复 —— 完成停等验收
+
+- **问题（核查确认，非推测）**：`planner.ts` 两个失败分支都是「先 `pending.delete(angle.id)`、再 `releaseReservedAngles()`」；而 `releaseReservedAngles` 只返回 `number`，DB 异常时同样返回 0（仅一条日志）→ 选题既没归还、又已不在 pending，**finally 兜底彻底失效**，遗留 `used=true`；且旧 finally 只在 `released>0` 时打日志，失败时零记录。
+- **修复**：`releaseReservedAngles` 返回结构化 `{released, retryable, skipped, error}`（DB 异常 → 全部入 retryable，交给兜底再试；受保护/非本账号 → skipped，不重试）；两处失败分支改为**先补偿、`retryable.length===0` 才出队**；note 分三态（已归还 / 将在批次结束时再试一次 / 无后缀）；finally 只再试一次，失败时 `logger.error`（accountId/angleIds/reason/err）并把一条「（补偿未完成）」记录追加进 `created[]`，finally 内部 try/catch 只吞补偿异常、不掩盖原始业务异常。
+- **测试（故障注入）**：`smoke:bulk` 用 Prisma 中间件只让「归还用的 `Angle.updateMany(used:false)`」抛错（reserve 的 used:true 不受影响），新增 12.6-12.9 共 8 项：首次失败不伪装成功、再次补偿成功、**planner 端到端「首轮补偿失败 → finally 兜底成功」**、两轮都失败时明确记录且仍 used=true。
+- **顺带修正一处假通过**：12.5 原断言写死 `g127`，但 reserve 按 seq 升序实际取的是别的未用选题（g127 从未被占用，`used===false` 天然成立）→ 改为按 `created[0].angleId` 断言。
+- **回归**：tsc 0 / smoke:bulk **73 项**（65+8）/ angles 176 / lint 138 / style 41 / verify:smoke-iso **10/10**；每轮 CLEANUP ok + REAL-DB FINGERPRINT MATCH。
+- **业务库零写入**：16 表 sha256 仍 `723a8027…`；`ArticleLintRun` 仍 ABSENT；未执行任何 Migration/Schema 操作。
+- **边界**：两轮都失败时仍会留 `used=true`（兜底只再试一次，非保证成功），靠 error 日志 + 批次结果 + TaskRun failed 追踪，人工归还；未加重试队列/并发锁。
+- **Git**：按令未 commit（本轮改 2 个代码/测试文件 + 报告/DEVLOG；历轮未提交改动原样保留）。**状态：完成，停等人工验收。不进 S4-5。**
