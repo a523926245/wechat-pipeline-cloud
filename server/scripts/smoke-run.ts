@@ -11,7 +11,7 @@
  * ⚠️ 禁止把测试模块改为静态 import —— 那会让 PrismaClient 早于守卫加载，防护失效。
  *
  * <target>：
- *   lint | style | angles        → 动态 import ./smoke-<target>.ts（标准三冒烟）
+ *   lint | style | angles | bulk → 动态 import ./smoke-<target>.ts（标准冒烟 + 批量删除）
  *   selftest:<name>              → 内置自检（verify:smoke-iso 的验收用例，见下）
  */
 
@@ -38,18 +38,20 @@ if (target.startsWith('selftest:')) {
   process.exit(0);
 }
 
-// ── 2b. 标准三冒烟：校验目标名后动态 import（PrismaClient 此时才加载） ──
+// ── 2b. 标准冒烟：校验目标名后动态 import（PrismaClient 此时才加载） ──
 const TARGET_MODULE: Record<string, string> = {
   lint: './smoke-lint.ts',
   style: './smoke-style-prompts.ts',
   angles: './smoke-angles.ts',
+  // S4-4-1：批量删除冒烟原本直跑（会连到 .env 的业务库），改为经本运行器走隔离库。
+  bulk: './smoke-bulk-delete.ts',
 };
 if (!/^[a-z][a-z0-9-]*$/.test(target)) {
   die(`非法 target：${target}`);
 }
 const modPath = TARGET_MODULE[target];
 if (!modPath) {
-  die(`未知 target：${target}（标准三冒烟只允许 lint | style | angles）`);
+  die(`未知 target：${target}（只允许 lint | style | angles | bulk）`);
 }
 console.log(`[smoke-run] import ${modPath} …`);
 await import(modPath);

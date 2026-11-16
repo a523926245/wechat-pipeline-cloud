@@ -118,6 +118,10 @@ export interface AngleItem {
   scoreSuggestion: string;
   /** 评分失败/缺失原因；null=已评分。 */
   scoreError: string | null;
+  /** 待重新评分标记（R1）：approved 编辑退回后 true，重新评分成功后清除；带标记不可审核通过。 */
+  rescoreRequired?: boolean;
+  /** 去重命中明细（S4-2 metaJson.dedupHits）：L2 历史文章标题提示为主，列表/审核展示用。 */
+  dedupHits?: AngleDupHit[];
   /** 引用了该选题的文章数，删除前据此给用户强提示 */
   articleCount: number;
   /** 含 IP 外角色（奶奶/婆婆/老师…）：漫画线画不出来，需要退回文章专用。 */
@@ -130,6 +134,24 @@ export interface AngleItem {
 export type AngleStatus = 'candidate' | 'needs_revision' | 'approved' | 'rejected';
 /** 人工审核结论（评分不替代人工审核，此枚举只来自人工操作）。 */
 export type AngleReviewVerdict = 'approved' | 'needs_revision' | 'rejected';
+
+/**
+ * 去重命中明细（S4-2）。L0 完全重复 / L1 高度相似 → 拦截保存；
+ * L2 历史文章标题相似 → 只提示不拦截。
+ */
+export interface AngleDupHit {
+  level: 'L0' | 'L1' | 'L2';
+  /** angle=现有选题（L0/L1）；article=历史文章标题（L2）。 */
+  sourceType: 'angle' | 'article';
+  targetId: number;
+  /** 命中的选题内容或历史文章标题。 */
+  targetText: string;
+  /** 相似度 0~1（L0 固定 1）。 */
+  score: number;
+  trackId: number | null;
+  trackName: string;
+  reason: string;
+}
 
 /** 六维评分（0-5 整数/维，总分=等权合计 0-30；无权重、无阈值）。 */
 export interface AngleScores {
@@ -149,6 +171,8 @@ export interface TopicReviewRecord {
   round: number;
   scores: AngleScores | null;
   riskHits: string[];
+  /** 审核时刻的去重命中快照（S4-2 TopicReview.dupHits）。 */
+  dupHits?: AngleDupHit[];
   verdict: AngleReviewVerdict;
   reason: string;
   model: string;
@@ -714,6 +738,31 @@ export interface ArticleRenderResult {
   message?: string;
   /** 成稿体检（文章产线才有；漫画为 null）。未通过时推送会被门禁拦下。 */
   lint?: ArticleLint | null;
+  /** 最近一次落库的体检记录（S4-3）；从未检查过为 null。 */
+  lintRun?: ArticleLintRun | null;
+  /** 存档结论所对应的正文已不是当前正文（改过稿/换过版），需重新检查才可信。 */
+  lintRunStale?: boolean;
+  /** 当前正文指纹（与 lintRun.contentHash 比对判断存档是否过期）。 */
+  contentHash?: string;
+  /** 本次体检结果未能存档的原因（存在即表示「检查成功但没留痕」，必须展示）。 */
+  lintPersistError?: string;
+}
+
+/** 单次成稿体检记录：一次检查一行，历史保留（S4-3 落库）。 */
+export interface ArticleLintRun {
+  id: number;
+  /** check=改稿页手动重新检查 / save=保存正文 / push=推送门禁 */
+  trigger: 'check' | 'save' | 'push';
+  ok: boolean;
+  errorCount: number;
+  warnCount: number;
+  /** 被检查正文的 SHA-256。 */
+  contentHash: string;
+  createdAt: string;
+  stats?: ArticleLint['stats'] | null;
+  issues?: ArticleLintIssue[];
+  /** 当时生效的规则参数（checks/relax）快照。 */
+  rule?: { checks?: string[]; relax?: string[] } | null;
 }
 
 /** 成稿体检报告：与推送门禁同一套规则。 */
@@ -753,6 +802,10 @@ export interface PushResult {
   reason?: string;
   /** 被体检门禁拦下时带上完整报告。 */
   lint?: ArticleLint | null;
+  /** 本次推送门禁体检的落库记录（S4-3）。 */
+  lintRun?: ArticleLintRun | null;
+  /** 门禁体检结果未能存档的原因。 */
+  lintPersistError?: string;
   coverMissing?: boolean;
 }
 

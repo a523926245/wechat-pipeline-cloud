@@ -19,7 +19,7 @@
     "smoke:models": "node --experimental-strip-types scripts/smoke-models.ts",
     "smoke:cover": "node --experimental-strip-types scripts/smoke-cover.ts",
     "smoke:angles": "node --experimental-strip-types scripts/smoke-isolated.ts run angles",
-    "smoke:bulk": "node --experimental-strip-types scripts/smoke-bulk-delete.ts",
+    "smoke:bulk": "node --experimental-strip-types scripts/smoke-isolated.ts run bulk",
     "verify:bulk": "node --experimental-strip-types scripts/verify-bulk-delete.ts",
     "verify:zodiac": "node --experimental-strip-types scripts/verify-zodiac.ts",
     "smoke:lint": "node --experimental-strip-types scripts/smoke-isolated.ts run lint",

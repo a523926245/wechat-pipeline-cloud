@@ -16,9 +16,11 @@ import { errMsg } from '../api/http.ts';
 import {
   applyEmphasis,
   applyRevise,
+  checkArticleLint,
   generateComicImages,
   generateCover,
   getArticle,
+  listArticleLintRuns,
   listComicPanels,
   previewArticle,
   previewEmphasis,
@@ -30,6 +32,7 @@ import {
 import StateError from '../components/StateError.vue';
 import type {
   ArticleDetail,
+  ArticleLintRun,
   ArticleRenderResult,
   ComicPanelItem,
   CoverGenerateResult,
@@ -39,6 +42,7 @@ import {
   coverUrl,
   defaultImageRatio,
   defaultImageSize,
+  friendlyTime,
   imageRatios,
   imageSizes,
   reviseModeText,
@@ -98,6 +102,8 @@ async function load() {
     html.value = article.value.contentHtml;
     dirty.value = false;
     await reloadPreview();
+    // 体检存档只对文章产线有意义（漫画正文是图片序列，不跑文章体检）。
+    if ((article.value.pipeline ?? 'article') !== 'comic') await loadLintRuns();
     if ((article.value.pipeline ?? 'article') === 'comic') {
       await loadPanels();
       // 进来时若还有没画完的格（或后端正在画）→ 自动轮询看进度；若后端没在跑，
@@ -128,6 +134,60 @@ async function reloadPreview() {
     rendered.value = await previewArticle(articleId.value);
   } catch (e) {
     ElMessage.error(errMsg(e, '预览渲染失败'));
+  }
+}
+
+// ── 成稿体检存档（S4-3）──
+const lintRuns = ref<ArticleLintRun[]>([]);
+const checking = ref(false);
+/** 体检结果未能存档的原因（只有 check/save/push 会写库，预览不会）。 */
+const lintPersistError = ref('');
+
+const lintTriggerText = (t: ArticleLintRun['trigger']): string =>
+  ({ check: '手动检查', save: '保存正文', push: '推送门禁' } as Record<string, string>)[t] ?? t;
+
+/** 历史记录拉取失败只影响辅助信息，不打断页面（当前结论仍来自预览/保存响应）。 */
+async function loadLintRuns() {
+  try {
+    const res = await listArticleLintRuns(articleId.value, 20);
+    lintRuns.value = res.items;
+  } catch {
+    lintRuns.value = [];
+  }
+}
+
+/**
+ * 重新检查：服务端算一遍并把结果落库（新增一行历史，不覆盖旧记录）。
+ * 检查对象是**已保存的正文**——有未保存改动时先拦一下，免得「检查的和你看到的不是同一份」。
+ */
+async function recheck() {
+  if (dirty.value) {
+    ElMessage.warning('正文有未保存改动：先保存（保存时会自动体检并留痕）再重新检查');
+    return;
+  }
+  checking.value = true;
+  lintPersistError.value = '';
+  try {
+    const res = await checkArticleLint(articleId.value);
+    if (res.lint && rendered.value) {
+      rendered.value.lint = res.lint;
+      rendered.value.lintRun = res.lintRun;
+      rendered.value.lintRunStale = false;
+    }
+    if (res.lintPersistError) lintPersistError.value = res.lintPersistError;
+    await loadLintRuns();
+    if (res.lintPersistError) {
+      // 结论有效但没留痕：明确说出「没存档」，不冒充成一次正常检查。
+      ElMessage.warning('已重新检查，但结果未能存档（见体检面板提示）；刷新后不可追溯');
+    } else {
+      ElMessage.success(
+        res.lint?.ok ? '已重新检查：体检通过，结果已存档' : '已重新检查：仍有不合规项，结果已存档',
+      );
+    }
+  } catch (e) {
+    ElMessage.error(errMsg(e, '重新检查失败'));
+  } finally {
+    checking.value = false;
   }
 }
 
@@ -339,7 +399,14 @@ async function save() {
     // 否则改一次台词预览就从「插图」退回「脚本」。统一走 preview 拿真实产物。
     if (isComic.value) await reloadPreview();
     else rendered.value = { ...res } as ArticleRenderResult;
-    ElMessage.success('已保存并重新渲染');
+    // 保存即体检并留痕：把「这次存档」显式说出来，失败也明说（不静默）。
+    lintPersistError.value = res.lintPersistError ?? '';
+    if (!isComic.value) await loadLintRuns();
+    if (res.lintPersistError) {
+      ElMessage.warning(`已保存并重新渲染，但体检结果未能存档：${res.lintPersistError}`);
+    } else {
+      ElMessage.success('已保存并重新渲染（体检结果已存档）');
+    }
   } catch (e) {
     ElMessage.error(errMsg(e, '保存失败'));
   } finally {
@@ -497,6 +564,12 @@ async function push() {
   pushing.value = true;
   try {
     const res = await pushArticle(articleId.value);
+    // 推送门禁无论放行还是拦截都会留下一条体检记录，回来后刷新历史列表。
+    if (!isComic.value) await loadLintRuns();
+    if (res.lintPersistError) {
+      lintPersistError.value = res.lintPersistError;
+      ElMessage.warning('推送门禁的体检结果未能存档，请留意日志');
+    }
     if (res.ok) {
       ElMessage.success(res.message ?? '已推送到草稿箱');
       await load();
@@ -511,7 +584,13 @@ async function push() {
         confirmButtonText: '知道了',
       });
       // 体检报告随推送结果回传，直接刷新预览区的体检面板，省得用户再点一次重渲染。
-      if (res.lint && rendered.value) rendered.value.lint = res.lint;
+      if (res.lint && rendered.value) {
+        rendered.value.lint = res.lint;
+        if (res.lintRun) {
+          rendered.value.lintRun = res.lintRun;
+          rendered.value.lintRunStale = false;
+        }
+      }
     }
   } catch (e) {
     ElMessage.error(errMsg(e, '推送失败'));
@@ -820,6 +899,42 @@ async function push() {
                   一句一段 {{ rendered.lint.stats.shortPara }}
                 </span>
               </div>
+              <!-- 存档信息：这条结论是什么时候、由哪个入口留下的，以及它是否还对得上当前正文 -->
+              <div class="lint-archive">
+                <template v-if="rendered.lintRun">
+                  <span class="wb-muted lint-archive-text">
+                    最近存档：{{ lintTriggerText(rendered.lintRun.trigger) }} ·
+                    {{ friendlyTime(rendered.lintRun.createdAt) }} ·
+                    {{ rendered.lintRun.ok ? '通过' : `${rendered.lintRun.errorCount} 项不合规` }}
+                  </span>
+                  <el-tag v-if="rendered.lintRunStale" type="warning" size="small">存档已过期（正文已改）</el-tag>
+                </template>
+                <span v-else class="wb-muted lint-archive-text">尚无存档记录</span>
+                <el-button size="small" :icon="Refresh" :loading="checking" @click="recheck">重新检查</el-button>
+                <el-popover placement="bottom-end" :width="380" trigger="click">
+                  <template #reference>
+                    <el-button link size="small">历史 {{ lintRuns.length }} 次</el-button>
+                  </template>
+                  <div v-if="!lintRuns.length" class="wb-muted">这篇还没有体检记录</div>
+                  <ul v-else class="lint-history">
+                    <li v-for="r in lintRuns" :key="r.id">
+                      <span class="wb-mono">{{ friendlyTime(r.createdAt) }}</span>
+                      <span class="wb-muted">{{ lintTriggerText(r.trigger) }}</span>
+                      <el-tag :type="r.ok ? 'success' : 'danger'" size="small">
+                        {{ r.ok ? '通过' : `${r.errorCount} 错 / ${r.warnCount} 提示` }}
+                      </el-tag>
+                    </li>
+                  </ul>
+                </el-popover>
+              </div>
+              <el-alert
+                v-if="lintPersistError"
+                type="warning"
+                show-icon
+                :closable="false"
+                class="lint-archive-alert"
+                :title="`体检结果未能存档：${lintPersistError}（结论仅本页可见，刷新后不可追溯）`"
+              />
               <ul v-if="rendered.lint.issues.length" class="lint-list">
                 <li
                   v-for="(it, i) in rendered.lint.issues"
@@ -1095,6 +1210,38 @@ async function push() {
 
 .lint-nums {
   font-size: 12px;
+}
+
+/* 存档行：结论的来源与新鲜度（S4-3） */
+.lint-archive {
+  display: flex;
+  align-items: center;
+  gap: var(--wb-space-2);
+  flex-wrap: wrap;
+  margin-top: var(--wb-space-2);
+  font-size: 12px;
+}
+
+.lint-archive-text {
+  font-size: 12px;
+}
+
+.lint-archive-alert {
+  margin-top: var(--wb-space-2);
+}
+
+.lint-history {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  line-height: 1.9;
+}
+
+.lint-history li {
+  display: flex;
+  align-items: center;
+  gap: var(--wb-space-2);
 }
 
 .lint-list {

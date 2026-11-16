@@ -38,6 +38,7 @@ import { processEmphasis } from '../src/services/emphasis.ts';
 import { ensureEllipsis } from '../src/services/ellipsis.ts';
 import { looksLikeArticleHtml, sanitizeModelHtml } from '../src/services/html-sanitize.ts';
 import { lintArticle, lintSummary } from '../src/services/lint.ts';
+import { recordLintRun } from '../src/services/lint-store.ts';
 import { reflowParagraphs } from '../src/services/paragraph-reflow.ts';
 import { buildPrompt, buildSystemPrompt, renderTemplate, SYSTEM_PROMPT } from '../src/services/writer.ts';
 import { DEFAULT_SYSTEM_PROMPTS, parseSystemTemplate } from '../src/services/style-prompts.ts';
@@ -618,6 +619,190 @@ async function main(): Promise<void> {
     });
     const comicLint = await call<{ lint: unknown }>('GET', `/api/articles/${comic.id}/lint`);
     expect('6 HTTP：漫画产线不做文章体检（lint=null）', comicLint.json.lint === null, comicLint.json.lint);
+
+    // ── 10 体检结果落库（S4-3）──
+    // 目的：把「检查结论只在响应里活一次」变成「一次执行一行历史」。
+    // 关注四件事：结论存得下、对外可读、多次检查不覆盖、失败不伪装成功。
+    console.log('— 10 体检结果落库 —');
+    type RunBrief = {
+      id: number;
+      trigger: string;
+      ok: boolean;
+      errorCount: number;
+      warnCount: number;
+      contentHash: string;
+    };
+    type RunItem = RunBrief & { issues?: { code: string }[]; stats?: { charCount: number } | null };
+
+    // 基线：第 6 节已经对 good 做过一次检查（现在也会落库），后续断言一律以「相对增量」为准，
+    // 免得把「前面用例顺手写了几条」硬编码进期望值——那种断言改一处就全碎。
+    const gh0 = await call<{ items: RunItem[] }>('GET', `/api/articles/${good.id}/lint-runs`);
+    const baseGood = gh0.json.items.length;
+    expect('10.0 落库基线可读（历史接口可用）', baseGood === 1, baseGood);
+    // bad 的基线：第 5 节既检查过一次、也推过一次（被拦），各留一条。
+    const bh0 = await call<{ items: RunItem[] }>('GET', `/api/articles/${bad.id}/lint-runs`);
+    const baseBad = bh0.json.items.length;
+    expect('10.0 被拦文章的基线=2（check + push 各一条）', baseBad === 2, baseBad);
+
+    // 10.1 通过的文章：GET /:id/lint 算完即落库，且结论与直接计算一致（规则语义未变）
+    const g1 = await call<{ lint: { ok: boolean } | null; lintRun: RunBrief | null }>(
+      'GET',
+      `/api/articles/${good.id}/lint`,
+    );
+    expect(
+      '10.1 体检通过：返回存档记录（trigger=check / ok=true）',
+      g1.json.lintRun?.trigger === 'check' && g1.json.lintRun?.ok === true,
+      g1.json.lintRun,
+    );
+    expect(
+      '10.1 落库不改变结论：与 lintArticle 直接算一致',
+      g1.json.lint?.ok === lintArticle(newStyleHtml()).ok && g1.json.lintRun?.errorCount === 0,
+      g1.json.lint,
+    );
+
+    const gh1 = await call<{ items: RunItem[] }>('GET', `/api/articles/${good.id}/lint-runs`);
+    expect(
+      '10.2 能读回存档（基线+1 条，含明细快照）',
+      gh1.json.items.length === baseGood + 1 && Array.isArray(gh1.json.items[0]?.issues),
+      gh1.json.items.length,
+    );
+    expect(
+      '10.2 存档带正文指纹（64 位 sha256）',
+      gh1.json.items[0]?.contentHash === g1.json.lintRun?.contentHash &&
+        (g1.json.lintRun?.contentHash ?? '').length === 64,
+      g1.json.lintRun?.contentHash,
+    );
+
+    // 10.3 未通过的文章：结论与不合规明细都留得下来
+    const b1 = await call<{ lint: { ok: boolean } | null; lintRun: RunBrief | null }>(
+      'GET',
+      `/api/articles/${bad.id}/lint`,
+    );
+    expect(
+      '10.3 体检未通过：存档 ok=false 且错误数>0',
+      b1.json.lintRun?.ok === false && (b1.json.lintRun?.errorCount ?? 0) > 0,
+      b1.json.lintRun,
+    );
+    const bh1 = await call<{ items: RunItem[] }>('GET', `/api/articles/${bad.id}/lint-runs`);
+    expect(
+      '10.3 未通过的明细可读回（errors 含 sections）',
+      bh1.json.items[0]?.issues?.some((i) => i.code === 'sections') === true,
+      bh1.json.items[0]?.issues,
+    );
+
+    // 10.4 连续检查：历史累加、新记录在前、旧记录原样保留
+    const g2 = await call<{ lintRun: RunBrief | null }>('GET', `/api/articles/${good.id}/lint`);
+    const gh2 = await call<{ items: RunItem[] }>('GET', `/api/articles/${good.id}/lint-runs`);
+    expect(
+      '10.4 再检查一次：历史 +1 条（新增而非覆盖）',
+      gh2.json.items.length === baseGood + 2,
+      gh2.json.items.length,
+    );
+    expect(
+      '10.4 最新一条在首位且就是本次记录',
+      gh2.json.items[0]?.id === g2.json.lintRun?.id && (gh2.json.items[1]?.id ?? 0) < (gh2.json.items[0]?.id ?? 0),
+      gh2.json.items.map((i) => i.id),
+    );
+    expect(
+      '10.4 旧记录原样保留（id 与首次检查相同）',
+      gh2.json.items[1]?.id === gh1.json.items[0]?.id,
+      gh2.json.items.map((i) => i.id),
+    );
+
+    // 10.5 保存正文：保存即体检并留痕（trigger=save）
+    const sv = await call<{ lint: { ok: boolean } | null; lintRun: RunBrief | null; status: string }>(
+      'PUT',
+      `/api/articles/${good.id}/content`,
+      { contentHtml: oldStyleHtml() },
+    );
+    expect('10.5 保存正文：存档 trigger=save', sv.json.lintRun?.trigger === 'save', sv.json.lintRun);
+    expect(
+      '10.5 保存后结论为不通过（换成旧文风）',
+      sv.json.lintRun?.ok === false && sv.json.lint?.ok === false,
+      sv.json.lint,
+    );
+    const gh3 = await call<{ items: RunItem[] }>('GET', `/api/articles/${good.id}/lint-runs`);
+    expect(
+      '10.5 保存也进历史（基线+3 条，新的在前）',
+      gh3.json.items.length === baseGood + 3 && gh3.json.items[0]?.trigger === 'save',
+      gh3.json.items.map((i) => i.trigger),
+    );
+
+    // 10.6 推送门禁：被拦下同样留痕（第 5 节对 bad 的那次 push）
+    const bh2 = await call<{ items: RunItem[] }>('GET', `/api/articles/${bad.id}/lint-runs`);
+    expect(
+      '10.6 推送门禁留痕（存在 push 记录且 ok=false）',
+      bh2.json.items.some((i) => i.trigger === 'push' && i.ok === false),
+      bh2.json.items.map((i) => `${i.trigger}:${i.ok}`),
+    );
+
+    // 10.7 关联正确：两篇文章各记各的，不串数据
+    expect(
+      '10.7 文章A历史里没有 push 记录（未被他文污染）',
+      gh3.json.items.every((i) => i.trigger !== 'push'),
+      gh3.json.items.map((i) => i.trigger),
+    );
+    // 10.7 关联正确：两篇文章各记各的，不串数据（库层按 articleId 核对，不看接口口径）
+    const goodRows = await prisma.articleLintRun.count({ where: { articleId: good.id } });
+    const badRows = await prisma.articleLintRun.count({ where: { articleId: bad.id } });
+    expect(
+      '10.7 关联正确：A=基线+3 / B=基线+1，各记各的',
+      goodRows === baseGood + 3 && badRows === baseBad + 1,
+      { goodRows, badRows, baseGood, baseBad },
+    );
+
+    // 10.8 预览：带最近存档、能判过期，且自身不写库
+    await prisma.article.update({ where: { id: good.id }, data: { contentHtml: newStyleHtml() } });
+    const pv = await call<{ lintRun: RunItem | null; lintRunStale: boolean; lint: { ok: boolean } | null }>(
+      'GET',
+      `/api/articles/${good.id}/preview`,
+    );
+    expect('10.8 预览带最近存档', pv.json.lintRun?.trigger === 'save', pv.json.lintRun);
+    expect(
+      '10.8 存档正文≠当前正文 → stale=true（不把旧结论当现行结论）',
+      pv.json.lintRunStale === true,
+      pv.json.lintRunStale,
+    );
+    const gh4 = await call<{ items: RunItem[] }>('GET', `/api/articles/${good.id}/lint-runs`);
+    expect(
+      '10.8 预览只读：历史条数不变（仍是基线+3）',
+      gh4.json.items.length === baseGood + 3,
+      gh4.json.items.length,
+    );
+
+    // 10.9 落库失败必须显式报错：不抛异常、不伪装成检查成功
+    const persistFail = await recordLintRun({
+      articleId: 999999,
+      trigger: 'check',
+      report: lintArticle(newStyleHtml()),
+      contentHtml: newStyleHtml(),
+    });
+    expect(
+      '10.9 落库失败：saved=false 且带错误原因（外键约束）',
+      persistFail.saved === false && Boolean(persistFail.error) && persistFail.run === undefined,
+      persistFail,
+    );
+
+    // 10.10 级联：删文章即删其体检记录，不留孤儿行
+    const tmp = await prisma.article.create({
+      data: {
+        trackId,
+        accountId: account.id,
+        pipeline: 'article',
+        title: '冒烟-级联',
+        digest: '',
+        contentHtml: newStyleHtml(),
+        contentWechat: '<section></section>',
+        pushDate: '',
+        status: 'draft',
+        idempotencyKey: `smoke-lint-cascade-${stamp}`,
+      },
+    });
+    await call('GET', `/api/articles/${tmp.id}/lint`);
+    const beforeDel = await prisma.articleLintRun.count({ where: { articleId: tmp.id } });
+    await prisma.article.delete({ where: { id: tmp.id } });
+    const afterDel = await prisma.articleLintRun.count({ where: { articleId: tmp.id } });
+    expect('10.10 删文章级联删除体检记录（1 → 0）', beforeDel === 1 && afterDel === 0, { beforeDel, afterDel });
   } finally {
     server.close();
     // 赛道删除会级联账号与其名下文章，一次清干净。

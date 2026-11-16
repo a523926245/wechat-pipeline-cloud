@@ -5,6 +5,7 @@
 import { http } from './http.ts';
 import type {
   AngleDeleteResult,
+  AngleDupHit,
   AngleItem,
   AngleListQuery,
   AngleListResult,
@@ -13,6 +14,8 @@ import type {
   AngleScopeFilter,
   AngleUpdatePayload,
   ArticleDetail,
+  ArticleLint,
+  ArticleLintRun,
   ArticleListItem,
   ArticleRenderResult,
   BindingMap,
@@ -149,10 +152,13 @@ export const reassignOffIpAngles = (trackId: number) =>
 export const getAngle = (id: number) => http.get<AngleItem>(`/angles/${id}`);
 
 export const createAngle = (payload: AnglePayload) =>
-  http.post<AngleItem & { message?: string }>('/angles', payload);
+  http.post<AngleItem & { message?: string; dedupWarnings?: AngleDupHit[] }>('/angles', payload);
 
 export const updateAngle = (id: number, payload: AngleUpdatePayload) =>
-  http.put<AngleItem & { message?: string }>(`/angles/${id}`, payload);
+  http.put<AngleItem & { message?: string; reviewReset?: boolean; dedupWarnings?: AngleDupHit[] }>(
+    `/angles/${id}`,
+    payload,
+  );
 
 export const deleteAngle = (id: number) => http.del<AngleDeleteResult>(`/angles/${id}`);
 
@@ -178,6 +184,13 @@ export const reviewAngle = (id: number, verdict: AngleReviewVerdict, reason?: st
     `/angles/${id}/review`,
     reason ? { verdict, reason } : { verdict },
   );
+
+/**
+ * 重新评分（R1）：approved 编辑退回的候选必须重新取得有效六维评分才能再过审。
+ * 评分失败不清「待重新评分」标记（仍不可审核通过）。
+ */
+export const rescoreAngle = (id: number) =>
+  http.post<AngleItem & { rescored?: boolean; message?: string }>(`/angles/${id}/rescore`);
 
 /** 审核记录（一候选多轮全留，新轮在前）。 */
 export const listAngleReviews = (id: number) =>
@@ -288,6 +301,23 @@ export const previewArticle = (id: number) => http.get<ArticleRenderResult>(`/ar
 
 export const updateArticleContent = (id: number, contentHtml: string) =>
   http.put<ArticleRenderResult & { status: string }>(`/articles/${id}/content`, { contentHtml });
+
+/**
+ * 重新做一次成稿体检（服务端会把这结果落库成一条历史记录）。
+ * 与预览里的 lint 是同一套规则，区别只在「这次执行要留痕」。
+ */
+export const checkArticleLint = (id: number) =>
+  http.get<{
+    id: number;
+    pipeline: string;
+    lint: ArticleLint | null;
+    lintRun: ArticleLintRun | null;
+    lintPersistError?: string;
+  }>(`/articles/${id}/lint`);
+
+/** 历史体检记录（新的在前）。 */
+export const listArticleLintRuns = (id: number, limit = 20) =>
+  http.get<{ id: number; items: ArticleLintRun[] }>(`/articles/${id}/lint-runs?limit=${limit}`);
 
 export const pushArticle = (id: number) => http.post<PushResult>(`/articles/${id}/push`);
 

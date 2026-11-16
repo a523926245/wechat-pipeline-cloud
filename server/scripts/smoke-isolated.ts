@@ -19,7 +19,7 @@
  *      非 OS 级全网络隔离，报告如实标注。
  *
  * 用法：
- *   node --experimental-strip-types scripts/smoke-isolated.ts run <lint|style|angles>
+ *   node --experimental-strip-types scripts/smoke-isolated.ts run <lint|style|angles|bulk>
  *   node --experimental-strip-types scripts/smoke-isolated.ts verify   （10 项验收台）
  *
  * 内部旗标（仅供 verify 验收台构造故障路径，不构成任何隔离绕过）：
@@ -63,13 +63,13 @@ const DEV_DB_FILE = join(PRISMA_DIR, 'dev.db');
  *  MySQL 本机 lower_case_table_names=1，information_schema 呈小写，比对一律忽略大小写。 */
 const BUSINESS_TABLES = [
   'Track', 'TrackPipeline', 'Account', 'User', 'UserSession', 'WechatToken',
-  'Angle', 'Article', 'ComicPanel', 'TaskRun', 'RunLog',
+  'Angle', 'Article', 'ArticleLintRun', 'ComicPanel', 'TaskRun', 'RunLog',
   'LlmModel', 'ModelBinding', 'Setting', 'StylePrompt', 'TopicReview',
 ];
 
-/** 清表顺序 = 外键子表在前（ComicPanel/TopicReview→Article/Angle→{Track,Account} 等），单条 DROP 语句内按序生效。 */
+/** 清表顺序 = 外键子表在前（ComicPanel/ArticleLintRun→Article；TopicReview→Angle；…），单条 DROP 语句内按序生效。 */
 const SMOKE_DROP_ORDER = [
-  'ComicPanel', 'TopicReview', 'RunLog', 'Article', 'ModelBinding', 'WechatToken', 'UserSession',
+  'ComicPanel', 'TopicReview', 'ArticleLintRun', 'RunLog', 'Article', 'ModelBinding', 'WechatToken', 'UserSession',
   'Account', 'TrackPipeline', 'Angle', 'TaskRun', 'LlmModel', 'User', 'Track',
   'Setting', 'StylePrompt', '_prisma_migrations',
 ];
@@ -851,7 +851,7 @@ async function main(): Promise<number> {
 
   if (cmd === 'verify') return verify();
   if (cmd !== 'run') {
-    console.error('用法：smoke-isolated.ts run <lint|style|angles> | verify');
+    console.error('用法：smoke-isolated.ts run <lint|style|angles|bulk> | verify');
     return 2;
   }
 

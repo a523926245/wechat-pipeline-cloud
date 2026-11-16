@@ -27,6 +27,7 @@ import { packJson } from '../db-json.ts';
 import { todayKey } from '../lib/day.ts';
 import { logger } from '../logger.ts';
 import { lintArticle, lintSummary, type LintReport } from './lint.ts';
+import { recordLintRun, type LintRunBrief } from './lint-store.ts';
 import { loadTrackRule } from './style-prompts.ts';
 import { ensureComicAssetsReady } from './render/comic.ts';
 
@@ -47,6 +48,10 @@ export interface PushResult {
   coverMissing?: boolean;
   /** 成稿体检报告（仅文章产线）。未通过时 reason='lint_failed'。 */
   lint?: LintReport;
+  /** 本次推送门禁体检的落库记录（S4-3）；落库失败时为 null 且带 lintPersistError。 */
+  lintRun?: LintRunBrief | null;
+  /** 体检结果未能存档的原因（显式暴露，不允许「检查成功但没留痕」看起来像一切正常）。 */
+  lintPersistError?: string;
 }
 
 /**
@@ -113,12 +118,28 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
 
   // ── 成稿体检门禁（仅文章产线；漫画正文是图片序列，结构规则不同）──
   // 放在凭据校验之后：先确认「能推」，再判断「值不值得推」，免得白跑一次体检。
+  let gateLintRun: LintRunBrief | null = null;
+  let gateLintPersistError: string | undefined;
   if (a.pipeline !== 'comic' && a.contentHtml.trim()) {
     // 赛道专项检查按 `r:{赛道}` 配置走（不再是代码里的赛道名分支）。
     // checks 与 relax 取自同一条规则：漏传 relax 会让配置页配的 warn 豁免在推送门禁失效。
     const trackName = a.track?.name ?? '';
     const rule = await loadTrackRule(trackName);
     const lint = lintArticle(a.contentHtml, undefined, trackName, rule.checks, rule.relax);
+    // 门禁结论一律留痕（通过与否都记）：这是「这篇到底在什么状态下被推/被拦」的唯一书面证据。
+    const rec = await recordLintRun({
+      articleId: a.id,
+      trigger: 'push',
+      report: lint,
+      contentHtml: a.contentHtml,
+      rule: { checks: rule.checks, relax: rule.relax },
+    });
+    gateLintRun = rec.run ?? null;
+    gateLintPersistError = rec.error;
+    if (!rec.saved) {
+      // 体检本身已完成、结论有效；只是没存下来。既不拦推送（不改变业务门禁），也不装作存成功。
+      logger.warn({ articleId: a.id, err: rec.error }, '体检结果落库失败：本次门禁结论未能留痕');
+    }
     if (!lint.ok) {
       logger.warn(
         { articleId: a.id, errors: lint.errors.map((e) => e.code) },
@@ -130,6 +151,8 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
         account: account.name,
         reason: 'lint_failed',
         lint,
+        lintRun: gateLintRun,
+        ...(gateLintPersistError ? { lintPersistError: gateLintPersistError } : {}),
         message: `未通过成稿体检（${lintSummary(lint)}）：${lint.errors.map((e) => e.message).join('；')}`,
       };
     }
@@ -201,6 +224,8 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
       mediaId,
       pushDate,
       ...(coverMissing ? { coverMissing: true } : {}),
+      ...(gateLintRun ? { lintRun: gateLintRun } : {}),
+      ...(gateLintPersistError ? { lintPersistError: gateLintPersistError } : {}),
       message: coverMissing
         ? '已推送到草稿箱（未群发），但封面文件缺失，推的是无封面草稿'
         : '已推送到草稿箱（未群发）。可在公众号后台草稿箱查看',

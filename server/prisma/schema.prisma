@@ -381,6 +381,8 @@ model Article {
   angle   Angle?   @relation(fields: [angleId], references: [id], onDelete: SetNull)
   /// 漫画逐格资产（pipeline='comic' 时才有行）。
   comicPanels ComicPanel[]
+  /// 成稿体检执行记录（S4-3：一次检查一行，历史保留不覆盖）。
+  lintRuns ArticleLintRun[]
 
   @@index([pushDate, accountId])
   @@index([status])
@@ -421,6 +423,35 @@ model ComicPanel {
   @@unique([articleId, seq])
   @@index([articleId, status])
   @@index([status, updatedAt])
+}
+
+/// 成稿体检（lint）执行记录。**一次检查一行，历史不覆盖**——这是与「把报告塞进一个 Json 列」
+/// 的根本差别：`Article.qualityJson` 那种单列写法存完就被下一次覆盖，追溯不到「上一版稿子为什么没过」。
+/// 快照口径：statsJson / issuesJson 是检查当时 LintReport 的原样拷贝，规则改动不回溯既有行
+/// （旧行如实反映旧规则下的结论，不做重算改写）。
+/// trigger 区分执行入口：check=改稿页手动重新检查 / save=保存正文 / push=推送门禁。
+model ArticleLintRun {
+  id         Int      @id @default(autoincrement())
+  articleId  Int
+  /// 触发入口：check | save | push（见 services/lint-store.ts 的 LintTrigger）
+  trigger    String   @db.VarChar(16)
+  /// 无 error 级问题即为通过（与 LintReport.ok 同义）
+  ok         Boolean
+  errorCount Int      @default(0)
+  warnCount  Int      @default(0)
+  /// LintStats 快照：{h2Count,pCount,charCount,boldCount,keyCount,longPara,shortPara,longRatio,shortRatio}
+  statsJson  Json?
+  /// LintIssue[] 快照（即 LintReport.issues，含 level/code/message/hits；errors/warnings 由 level 派生）
+  issuesJson Json?
+  /// 本次检查生效的规则参数快照：{checks,relax}。回答「这次比上次少报一条，是规则改了还是稿子改了」。
+  ruleJson   Json?
+  /// 被检查正文（contentHtml）的 SHA-256。用于判断「这条记录还对不对应当前正文」。
+  contentHash String  @default("") @db.VarChar(64)
+  createdAt  DateTime @default(now())
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId, createdAt])
 }
 
 /// 任务执行记录。排产、写作、生图、推送都走这里，便于监控与重试。

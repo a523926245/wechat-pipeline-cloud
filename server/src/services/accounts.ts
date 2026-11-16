@@ -17,6 +17,8 @@ import {
 import { prisma } from '../db.ts';
 import { ConflictError, NotFoundError } from '../errors.ts';
 import { encryptSecret, looksLikePlaceholder, maskSecret } from '../lib/crypto.ts';
+import { ANGLE_RELEASE_DATA } from './angle-claim.ts';
+import { hasPushTrace } from './article-delete.ts';
 
 export type CredStatusDb = 'ok' | 'placeholder' | 'missing' | 'invalid';
 
@@ -147,14 +149,16 @@ export interface DeleteAccountResult {
   name: string;
   /** 被级联删除的文章数 */
   deletedArticles: number;
-  /** 归还到角度池的角度数（仅未推送的文章才归还） */
+  /** 归还到角度池的角度数（只有从未送达微信的文章所占选题才归还） */
   recycledAngles: number;
 }
 
 /**
  * 删除账号，并在同一事务里理顺所有关联：
- *  1. 未送达微信的文章所占角度归还池中（已推送的不归还，避免重复选题）
- *  2. 该账号名下文章全部删除（应用层显式级联，与 schema 的 onDelete:Cascade 双保险）
+ *  1. 名下文章**先删除**，再按「是否仍有其他文章引用」逐个归还选题
+ *     （S4-4-1 R3：删除前判断会被同批文章干扰，故必须后置）
+ *  2. 只有**从未送达微信**（无 mediaId 且无 pushDate，R1）的文章所占选题才归还；
+ *     曾送达的保持 used=true，避免同一选题被再写一遍
  *  3. TaskRun 的 accountId 置空，避免留下指向不存在账号的孤儿字段
  * 微信侧已发内容不受影响（只写草稿箱，且这里不动微信接口）。
  *
@@ -177,34 +181,47 @@ export async function deleteAccount(
 
     const articles = await tx.article.findMany({
       where: { accountId: id },
-      select: { id: true, angleId: true, status: true },
+      // 推送事实（R1）：不再用 status 判断「送没送过」，见 article-delete.hasPushTrace。
+      select: { id: true, angleId: true, mediaId: true, pushDate: true },
     });
 
-    // 只回收「还没安全送到微信」的角度：draft / updated / failed。
-    // pushed 的保持 used=true，否则同一选题会被再写一遍。
-    const angleIds = [
-      ...new Set(
-        articles
-          .filter((a) => a.status !== 'pushed' && a.angleId != null)
-          .map((a) => a.angleId as number),
-      ),
-    ];
-    let recycledAngles = 0;
-    if (angleIds.length > 0) {
-      const r = await tx.angle.updateMany({
-        where: { id: { in: angleIds } },
-        // P3：结构化归属字段一起清（usedBy 展示标签同步清空）
-        data: { used: false, usedBy: '', usedDate: null, usedById: null, usedByAccountId: null },
-      });
-      recycledAngles = r.count;
-    }
-
+    // ── 顺序很重要（S4-4-1 R3）──
+    // 必须**先删文章、再判断引用**：否则同批里还没删掉的文章会被误当成「其他引用」，
+    // 或者反过来——用删除前的快照判断，会把仍被其他账号文章引用的选题错误归还。
     let deletedArticles = 0;
     if (articles.length > 0) {
       const r = await tx.article.deleteMany({
         where: { id: { in: articles.map((a) => a.id) } },
       });
       deletedArticles = r.count;
+    }
+
+    // 候选 = 未送达微信（无推送痕迹）且挂过选题的文章所占的选题。
+    // 曾送达的保持 used=true，否则同一选题会被再写一遍（R1）。
+    const candidates = [
+      ...new Set(
+        articles
+          .filter((a) => a.angleId != null && !hasPushTrace(a))
+          .map((a) => a.angleId as number),
+      ),
+    ];
+
+    let recycledAngles = 0;
+    if (candidates.length > 0) {
+      // 该账号的文章此刻已全部删除，因此 count 的结果就是「其他账号/其他文章」的引用数。
+      const freeIds: number[] = [];
+      for (const angleId of candidates) {
+        const remain = await tx.article.count({ where: { angleId } });
+        if (remain === 0) freeIds.push(angleId);
+      }
+      if (freeIds.length > 0) {
+        // used:true 条件：只归还确实被占用的选题，不制造「归还了没占用的题」的假信号。
+        const r = await tx.angle.updateMany({
+          where: { id: { in: freeIds }, used: true },
+          data: ANGLE_RELEASE_DATA,
+        });
+        recycledAngles = r.count;
+      }
     }
 
     await tx.taskRun.updateMany({ where: { accountId: id }, data: { accountId: null } });
