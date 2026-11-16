@@ -41,7 +41,7 @@ import { lintArticle, lintSummary } from '../src/services/lint.ts';
 import { recordLintRun } from '../src/services/lint-store.ts';
 import { reflowParagraphs } from '../src/services/paragraph-reflow.ts';
 import { buildPrompt, buildSystemPrompt, renderTemplate, SYSTEM_PROMPT } from '../src/services/writer.ts';
-import { DEFAULT_SYSTEM_PROMPTS, parseSystemTemplate } from '../src/services/style-prompts.ts';
+import { DEFAULT_SYSTEM_PROMPTS, loadTrackRule, migrateStyleSeedsV16, parseSystemTemplate } from '../src/services/style-prompts.ts';
 import { newStyleHtml, oldStyleHtml } from './fixtures/article-sample.ts';
 
 let passed = 0;
@@ -530,6 +530,141 @@ async function main(): Promise<void> {
     '9 结尾钩子：有回扣物件的提问不提示',
     hooked.warnings.some((w) => w.code === 'ending_hook') === false,
     hooked.warnings,
+  );
+
+  // ── 9b 结尾判据分赛道（S4-5 A 档）──
+  // 这一组验的是「判据该不该要求这条赛道、这件事」：
+  //   sys:星座 明文允许「一句可截图的话，或一句『你是第几个 / @ 那个 XX 座』」并禁止抒情提问
+  //   sys:育儿 全文没有「结尾要提问」的写法要求
+  // 两条都用同一段**无问号**正文做对比：豁免前报、豁免后不报，证明改的是判据而不是正文。
+  console.log('— 结尾判据分赛道 —');
+  const noHookTail = `${head}<p>它吃完还会抬头望一望窗户，像在看谁。</p>`;
+  const zodiacTail = `${head}<p>@那个总在群里已读不回的双鱼座</p>`;
+  const preChangeRelax = ['para_shape', 'para_short'];
+
+  expect(
+    '9.1 星座：无问号结尾，豁免前会报（正是与 sys:星座 口径冲突的那条）',
+    lintArticle(noHookTail, undefined, '星座', undefined, preChangeRelax).warnings.some(
+      (w) => w.code === 'ending_hook',
+    ) === true,
+  );
+  expect(
+    '9.2 星座：目标形态样本（@ 那个 XX 座）豁免后不再报',
+    lintArticle(zodiacTail, undefined, '星座').warnings.some((w) => w.code === 'ending_hook') === false,
+    lintArticle(zodiacTail, undefined, '星座').warnings,
+  );
+  expect(
+    '9.3 育儿：无问号结尾，豁免前会报',
+    lintArticle(noHookTail, undefined, '育儿', undefined, ['para_short']).warnings.some(
+      (w) => w.code === 'ending_hook',
+    ) === true,
+  );
+  expect(
+    '9.4 育儿：豁免后不再报（sys:育儿 没要求过结尾提问）',
+    lintArticle(noHookTail, undefined, '育儿').warnings.some((w) => w.code === 'ending_hook') === false,
+    lintArticle(noHookTail, undefined, '育儿').warnings,
+  );
+  expect(
+    '9.5 没有 r: 行的赛道不受影响：科技仍报 ending_hook',
+    lintArticle(noHookTail, undefined, '科技').warnings.some((w) => w.code === 'ending_hook') === true,
+  );
+  expect(
+    '9.5 未知赛道不受影响：仍报 ending_hook（不是把检查全局关掉）',
+    lintArticle(noHookTail, undefined, '__smoke_unknown_track__').warnings.some(
+      (w) => w.code === 'ending_hook',
+    ) === true,
+  );
+
+  // 库内规则真的加载生效（loadTrackRule 走 DB → 种子回落，lint 侧用的是同一份数据）
+  const ruleZodiac = await loadTrackRule('星座');
+  const ruleParenting = await loadTrackRule('育儿');
+  const ruleTech = await loadTrackRule('科技');
+  expect(
+    '9.6 库内加载：星座/育儿 relax 含 ending_hook，科技不含',
+    ruleZodiac.relax?.includes('ending_hook') === true &&
+      ruleParenting.relax?.includes('ending_hook') === true &&
+      ruleTech.relax?.includes('ending_hook') !== true,
+    { zodiac: ruleZodiac.relax, parenting: ruleParenting.relax, tech: ruleTech.relax },
+  );
+  // S4-5 B 档：科技新增了种子规则（checks:[] + scene），体检侧不该因此多豁免或少检查。
+  expect(
+    '9.6 形态（B 档）：科技=scene、星座=zodiac、育儿=default（种子可加载）',
+    ruleTech.angleMode === 'scene' && ruleZodiac.angleMode === 'zodiac' && ruleParenting.angleMode === 'default',
+    { tech: ruleTech.angleMode, zodiac: ruleZodiac.angleMode, parenting: ruleParenting.angleMode },
+  );
+  expect(
+    '9.6 科技新增规则未放行 ending_hook（relax 为空）',
+    (ruleTech.relax ?? []).length === 0,
+    ruleTech.relax,
+  );
+
+  // ── 9c V16 存量迁移（S4-5 A 档，仅隔离库；未接入启动链）──
+  // 隔离库是新播种的，天生就带豁免 → 直接跑迁移等于空转。所以先把行还原成旧值，再验「只追加、不改别的」。
+  console.log('— V16 存量配置迁移 —');
+  const readRuleJson = async (key: string) => {
+    const row = await prisma.stylePrompt.findUnique({ where: { key } });
+    return row
+      ? (JSON.parse(row.prompt) as { checks?: unknown; angleMode?: unknown; relax?: unknown })
+      : null;
+  };
+  const v16Flag = 'style_seed_v16';
+  const zodiacRuleKey = 'r:星座';
+  const oldZodiacRule = {
+    checks: ['zodiac_topic', 'zodiac_textbook', 'zodiac_repeat', 'zodiac_dup'],
+    angleMode: 'zodiac',
+    relax: ['para_shape', 'para_short'],
+  };
+  await prisma.stylePrompt.update({
+    where: { key: zodiacRuleKey },
+    data: { prompt: JSON.stringify(oldZodiacRule, null, 2) },
+  });
+  await prisma.stylePrompt.update({
+    where: { key: 'r:育儿' },
+    data: { prompt: JSON.stringify({ checks: [], angleMode: 'default', relax: ['para_short'] }, null, 2) },
+  });
+  await prisma.setting.deleteMany({ where: { k: v16Flag } });
+
+  await migrateStyleSeedsV16();
+  const zAfter = await readRuleJson(zodiacRuleKey);
+  const yAfter = await readRuleJson('r:育儿');
+  expect(
+    '9.7 V16：星座 relax 追加 ending_hook（原有两项保留、顺序不变）',
+    JSON.stringify(zAfter?.relax) === JSON.stringify(['para_shape', 'para_short', 'ending_hook']),
+    zAfter?.relax,
+  );
+  expect(
+    '9.7 V16：育儿 relax 追加 ending_hook',
+    JSON.stringify(yAfter?.relax) === JSON.stringify(['para_short', 'ending_hook']),
+    yAfter?.relax,
+  );
+  expect(
+    '9.7 V16：checks / angleMode 原样保留（不借机改规则本体）',
+    JSON.stringify(zAfter?.checks) === JSON.stringify(oldZodiacRule.checks) &&
+      zAfter?.angleMode === 'zodiac',
+    zAfter,
+  );
+
+  // 幂等：标记被删掉后再跑一次，不应重复追加
+  await prisma.setting.deleteMany({ where: { k: v16Flag } });
+  await migrateStyleSeedsV16();
+  const zAgain = await readRuleJson(zodiacRuleKey);
+  expect(
+    '9.8 V16 幂等：重复执行不重复追加',
+    (zAgain?.relax as string[] | undefined)?.filter((c) => c === 'ending_hook').length === 1,
+    zAgain?.relax,
+  );
+
+  // 注释里那条保守规则：行内**没有** relax 键时不许替它写一个只有 ending_hook 的数组
+  // （否则会把种子里继承来的 para_shape / para_short 顶掉）
+  const noRelaxPrompt = JSON.stringify({ checks: [], angleMode: 'default' }, null, 2);
+  await prisma.stylePrompt.update({ where: { key: 'r:育儿' }, data: { prompt: noRelaxPrompt } });
+  await prisma.setting.deleteMany({ where: { k: v16Flag } });
+  await migrateStyleSeedsV16();
+  const yNoRelax = await readRuleJson('r:育儿');
+  expect(
+    '9.9 V16：行里没有 relax 键时不动它（交给种子继承）',
+    yNoRelax?.relax === undefined,
+    yNoRelax,
   );
 
   const stamp = Date.now().toString(36);

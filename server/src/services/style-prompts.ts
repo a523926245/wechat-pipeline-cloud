@@ -1229,6 +1229,9 @@ async function doEnsureStylePromptsSeeded(): Promise<void> {
   await migrateStyleSeedsV13();
   await migrateStyleSeedsV14();
   await migrateStyleSeedsV15();
+  // S4-5 A 档（V16）：给星座/育儿补 ending_hook 豁免。
+  // 只追加一个 relax 项，checks/angleMode 与其余豁免原样保留（见函数内注释）。
+  await migrateStyleSeedsV16();
 }
 
 /**
@@ -1811,6 +1814,79 @@ async function migrateStyleSeedsV15(): Promise<void> {
 }
 
 /**
+ * 存量库迁移 v16（S4-5 A 档，2026-11-16）：给星座 / 育儿补 `ending_hook` 豁免。
+ *
+ * 为什么非要有这次迁移：`loadTrackRule` 的合并语义是「DB 里有 `relax` 这个键，就整条用 DB 的值」
+ * （缺失才继承种子）。库里 `r:星座` / `r:育儿` 早就把 relax 数组写死了，所以**只改
+ * `DEFAULT_TRACK_RULES` 对存量库完全无效**——这正是 v15 注释里那条教训的翻版。
+ *
+ * 为什么只追加一个 code：本迁移只解决「判据要求结尾有问号，而 `sys:星座` 明文禁止抒情提问、
+ * `sys:育儿` 从未要求提问」这一条结构性冲突。`checks` / `angleMode` / 其余 relax 项一律原样保留，
+ * 不借机放宽别的检查。
+ *
+ * 两条保守规则：
+ *  ① 行里**没有** `relax` 键时不动它——那种情况下 `loadTrackRule` 会继承种子（已含 ending_hook），
+ *     此时写一个只有 ending_hook 的数组反而会把种子的 para_shape / para_short 顶掉。
+ *  ② JSON 坏了、字段类型不对就跳过并 warn，绝不猜着改。
+ *
+ * ⚠️ **本函数尚未接入 `doEnsureStylePromptsSeeded` 的迁移链**（S4-5 S1 只做实现与隔离验证）。
+ * 接线意味着服务首次启动会自动 UPDATE 真实业务库这 2 行，必须等「允许写真实业务库」的单独授权。
+ */
+const LEGACY_SEED_KEY_V16 = 'style_seed_v16';
+
+/** 本迁移负责的赛道：判据与赛道口径冲突、且库里已有 `r:` 行的那两条。 */
+const V16_RELAX_TRACKS = ['星座', '育儿'] as const;
+/** 要补进 relax 的豁免项。 */
+const V16_RELAX_CODE = 'ending_hook';
+
+export async function migrateStyleSeedsV16(): Promise<void> {
+  try {
+    const flag = await prisma.setting.findUnique({ where: { k: LEGACY_SEED_KEY_V16 } });
+    if (flag?.v === '16') return;
+    const changed: string[] = [];
+
+    for (const track of V16_RELAX_TRACKS) {
+      const key = ruleKey(track);
+      const row = await prisma.stylePrompt.findUnique({ where: { key } });
+      if (!row) continue; // 没有 r: 行 → 走种子，种子里已经带豁免，无需补
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(row.prompt);
+      } catch {
+        logger.warn({ key }, 'r: 规则不是合法 JSON，跳过 relax 补丁（体检会回落到种子）');
+        continue;
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        logger.warn({ key }, 'r: 规则不是对象，跳过 relax 补丁');
+        continue;
+      }
+      const o = parsed as Record<string, unknown>;
+      if (!Array.isArray(o.relax)) continue; // 见注释①：没有 relax 键时交给种子继承
+      const relax = o.relax.filter((c): c is string => typeof c === 'string');
+      if (relax.includes(V16_RELAX_CODE)) continue;
+
+      // 只改 relax，其他字段（checks / angleMode / 用户自己加的项）原样写回。
+      const next = { ...o, relax: [...relax, V16_RELAX_CODE] };
+      await prisma.stylePrompt.update({
+        where: { key },
+        data: { prompt: JSON.stringify(next, null, 2) },
+      });
+      changed.push(key);
+    }
+
+    await prisma.setting.upsert({
+      where: { k: LEGACY_SEED_KEY_V16 },
+      create: { k: LEGACY_SEED_KEY_V16, v: '16', kind: 'json', desc: '文风种子版本 v16' },
+      update: { v: '16' },
+    });
+    if (changed.length > 0) logger.info({ changed }, '已为星座/育儿补上 ending_hook 豁免');
+  } catch {
+    // 失败不阻断：缺这条豁免只是多一条提示，不影响写稿与推送。
+  }
+}
+
+/**
  * 播种默认配置。只在表为空时写入；之后配置页的修改永不被覆盖。
  * 幂等：重复调用无副作用；失败不缓存，下次调用会重试。
  */
@@ -2035,6 +2111,26 @@ export async function loadTrackSpec(track: string): Promise<TrackSpec> {
   return { ...parseSpecSections(seed), fromDb: false };
 }
 
+/**
+ * 解析库里的 `angleMode`：白名单四态，其余一律 `default`。
+ *
+ * ⚠️ 刻意用 `switch` 而不是 `a === 'x' || 'y' || 'z'` —— 那种写法里 `'y'` 是真值，
+ * 表达式恒成立，非法值会被原样放出来。这里每个分支都是显式比较，`undefined` / `null` /
+ * 数字 / 未知字符串全部落到 `default`。
+ */
+function readAngleMode(v: unknown): TrackRule['angleMode'] {
+  switch (v) {
+    case 'zodiac':
+      return 'zodiac';
+    case 'moment':
+      return 'moment';
+    case 'scene':
+      return 'scene';
+    default:
+      return 'default';
+  }
+}
+
 /** 读某赛道的机器规则（体检项 / 选题形态 / 豁免项）。库里是 JSON；解析失败回落到种子。 */
 export async function loadTrackRule(track: string): Promise<TrackRule> {
   const seed = ruleFor(track);
@@ -2048,7 +2144,9 @@ export async function loadTrackRule(track: string): Promise<TrackRule> {
         const checks = Array.isArray(o.checks)
           ? o.checks.filter((c): c is string => typeof c === 'string')
           : [];
-        const mode = o.angleMode === 'zodiac' ? 'zodiac' : 'default';
+        // 形态白名单：非法值回落 default。S4-5 B 档扩了 moment / scene —— 这里只修正
+        // **解析**，不代表选题开始读库（选题形态仍走 angles.ts 的 ruleFor 种子）。
+        const mode = readAngleMode(o.angleMode);
         // relax 是 2026-11-12 新增的字段：老库里 `r:{赛道}` 没有它，
         // 这时继承出厂默认（而不是当成空数组），否则新赛道的段落豁免对存量库永远不生效。
         // 想显式关掉豁免就写 `"relax": []`。

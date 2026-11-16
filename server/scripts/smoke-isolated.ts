@@ -21,6 +21,8 @@
  * 用法：
  *   node --experimental-strip-types scripts/smoke-isolated.ts run <lint|style|angles|bulk>
  *   node --experimental-strip-types scripts/smoke-isolated.ts verify   （10 项验收台）
+ *   node --experimental-strip-types scripts/smoke-isolated.ts fp       （只读：打印业务库指纹，
+ *                                                                    与 verify ⑦ 同一函数/同一表集合）
  *
  * 内部旗标（仅供 verify 验收台构造故障路径，不构成任何隔离绕过）：
  *   --timeout-ms=N              收紧子进程超时
@@ -76,6 +78,35 @@ const SMOKE_DROP_ORDER = [
 
 /** 真实库指纹表清单 = 业务表 + 迁移记账表。 */
 const FINGERPRINT_TABLES = [...BUSINESS_TABLES, '_prisma_migrations'];
+
+/**
+ * `fp` 子命令：打印**真实业务库**指纹（只读：COUNT(*) + CHECKSUM TABLE）。
+ *
+ * 为什么要有它：S2 之类需要「执行前后各取一次同一口径指纹」的场景，如果让文档自己维护
+ * 一份表数组和一段计算逻辑，两套口径迟早分叉（S4-5 S2 就踩过：历史文档写"16 表"、
+ * 脚本实际 18 项）。这里直接复用 verify 用的 `fingerprintBusinessDb`——同一份
+ * `FINGERPRINT_TABLES`、同一段算法，输出格式也与 verify ⑦ 的 `business sha256=` 对齐，
+ * 便于 grep 与跨轮比对。
+ */
+async function printFingerprint(): Promise<number> {
+  const baseUrl = loadBaseUrl();
+  const { state, sha256 } = await fingerprintBusinessDb(baseUrl);
+  const dbName = (() => {
+    try {
+      return new URL(baseUrl).pathname.replace(/^\//, '') || '?';
+    } catch {
+      return '?';
+    }
+  })();
+  log(`[fp] database=${dbName}`);
+  if (dbName === SMOKE_DB_NAME) {
+    log(`[fp] WARN 目标是隔离库 ${SMOKE_DB_NAME}，不是业务库——不要把这个值当业务库基线`);
+  }
+  log(`[fp] tables=${FINGERPRINT_TABLES.length}`);
+  log(state);
+  log(`[fp] business sha256=${sha256}`);
+  return 0;
+}
 
 /** 子进程 env 显式允许清单（Q7-4）。其余一律剥离。 */
 const ENV_ALLOW = ['PATH', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'LANG', 'TZ'] as const;
@@ -850,8 +881,9 @@ async function main(): Promise<number> {
   const cmd = argv[0] ?? '';
 
   if (cmd === 'verify') return verify();
+  if (cmd === 'fp') return printFingerprint();
   if (cmd !== 'run') {
-    console.error('用法：smoke-isolated.ts run <lint|style|angles|bulk> | verify');
+    console.error('用法：smoke-isolated.ts run <lint|style|angles|bulk> | verify | fp');
     return 2;
   }
 

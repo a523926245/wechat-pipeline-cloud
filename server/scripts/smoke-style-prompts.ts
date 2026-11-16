@@ -32,6 +32,7 @@ import {
   loadTrackRule,
   parseLengthLine,
   pickVariants,
+  resetStyleSeedGate,
   ruleKey,
   upsertStylePrompt,
   variantKey,
@@ -207,10 +208,16 @@ async function main(): Promise<void> {
     dbLint.warnings.some((w) => w.code === 'para_short'),
     dbLint.warnings,
   );
-  // 5.2 种子默认生效：删掉库里的 r:育儿 → 回落出厂种子（relax: ['para_short']）
+  // 5.2 种子默认生效：删掉库里的 r:育儿 → 回落出厂种子（relax: ['para_short','ending_hook']）
+  // S4-5 A 档：育儿种子补了 ending_hook（sys:育儿 没要求过结尾提问），断言的语义仍是「回落种子」，
+  // 期望值随种子更新——不是放宽断言。
   await deleteStylePrompt(ruleKey('育儿'));
   const seedRule = await loadTrackRule('育儿');
-  expect('5.2 loadTrackRule 回落种子：relax=para_short', JSON.stringify(seedRule.relax) === JSON.stringify(['para_short']), seedRule);
+  expect(
+    '5.2 loadTrackRule 回落种子：relax=para_short+ending_hook',
+    JSON.stringify(seedRule.relax) === JSON.stringify(['para_short', 'ending_hook']),
+    seedRule,
+  );
   const seedLint = lintArticle(oldStyleHtml(), undefined, '育儿', seedRule.checks, seedRule.relax);
   expect(
     '5.2 种子 relax 生效：para_short 被豁免',
@@ -232,6 +239,75 @@ async function main(): Promise<void> {
     hard.errors,
   );
   expect('5.3 relax 可免尽 warn', hard.warnings.length === 0, hard.warnings);
+
+  // ── 6. V16 是否真的在迁移链里被调用（S4-5 S2 接线验证）──
+  // 本进程启动时链已经跑过一遍（5.x 的读取触发的），但那时库里是新种子（已带豁免）→ V16 空转。
+  // 要验证「链调用了 V16」，必须制造「旧值 + 标记缺失」，再用 resetStyleSeedGate() 重开闸门，
+  // 让 ensureStylePromptsSeeded() 真跑一遍**完整迁移链**。全程只在隔离库内，不碰真实库。
+  console.log('\n[6] V16 接入迁移链');
+  const oldZodiacRule = {
+    checks: ['zodiac_topic', 'zodiac_textbook', 'zodiac_repeat', 'zodiac_dup'],
+    angleMode: 'zodiac',
+    relax: ['para_shape', 'para_short'],
+  };
+  const oldParentingRule = { checks: [], angleMode: 'default', relax: ['para_short'] };
+  const putRule = async (key: string, rule: unknown): Promise<void> => {
+    const prompt = JSON.stringify(rule, null, 2);
+    await prisma.stylePrompt.upsert({
+      where: { key },
+      create: { key, kind: 'rule', prompt },
+      update: { prompt },
+    });
+  };
+  const readRule = async (
+    key: string,
+  ): Promise<{ checks?: unknown; angleMode?: unknown; relax?: string[] } | null> => {
+    const row = await prisma.stylePrompt.findUnique({ where: { key } });
+    return row ? (JSON.parse(row.prompt) as { checks?: unknown; angleMode?: unknown; relax?: string[] }) : null;
+  };
+
+  await putRule('r:星座', oldZodiacRule);
+  await putRule('r:育儿', oldParentingRule);
+  await prisma.setting.deleteMany({ where: { k: 'style_seed_v16' } });
+  const preZ = await readRule('r:星座');
+  const v16FlagBefore = await prisma.setting.findUnique({ where: { k: 'style_seed_v16' } });
+  expect(
+    '6.1 前置：两条 r: 已还原为旧值、标记已删',
+    JSON.stringify(preZ?.relax) === JSON.stringify(['para_shape', 'para_short']) && v16FlagBefore === null,
+    { relax: preZ?.relax, flag: v16FlagBefore },
+  );
+
+  // ★ 这一步是本次验证的核心：只调公开入口 ensureStylePromptsSeeded()，不直接调 V16。
+  resetStyleSeedGate();
+  await ensureStylePromptsSeeded();
+  const z6 = await readRule('r:星座');
+  const y6 = await readRule('r:育儿');
+  const v16Flag = await prisma.setting.findUnique({ where: { k: 'style_seed_v16' } });
+  expect(
+    '6.1 链上调用生效：星座/育儿 relax 均被追加 ending_hook',
+    JSON.stringify(z6?.relax) === JSON.stringify(['para_shape', 'para_short', 'ending_hook']) &&
+      JSON.stringify(y6?.relax) === JSON.stringify(['para_short', 'ending_hook']),
+    { zodiac: z6?.relax, parenting: y6?.relax },
+  );
+  expect(
+    '6.1 链上迁移不碰规则本体：checks / angleMode 保持原样',
+    JSON.stringify(z6?.checks) === JSON.stringify(oldZodiacRule.checks) &&
+      z6?.angleMode === 'zodiac' &&
+      JSON.stringify(y6?.checks) === '[]' &&
+      y6?.angleMode === 'default',
+    { zodiac: z6, parenting: y6 },
+  );
+  expect('6.1 迁移标记已写入（v=16）', v16Flag?.v === '16', v16Flag);
+
+  // 幂等：再重开闸门跑一遍完整链，不得重复追加
+  resetStyleSeedGate();
+  await ensureStylePromptsSeeded();
+  const z6b = await readRule('r:星座');
+  expect(
+    '6.2 幂等：重复跑整条迁移链不重复追加',
+    (z6b?.relax ?? []).filter((c) => c === 'ending_hook').length === 1,
+    z6b?.relax,
+  );
 
   await cleanup();
   expect('清理完成', (await prisma.stylePrompt.count({ where: { key: { in: SMOKE_KEYS } } })) === 0);

@@ -1664,3 +1664,87 @@ T1 拆 T1-A 基线迁移 / T1-B TrackContract / T1-C PromptVersion / T1-D Genera
 - **业务库零写入**：16 表 sha256 仍 `723a8027…`；`ArticleLintRun` 仍 ABSENT；未执行任何 Migration/Schema 操作。
 - **边界**：两轮都失败时仍会留 `used=true`（兜底只再试一次，非保证成功），靠 error 日志 + 批次结果 + TaskRun failed 追踪，人工归还；未加重试队列/并发锁。
 - **Git**：按令未 commit（本轮改 2 个代码/测试文件 + 报告/DEVLOG；历轮未提交改动原样保留）。**状态：完成，停等人工验收。不进 S4-5。**
+
+## 2026-11-16（下午）· S4-5 A 档：结尾判据分赛道（ending_hook 豁免）—— 完成停等验收
+
+- **决策**：S4-5 采用解读 (a)，是 S4 阶段内部子任务（权威计划 S4/S5/S6 划分未动）。A 档走 **A-1**：保留「DB 优先」relax 语义，用 V16 存量迁移让规则生效；B 档预选 B-1（选题读库 + V17），本轮不实施。
+- **问题（代码证据）**：`ending_hook`（`lint.ts:449-472`）要求结尾有问号 + 第二人称；而 `sys:星座` 明文要求「一句可截图的话 / @那个XX座」并禁止抒情提问、`sys:育儿` 全文没有结尾提问要求 → 判据给两条赛道加了它们没被要求过的东西。`relax` 机制本身已能豁免 warn（`lint.ts:530-531`），**但只改种子对存量库无效**：`loadTrackRule:2055-2057` 是「DB 有 relax 键就整条用 DB」，库内 `r:星座`/`r:育儿` 早已写死 relax。
+- **实测基线（防夸大）**：归档库 12 篇（星座 8/育儿 4）跑 lint，`ending_hook` **0 次**。故本项是「判据对齐口径」的结构性修复，不是已发生的数据事故；验收改为「目标形态样本前后对比 + 归档样本零变化」。
+- **实现**：`track-rules.ts` 星座/育儿种子 relax 追加 `ending_hook`（其余赛道不动，避免大范围关检查）；`style-prompts.ts` 新增 `migrateStyleSeedsV16()`——只追加该 code、其余字段原样保留、JSON 坏或 `relax` 键缺失一律跳过（缺失时写只含 ending_hook 的数组会顶掉种子的 para_shape/para_short）、Setting `style_seed_v16` 打标幂等。**刻意未接入启动迁移链**（接线=服务首次启动自动 UPDATE 业务库 2 行，需单独授权）。`lint.ts` 零改动。
+- **测试**：smoke-lint 新增 9.1-9.9 共 12 项（星座/育儿豁免前报→豁免后不报、科技/未知赛道仍报、loadTrackRule 加载正确、V16 只追加+保留 checks/angleMode+幂等+无 relax 键不动）；smoke-style 5.2 期望值随种子同步为 `['para_short','ending_hook']`（语义仍是「回落种子」，非放宽）。
+- **回归（真实输出）**：typecheck 0 / smoke:lint **150**（138+12）/ style **41** / angles **176** / bulk **73** / verify:smoke-iso **10/10**；每轮 `ISO-EMPTY 17/17` + `CLEANUP ok` + `REAL-DB FINGERPRINT MATCH`。
+- **业务库零写入**：16 表口径 sha256 仍 `723a8027…`；库内 `r:星座`/`r:育儿` 的 relax **仍是旧值**（未出现 ending_hook）→ 直接证明 V16 未在业务库执行；`Setting.style_seed_v16` 不存在；`ArticleLintRun` 仍 ABSENT。未跑任何 Migration。
+- **工作区**：4 项 M（`track-rules.ts`、`style-prompts.ts`、`smoke-lint.ts`、`smoke-style-prompts.ts`）+ 本报告；未 commit / 未 push。
+- **待授权**：S2 = 迁移链加一行 `await migrateStyleSeedsV16();` 并触发一次；届时业务库指纹**必然变化**，验收口径应为「差异仅限 StylePrompt 两行」而非「指纹不变」。
+
+## 2026-11-16（晚）· S4-5 S2 预案修订 v2：指纹口径统一 + 回滚参数化 + 链上验证
+
+- **接线已落地，但未执行**：`style-prompts.ts` 迁移链尾加 `await migrateStyleSeedsV16();`。链只在「进程内首次读风格配置」时跑（`index.ts` 不调用），本轮无服务连真实库 → 业务库 `style_seed_v16` 不存在、两条 `r:` 仍旧值、指纹仍 `4becc576…`。**授权前不要启动服务/打开配置页**。
+- **指纹口径统一（重要）**：历史报告里的「16 表」实为 **17 项**（16 业务表 + `_prisma_migrations`，缺 `ArticleLintRun`）→ `723a8027…`；`verify:smoke-iso` 的 `FINGERPRINT_TABLES` 是 **18 项**（17 业务表 + `_prisma_migrations`）→ `4becc576…`。两者差异仅 `ArticleLintRun:absent` 一条字符串，**不是数据变了**。今后唯一口径 = 18 项，唯一真源 = verify ⑦ 打印值。
+- **回滚参数化**：新增 `scripts/restore-style-prompt.ts`——读 `.before.json` → JSON 校验（对象/checks 数组/angleMode 字符串）→ Prisma `update({where,data})`；`--dry-run` / `--pin-flag`；只接受 `r:*`。三道守卫实测：dry-run 双向 sha256 一致（`b9136b9b…`）、`--key global` 拒绝、坏 JSON 拒绝。回滚顺序仍必须「先钉标记 → 再恢复数据」。
+- **链上验证（新增哨兵）**：`smoke-style` 第 [6] 节 5 项断言——把两条 `r:` 写回旧值 + 删标记 → `resetStyleSeedGate()` → **只调 `ensureStylePromptsSeeded()`** → 断言 relax 被追加、checks/angleMode 未变、标记 v=16；再重开闸门验幂等。若有人把 V16 从链上摘掉，`smoke:style` 立刻变红。
+- **回归**：typecheck 0 / smoke:style **46**（41+5）/ lint **150** / angles **176** / bulk **73** / verify:smoke-iso **10/10**；每轮 `ISO-EMPTY 17/17` + `REAL-DB FINGERPRINT MATCH`。
+- **踩坑**：Windows 上 `/tmp` 会被解析成 `K:/tmp`（ENOENT），备份文件改放 `server/var/tmp/s45/`（已被 .gitignore 覆盖）。
+- **Git**：未 commit / 未 push；本轮新增 `restore-style-prompt.ts`、改 `style-prompts.ts`（接线）、`smoke-style-prompts.ts`（[6] 节）、S2 预案 v2、S1 报告追加注记。
+
+## 2026-11-16（夜）· S4-5 S2 Runbook v3：备份保真 + 指纹单一真源
+
+- **备份不能用 mysql CLI（实测结论）**：`-N -B` 会把换行/制表/反斜杠转义成字面 `\n` `\t` `\\`（DB `61 0A 62` → 导出 `61 5C 6E 62`，JSON 解析失败）；加 `--raw` 只关掉转义，Windows 客户端文本模式仍把**所有 LF 改写成 CRLF**（`61 0D 0A 62`）并多一个行尾换行 → **字节不保真**。故 `restore-style-prompt.ts` 增 `--dump`：Prisma 读 `prompt` 原样落盘（不转义/不换行转换/不补行尾），写完回读比对 + 双 sha256，不一致 `exit 1`（fail-closed）。
+- **保真验证（全程不写表）**：Prisma 参数化往返 → 客户端 sha256 = 服务端 `SHA2()` = 回读 sha256，逐字节一致、无 CRLF、`JSON.parse` 通过；文件层 write→read→compare 一致，首末字节 `{` `}`。
+- **指纹单一真源**：新增 `smoke-isolated.ts fp` 子命令，复用 `verify` 的同一个 `fingerprintBusinessDb()`（同一份 `FINGERPRINT_TABLES`），输出 `[fp] database/tables=18/state/business sha256=`；指向隔离库时额外打 `WARN`。Runbook 里那份手写 18 项数组与内联计算**已删除**（grep 0 命中）。
+- **回归**：typecheck 0 / smoke:style **46** / lint **150** / angles **176** / bulk **73** / verify:smoke-iso **10/10**（business sha256=4becc576…）；每轮 `REAL-DB FINGERPRINT MATCH`。
+- **边界**：本轮未连真实业务库（仅 smoke 库做 CLI 探针与 fp 试跑）、未触发 V16、未跑 Migration；业务库 `v16` 标记仍不存在、两条 `r:` 仍为旧值、指纹仍 `4becc576…`。临时凭据文件（var/tmp/s45-*.env）用后即删。
+- **Git**：未 commit / 未 push。
+
+## 2026-11-16（夜·续）· S4-5 S2 脚本两处安全修复
+
+- **`--pin-flag` 顺序纠正**：原来是「先恢复 prompt、后写标记」，与回滚安全要求相反（恢复期间迁移链可能把豁免补回）。现改为 **① upsert `style_seed_v16=16` → ② 恢复 prompt → ③ 回读校验 SHA-256**（不一致 exit 1），日志按 ①②③ 打印。
+- **`--dump` 改 fail-closed**：原实现 `JSON.parse` 失败只打日志、仍 exit 0。现在「文件与库内不逐字节一致」或「JSON.parse 失败」任一成立都 exit 1，只有两者都通过才 exit 0。
+- **隔离验证（`wechat_pipeline_smoke` 内建最小 `StylePrompt`/`Setting` 表，测完 DROP，库回到 0 表）**：正常 dump exit 0（双 sha `a249ec6…`、逐字节一致、JSON 通过）；坏 JSON dump **exit 1**；`--pin-flag` 日志顺序 ①→②→③ 且 DB 时间戳 `Setting …10.547Z` < `StylePrompt …10.567Z`；回滚回读 sha 与备份一致；内容已一致时跳过 update 仍 exit 0；`--key global` 与坏 JSON `--from` 均 exit 1。
+- **回归**：typecheck 0 / style **46** / lint **150** / angles **176** / bulk **73** / verify:smoke-iso **10/10**（`business sha256=4becc576…`）；每轮 `REAL-DB FINGERPRINT MATCH`。
+- **边界**：未连真实业务库、未触发 V16、未跑 Migration、未起服务；临时连接参数与备份文件用后即删。未 commit / push。
+
+## 2026-11-16（14:00）· S4-5 S2 正式执行：V16 已写入真实业务库
+
+- **执行内容**：给 `r:星座` / `r:育儿` 补 `ending_hook` 豁免 + 写入 `style_seed_v16=16`。**未执行任何 Prisma Migration**（`ArticleLintRun` 仍未部署）。
+- **执行前现场**：分支 `feature/open-source-readiness` / HEAD `f214c57`；工作区 9 项未提交（全属 S4-5）；身份 `wechat_pipeline` / `wpc_app@127.0.0.1` / 8.0.30；`style_seed_v16`=0；`StylePrompt=44`、`Setting=15`；18 表指纹 `4becc576…`。
+- **备份（保留至验收）**：`server/var/tmp/s45/zodiac.before.json` sha `b9136b9b…`、`parenting.before.json` sha `b067cd6e…`，均「库内=文件、逐字节一致、JSON 通过」。另有 `rows.before/after.txt`（44 行逐行 sha）与 `fp.before/after.txt`。
+- **触发**：`npm start` 启动（pid 8196，日志无异常）→ **单次** `GET /api/style-prompts`（复用现有会话，未新建会话）→ 200；服务日志 `changed:["r:星座","r:育儿"] 已为星座/育儿补上 ending_hook 豁免`、`reqId:1`。随后立即停服，8787 释放。
+- **执行后验收**：星座 `para_shape/para_short/ending_hook`(len3,has_hook1)、育儿 `para_short/ending_hook`(len2,has_hook1)；`checks`/`angleMode`/顶层三字段均未变；44 行 diff **仅这两行**、其余 42 行 sha 完全一致；标记 `v=16`；逐表指纹仅 `Setting 15→16 行`与 `StylePrompt` checksum 变，其余 16 表不变。
+- **新基线**：18 表指纹 **`5d449bb72e1cf352e5790aa5e07278ca6cf8531aa2085d3da982886500781308`**（`4becc576…` 作废）；`StylePrompt=44` / `Setting=16`。
+- **回归**：typecheck 0 / style 46 / lint 150 / angles 176 / bulk 73 / verify 10/10（`business sha256=5d449bb7…`）；每轮 `ISO-EMPTY 17/17` + `CLEANUP ok` + `REAL-DB FINGERPRINT MATCH`。
+- **异常**：无；未回滚。**未 commit / 未 push / 未部署 ArticleLintRun / 未进 B 档或 S5。**
+
+## 2026-11-16（15:47）· S4-5 收尾登记：A 档 / B 档均已人工验收通过
+
+> 本节只登记验收状态与最终口径，不改写前几轮的实施过程记录。S4-5 是 S4 阶段内部子任务（S4 归属权威计划「业务流程与内容质量优化」），权威计划的 S4/S5/S6 划分未变。
+
+### A 档（结尾判据分赛道）—— 已验收
+
+| 项 | 状态 |
+|---|---|
+| 星座 / 育儿 warning 判据适配 | **完成**：`r:星座` relax=`para_shape/para_short/ending_hook`；`r:育儿`=`para_short/ending_hook`。其余赛道未放宽（`ending_hook` 仅这两条豁免） |
+| S1 代码实施 | **验收通过**（`docs/restructure/S4-5-A-IMPLEMENTATION-REPORT.md`） |
+| S2 V16 真实库同步 | **执行完成**：`style_seed_v16=16` 已写入，两条 `r:` 已补 `ending_hook`；执行记录见 `S4-5-S2-MIGRATION-PLAN.md` §13 |
+| S1 阶段测试 | typecheck 0 / smoke:lint **150** / smoke:style **41**（S2 接入链上哨兵后为 46 = 41+5）/ smoke:angles **176** / smoke:bulk **73** / verify:smoke-iso **10/10** |
+| S2 执行后基线 | 18 表指纹由 `4becc576…` 变为 **`5d449bb72e1cf352e5790aa5e07278ca6cf8531aa2085d3da982886500781308`**；`StylePrompt=44` / `Setting=16`；逐表差异仅这两张表 |
+
+### B 档（选题形态分赛道）—— 已验收
+
+| 项 | 状态 |
+|---|---|
+| 激励 moment 形态 | **完成**：`angleMode:'moment'`；题面=普通时刻 + 一件小事；不强制冲突/反差/方法钩子 |
+| 科技 scene 形态 | **完成**：新增种子规则 `{checks:[], angleMode:'scene'}`；题面=真实场景 + 可感知比喻或判断信号 |
+| 提示词与守门分派 | **完成**：`buildMessages` 的形态补充/格式示例/硬性要求 #1/#4 按 mode 替换（非追加）；`topicRejectReason` 按 mode 分派，moment/scene 只保留基础保护（空内容 + 反心理标签） |
+| `angleMode` 白名单 | **完成**：`readAngleMode()` switch 四态，`undefined`/`null`/数字/非法字符串一律回落 `default`（并在隔离库加了 8 条断言） |
+| zodiac 通用钩子冲突 | **完成**：zodiac 的形态补充改用星座专属结尾（反差/误解/行为切片/对号入座），不再下发「必须留指向方法的钩子」；`default` 文案逐字保留 |
+| S1/S2 验收 | **通过**（本轮只做收尾，业务实现未再改动） |
+| 最终测试 | typecheck **0** / smoke:angles **205** / smoke:lint **152** / smoke:style **46** / smoke:bulk **73** / verify:smoke-iso **10/10** |
+| 写入方案 | **B-A 零写入**：未新增 V17、未动 `r:激励`、未插 `r:科技`；真实库基线保持 **`5d449bb7…`** |
+
+### S4-5 剩余事项（未完成，不得当作已完成）
+
+1. **C 档（配置页可编辑 `r:` 规则）暂缓**，归入 S5 UI/UX 阶段；本轮及此前均未实施。
+2. **S3（真实 LLM 样本验证）尚未授权、尚未执行**：激励/科技的真实扩库形态（每赛道 10 条人工比对）没有跑过。
+3. **`r:激励` 库内 `angleMode` 仍为 `default`**，与种子 `moment` 存在配置分叉——这是 B-A 方案明确接受的代价（选题形态只读代码种子，库值不参与生成/守门），已写入 `track-rules.ts` 注释。
+4. `ArticleLintRun` Migration **仍未部署**到真实业务库（S4-3 遗留，需单独授权）。

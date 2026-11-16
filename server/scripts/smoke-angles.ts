@@ -20,7 +20,8 @@ import { Prisma } from '@prisma/client';
 import { createApp } from '../src/app.ts';
 import { prisma } from '../src/db.ts';
 import { packJson, unpackJson } from '../src/db-json.ts';
-import { expandAnglesForTrack, rescoreAngle } from '../src/services/angles.ts';
+import { expandAnglesForTrack, rescoreAngle, topicRejectReason } from '../src/services/angles.ts';
+import { loadTrackRule } from '../src/services/style-prompts.ts';
 import { reserveAnglesForPipeline } from '../src/services/planner.ts';
 import { normalizeScores, parseScoreBatch } from '../src/services/topic-review.ts';
 
@@ -1393,6 +1394,118 @@ async function main(): Promise<void> {
       hits18,
     );
 
+    // ═══════════ S4-5 B 档：选题形态分赛道（moment / scene）═══════════
+    // 两条口径：① 守门按形态分派（基础保护不许退化）；② 提示词真的换了形态，且不再
+    // 同时下发互相矛盾的通用要求（不能"只追加附录、通用硬性要求照旧生效"）。
+    console.log('\n— S4-5 B：选题形态分赛道 —');
+    const momentSample = '闹钟响到第三次，他把脚放回地板上的那三秒';
+    const sceneSample = '她把体检单拍了三遍，读出来的结论和医生说的不一样';
+    const zodiacSample = '水逆第三天，他把已读不回包装成了在忙';
+
+    expect('B1 激励 moment：无方法钩子的普通时刻样本 → 放行', topicRejectReason({ theme: '闹钟', content: momentSample }, '激励') === null,
+      topicRejectReason({ theme: '闹钟', content: momentSample }, '激励'));
+    expect(
+      'B2 同一样本给未配置赛道 → 仍按 default 拒（放宽没外溢）',
+      topicRejectReason({ theme: '闹钟', content: momentSample }, '__smoke_unknown_b__') !== null,
+      topicRejectReason({ theme: '闹钟', content: momentSample }, '__smoke_unknown_b__'),
+    );
+    expect('B3 科技 scene：真实场景 + 判断信号、无方法钩子 → 放行', topicRejectReason({ theme: '体检单', content: sceneSample }, '科技') === null,
+      topicRejectReason({ theme: '体检单', content: sceneSample }, '科技'));
+    expect(
+      'B4 基础保护不退化：激励含心理病理标签仍拒',
+      topicRejectReason({ theme: '焦虑症', content: momentSample }, '激励') !== null,
+      topicRejectReason({ theme: '焦虑症', content: momentSample }, '激励'),
+    );
+    expect(
+      'B4 基础保护不退化：scene 空内容仍拒',
+      topicRejectReason({ theme: 'x', content: '   ' }, '科技') !== null,
+    );
+
+    // 提示词层：捕获真正发给生成器的 messages（新增捕获版 mock，不动原有 mockGen）
+    type Msg = { role: string; content: string };
+    const mkFormTrack = async (name: string) =>
+      prisma.track.create({
+        data: { name, slug: `smoke-b-${name}-${stamp}`, quotaPerDay: 1, enabled: true },
+      });
+    const runCapture = async (name: string, candidate: string): Promise<string> => {
+      const tr = await mkFormTrack(name);
+      const sink: { msgs?: Msg[] } = {};
+      await expandAnglesForTrack(tr.id, 1, undefined, 'article', {
+        gen: (async (msgs: Msg[]) => {
+          sink.msgs = msgs;
+          return JSON.stringify([{ theme: '样本', content: candidate }]);
+        }) as never,
+        score: (async () => '[]') as never,
+      });
+      return (sink.msgs ?? []).map((m) => m.content).join('\n');
+    };
+
+    const momentPrompt = await runCapture('激励', momentSample);
+    expect('B5 激励提示词含 moment 形态规则', momentPrompt.includes('激励赛道专用，覆盖通用形态要求'), momentPrompt.length);
+    expect('B5 激励提示词不含 zodiac 附录', !momentPrompt.includes('星座赛道专用规则'), momentPrompt.includes('星座赛道专用规则'));
+    expect('B5 激励提示词不再强制方法钩子', !momentPrompt.includes('指向方法的钩子'), momentPrompt.includes('指向方法的钩子'));
+    expect('B5 激励提示词不再强制冲突/反差', !momentPrompt.includes('暗含冲突、反差或两难'), momentPrompt.includes('暗含冲突、反差或两难'));
+
+    const scenePrompt = await runCapture('科技', sceneSample);
+    expect('B6 科技提示词含 scene 形态规则', scenePrompt.includes('科技赛道专用，覆盖通用形态要求'), scenePrompt.length);
+    expect('B6 科技提示词不含 zodiac 附录', !scenePrompt.includes('星座赛道专用规则'));
+    expect('B6 科技提示词不再强制方法钩子', !scenePrompt.includes('指向方法的钩子'), scenePrompt.includes('指向方法的钩子'));
+
+    // 复用 __smoke_angles_b_ 前缀：finally 里已有按前缀清赛道的规则
+    // （Track.name 是 VarChar(32)，名字要短）
+    const defaultPrompt = await runCapture(`__smoke_angles_b_d${stamp}`, '孩子把牛奶打翻后自己拿抹布擦，这算不算在学责任');
+    expect('B7 未配置赛道：无 moment/scene 附录', !defaultPrompt.includes('激励赛道专用') && !defaultPrompt.includes('科技赛道专用'));
+    expect('B7 未配置赛道：仍保留方法钩子要求', defaultPrompt.includes('指向方法的钩子'));
+    expect('B7 未配置赛道：仍保留冲突/反差要求', defaultPrompt.includes('暗含冲突、反差或两难'));
+    expect(
+      'B7 未配置赛道：总纲里那句通用钩子原文一字未改',
+      defaultPrompt.includes('每条的结尾必须留一个指向方法的钩子（怎么开口/怎么办/如何化解这类问法）'),
+    );
+
+    const zodiacPrompt = await runCapture('星座', zodiacSample);
+    expect('B8 星座：仍用 zodiac 附录', zodiacPrompt.includes('星座赛道专用规则（覆盖上面的通用选题补充）'));
+    expect('B8 星座：不含 moment/scene 附录', !zodiacPrompt.includes('激励赛道专用') && !zodiacPrompt.includes('科技赛道专用'));
+    expect(
+      'B8 星座：结尾要求已与本赛道钩子对齐（不再要求方法问句）',
+      zodiacPrompt.includes('本赛道钩子') && !zodiacPrompt.includes('不许停在僵局或纯情绪上'),
+      zodiacPrompt.includes('不许停在僵局或纯情绪上'),
+    );
+    expect(
+      'B8 星座：总纲里不再出现通用方法钩子那句',
+      !zodiacPrompt.includes('每条的结尾必须留一个指向方法的钩子'),
+      zodiacPrompt.includes('每条的结尾必须留一个指向方法的钩子'),
+    );
+    expect(
+      'B8 星座：总纲结尾换成星座钩子（反差/误解/行为切片/对号入座）',
+      zodiacPrompt.includes('每条的结尾用本赛道钩子（反差 / 误解 / 行为切片 / 对号入座）'),
+    );
+
+    // ── B9 angleMode 白名单（隔离库写 StylePrompt 行验证，不碰业务库）──
+    // 重点防的是 `a === 'x' || 'y' || 'z'` 这种恒真写法：非法值必须回落 default。
+    console.log('— B9 angleMode 白名单 —');
+    const putRule = async (name: string, rule: Record<string, unknown>) => {
+      const key = `r:${name}`;
+      const prompt = JSON.stringify(rule, null, 2);
+      await prisma.stylePrompt.upsert({ where: { key }, create: { key, kind: 'rule', prompt }, update: { prompt } });
+      return loadTrackRule(name);
+    };
+    const badStr = await putRule(`__smoke_b_mode_${stamp}`, { checks: [], angleMode: 'weird' });
+    expect('B9 非法字符串 angleMode → default', badStr.angleMode === 'default', badStr.angleMode);
+    const noKey = await putRule(`__smoke_b_nomode_${stamp}`, { checks: [] });
+    expect('B9 缺 angleMode 键 → default', noKey.angleMode === 'default', noKey.angleMode);
+    const nullMode = await putRule(`__smoke_b_nullmode_${stamp}`, { checks: [], angleMode: null });
+    expect('B9 angleMode=null → default', nullMode.angleMode === 'default', nullMode.angleMode);
+    const numMode = await putRule(`__smoke_b_nummode_${stamp}`, { checks: [], angleMode: 123 });
+    expect('B9 angleMode=123 → default', numMode.angleMode === 'default', numMode.angleMode);
+    const okMoment = await putRule(`__smoke_b_okmoment_${stamp}`, { checks: [], angleMode: 'moment' });
+    expect('B9 合法 moment 原样保留', okMoment.angleMode === 'moment', okMoment.angleMode);
+    const okScene = await putRule(`__smoke_b_okscene_${stamp}`, { checks: [], angleMode: 'scene' });
+    expect('B9 合法 scene 原样保留', okScene.angleMode === 'scene', okScene.angleMode);
+    const okZodiac = await putRule(`__smoke_b_okzodiac_${stamp}`, { checks: [], angleMode: 'zodiac' });
+    expect('B9 合法 zodiac 原样保留', okZodiac.angleMode === 'zodiac', okZodiac.angleMode);
+    const okDefault = await putRule(`__smoke_b_okdefault_${stamp}`, { checks: [], angleMode: 'default' });
+    expect('B9 合法 default 原样保留', okDefault.angleMode === 'default', okDefault.angleMode);
+
     console.log(`\nSMOKE ANGLES: ALL PASS (${passed} 项)`);
   } finally {
     // ── 清理：绝不留下脏数据（TopicReview 随 Angle 级联删） ──
@@ -1404,6 +1517,13 @@ async function main(): Promise<void> {
     await prisma.angle.deleteMany({ where: { track: { name: { startsWith: '__smoke_angles_b_' } } } });
     await prisma.article.deleteMany({ where: { track: { name: { startsWith: '__smoke_angles_b_' } } } });
     await prisma.track.deleteMany({ where: { name: { startsWith: '__smoke_angles_b_' } } });
+    // S4-5 B 档形态测试用的真名赛道（形态按 name 查种子，只能用「激励/科技/星座」真名）
+    const formTracks = ['激励', '科技', '星座'];
+    await prisma.angle.deleteMany({ where: { track: { name: { in: formTracks } } } });
+    await prisma.article.deleteMany({ where: { track: { name: { in: formTracks } } } });
+    await prisma.track.deleteMany({ where: { name: { in: formTracks } } });
+    // B9 白名单用例写的 r:* 行
+    await prisma.stylePrompt.deleteMany({ where: { key: { startsWith: 'r:__smoke_b_' } } });
     server.close();
     await prisma.$disconnect();
   }
