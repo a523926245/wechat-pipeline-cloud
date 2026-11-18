@@ -2103,3 +2103,17 @@ T1 拆 T1-A 基线迁移 / T1-B TrackContract / T1-C PromptVersion / T1-D Genera
 - **历史遗留（非 6 范围，未动）**：B-1、T1（S5-UI-4-0 P2）、500px `.el-card__body` 横向溢出（既有，横幅缺席时溢出量相同）、S5-UI-5 的 B1/D-1/E-3（P3 暂缓）。
 - **结论**：**可正式关闭 S5-UI-6**。HEAD 保持 `b2fbad3`、分支 `feature/open-source-readiness`、工作区 80 项未提交改动（本轮前 79 + 本报告）原样保留、无 Git 写操作、端口无监听。详见 `docs/restructure/S5-UI-6-FINAL-CLOSURE-AUDIT.md`。
 - 不进入下一阶段，不擅自实施任何新修复（含 P3 措辞与真实库 E2E，均需单独授权）。
+
+## 2026-11-18（16:13）· S6-1B 整体提交与提交后验证（执行）
+- **性质**：执行类。唯一写操作 = `git add -A` + 单次 `git commit`。未 push / amend / rebase / squash / reset / checkout / stash / clean；未改业务代码；未连库；未跑 `smoke:*|verify:*`；未调 LLM/微信；未发布群发。
+- **基线复核（重新实测）**：分支 `feature/open-source-readiness`、HEAD `b2fbad3`、暂存区空 —— 与 S6-1A 一致。`M` 37 个逐一比对一致。`??` 展开 **46** 个（S6-1A 记 45），差异**仅为 `S6-1A-PRE-COMMIT-CHECK.md` 本身**（核对时该文件尚未生成），其余 45 个完全一致，判定预期增长后继续。无 `D`/`R`。
+- **安全自检 7 项全过**：敏感文件 0 命中；`server/.env`、`server/var/`、`var/tmp/`、`web/dist/`、`.workbuddy/` 全被 ignore；`.gitignore` 未被改动（`git status -- .gitignore` 空）；两个断言 `.mjs` 存在且未被忽略。
+  - ⚠️ **口径坑实证复现**：`git status | grep "assert-"` **匹配不到**，因 Git 把未跟踪目录 `web/scripts/` 折叠成 1 行。必须直接 `[ -f ] + git check-ignore` 核查文件，不能靠 status 行 grep。
+- **暂存**：`git add -A` 退出码 0，**83 文件 = 37 M + 46 A，0 D/R**；工作区零残留。70 条 `LF→CRLF` 警告是 Windows `core.autocrlf` 行尾归一化，非内容变更。
+- **暂存区审查**：`+13368 / −723`。三重敏感扫描（文件名黑名单 / 密钥形态 / 环境变量赋值）→ 4 处命中**全部判定安全**：3 处在 S6-1A 文档内属**引用占位符文本**，1 处 `server/scripts/smoke-push.ts:25` 的 `Buffer.alloc(32,7).toString('base64')` 是**合成测试密钥**（确定性填充 + `if (!process.env.APP_SECRET_KEY)` 守卫 + 仅进程内）。重点文件逐项验：publisher 删除行无安全逻辑、scheduler 口径唯一（`:167/179/205`）、路由复用 `resolveAutomationForAccounts`（`:70-74`）、`pushIntent?` 可选（`types.ts:528`）、SchedulerView 旧 `!cfg.pushEnabled` 已清零（`:55-61`）。`AUTO_PUBLISH` 仍 `false as const`；`masssend` 仅 2 处注释零调用。
+- **提交**：`9f6c4e7`（`9f6c4e76a0eb6fbfa8a0066671a3f5766c8cbcb9`），父 `b2fbad3`（证未 amend/rebase），83 文件。**未 push**，`ahead 12`（本轮前 11 + 1），远程仍 `d82db27`。
+- **提交后验证 4/4 全过**：`server typecheck` 退出码 0 零错误；`web build` 退出码 0 `✓ built in 20.15s`（build 脚本含 `vue-tsc --noEmit`，类型检查同步通过）；`test:article-push` 26/26；`test:todo-nav` 34/34。**诚实标注**：四项均为静态检查/纯函数单测，非真实后端/数据库/浏览器运行验证。
+- **最终状态**：`git status --short` 空、暂存区空、工作区干净；`--ignored` 抽查确认 `server/.env`、`config/*.bak*.json`、`.workbuddy/`、根 `package-lock.json` 仍受保护。8787/5173 用户自启服务未干预。
+- **已消除风险**：S6-0 P1-②「只提交已跟踪文件导致 build 失败」——9 个新增前端依赖文件已与 17 个引用方视图同批入库。
+- **遗留未动**：`.env` 指向 smoke 库（S6-2）、CHANGELOG 缺 10 阶段 / README 状态行 / 报告索引（S6-4）、浏览器证据入库、历史 P3/P4、真实库 `GET /scheduler` E2E。
+- 报告：`docs/restructure/S6-1B-COMMIT-EXECUTION-REPORT.md`。等待下一步授权（S6-2 或 S6-3）。
