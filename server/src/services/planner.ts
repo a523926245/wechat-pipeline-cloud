@@ -312,7 +312,12 @@ export interface TriggerResult {
   accountId: number;
   account: string;
   need: number;
+  /** 只含真实创建成功、有真实文章 id 的草稿；失败项一律不进这里。 */
   created: Array<{ id: number; title: string; angleId: number; modelUsed: string | null; note: string }>;
+  /** 本批失败项（含标题/选题/原因），只用于反馈与 TaskRun 记录，不含虚假文章 id。 */
+  failed: Array<{ title: string; angleId: number; note: string }>;
+  /** 本批因无可用选题等原因跳过的条数（0 表示没有跳过）。 */
+  skipped: number;
   reason?: string;
 }
 
@@ -333,7 +338,7 @@ export async function runPipelineForAccount(
   const quota = await getPipelineQuota(acc.trackId, pipeline);
   let need = count != null ? count : Math.max(0, quota - already);
   if (need <= 0) {
-    return { accountId, account: acc.name, need: 0, created: [], reason: '今日配额已满' };
+    return { accountId, account: acc.name, need: 0, created: [], failed: [], skipped: 0, reason: '今日配额已满' };
   }
 
   const reserved = await reserveAnglesForPipeline(accountId, need, pipeline);
@@ -362,10 +367,12 @@ export async function runPipelineForAccount(
       (byTrack.size > 0
         ? `注意：未用选题在 ${otherText} ——那是别的赛道的池子，本账号吃不到。请给【${acc.track.name}】扩库（${kindText}切片），或把账号改绑到对应赛道。`
         : '');
-    return { accountId, account: acc.name, need, created: [], reason };
+    return { accountId, account: acc.name, need, created: [], failed: [], skipped: need, reason };
   }
 
   const created: TriggerResult['created'] = [];
+  /** 失败项单独收集（S5-UI-5-P1）：不再污染 created，但保留原因供反馈与 TaskRun 记录。 */
+  const failed: TriggerResult['failed'] = [];
   /**
    * 本次任务实际预留、但还没有产出文章的选题 id（S4-4-1 R5）。
    * 集合只含 `reserved` 里的 id，因此补偿不会碰其他任务或人工占用的选题。
@@ -402,11 +409,9 @@ export async function runPipelineForAccount(
             },
             '漫画脚本生成失败（已尝试归还该选题）',
           );
-          created.push({
-            id: 0,
+          failed.push({
             title: angle.content,
             angleId: angle.id,
-            modelUsed: null,
             note:
               `漫画脚本失败：${msg.slice(0, 160)}` +
               (rel.released > 0
@@ -417,12 +422,11 @@ export async function runPipelineForAccount(
           });
         }
       }
-      const failures = created.filter((c) => c.id === 0);
       await prisma.taskRun.create({
         data: {
           jobType: 'comic_script',
           // 不能把「一条都没成就」记成 success：任务流水要如实反映本批结果。
-          status: failures.length > 0 ? 'failed' : 'success',
+          status: failed.length > 0 ? 'failed' : 'success',
           trigger: 'manual',
           trackId: acc.trackId,
           accountId: acc.id,
@@ -430,11 +434,11 @@ export async function runPipelineForAccount(
           attempt: 1,
           paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }) ?? Prisma.DbNull,
           resultJson: packJson({ createdIds: created.map((c) => c.id).filter(Boolean) }) ?? Prisma.DbNull,
-          errorCode: failures.length > 0 ? 'comic_script_failed' : '',
-          errorMessage: failures.length > 0 ? summarizeFailures(failures) : '',
+          errorCode: failed.length > 0 ? 'comic_script_failed' : '',
+          errorMessage: failed.length > 0 ? summarizeFailures(failed) : '',
         },
       });
-      return { accountId, account: acc.name, need: reserved.length, created };
+      return { accountId, account: acc.name, need: reserved.length, created, failed, skipped: 0 };
     }
 
     const titlePrefix = await getTitlePrefix();
@@ -487,11 +491,9 @@ export async function runPipelineForAccount(
           },
           '文章建稿失败（已尝试归还该选题）',
         );
-        created.push({
-          id: 0,
+        failed.push({
           title: angle.content,
           angleId: angle.id,
-          modelUsed: null,
           note:
             `建稿失败：${msg.slice(0, 160)}` +
             (rel.released > 0
@@ -503,11 +505,10 @@ export async function runPipelineForAccount(
       }
     }
 
-    const failures = created.filter((c) => c.id === 0);
     await prisma.taskRun.create({
       data: {
         jobType: 'write',
-        status: failures.length > 0 ? 'failed' : 'success',
+        status: failed.length > 0 ? 'failed' : 'success',
         trigger: 'manual',
         trackId: acc.trackId,
         accountId: acc.id,
@@ -515,12 +516,12 @@ export async function runPipelineForAccount(
         attempt: 1,
         paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }) ?? Prisma.DbNull,
         resultJson: packJson({ createdIds: created.map((c) => c.id), modelUsed: created[0]?.modelUsed ?? null }) ?? Prisma.DbNull,
-        errorCode: failures.length > 0 ? 'write_failed' : '',
-        errorMessage: failures.length > 0 ? summarizeFailures(failures) : '',
+        errorCode: failed.length > 0 ? 'write_failed' : '',
+        errorMessage: failed.length > 0 ? summarizeFailures(failed) : '',
       },
     });
 
-    return { accountId, account: acc.name, need: reserved.length, created };
+    return { accountId, account: acc.name, need: reserved.length, created, failed, skipped: 0 };
   } finally {
     // 批次中途异常退出（render/create 抛错、进程级错误由上层捕获）时，
     // 剩余「已预留但还没建稿或有补偿未成功」的选题在这里统一归还，不留孤儿（R5-3）。
@@ -551,11 +552,9 @@ export async function runPipelineForAccount(
             },
             '兜底补偿失败：这些选题仍为 used=true，需人工归还',
           );
-          created.push({
-            id: 0,
+          failed.push({
             title: '（补偿未完成）',
             angleId: rel.retryable[0] ?? 0,
-            modelUsed: null,
             note:
               `兜底补偿失败：${rel.retryable.length} 个选题未能归还` +
               `（angleId ${rel.retryable.join(',')}）：${rel.error ?? '未知原因'}；` +

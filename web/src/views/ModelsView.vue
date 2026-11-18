@@ -22,6 +22,8 @@ import { computed, nextTick, onMounted, reactive, ref } from "vue";
 
 import RowActions, { type RowAction } from "../components/RowActions.vue";
 import BatchBar from "../components/BatchBar.vue";
+import EmptyState from "../components/EmptyState.vue";
+import PageHead from "../components/PageHead.vue";
 import { errMsg } from "../api/http.ts";
 import {
   bindRole,
@@ -31,6 +33,7 @@ import {
   getBindings,
   getModelMeta,
   listModels,
+  resolveRole,
   testModel,
   unbindRole,
   updateModel,
@@ -42,6 +45,7 @@ import type {
   LlmModelPayload,
   LlmModelView,
   ModelMeta,
+  RoleResolveResult,
   RoleSpecDto,
 } from "../types.ts";
 import {
@@ -122,6 +126,12 @@ const UNBIND = "__unbind__";
 const meta = ref<ModelMeta | null>(null);
 const models = ref<LlmModelView[]>([]);
 const bindings = ref<BindingMap>({});
+/**
+ * 角色可用性真源（S5-UI-4-1-C）：后端 GET /models/resolve/:role 的结果。
+ * 就绪状态以后端 usable/reason 为准，避免前端重复实现能力/协议判断导致误报。
+ * 接口失败的角色不写入此表，bindState 会回落到本地基础判断（降级不崩）。
+ */
+const resolutions = ref<Record<string, RoleResolveResult>>({});
 const loading = ref(false);
 const error = ref("");
 const testingId = ref<number | null>(null);
@@ -228,6 +238,15 @@ async function load() {
       meta.value = metaRes;
       setModelLabels(metaRes);
     }
+    // 就绪状态以每个角色的后端解析结果为准（单一真源）。
+    // 逐个 allSettled：某个 resolve 失败只让该角色走本地降级，不影响其它角色。
+    const roleKeys = roles.value.map((r) => r.role);
+    const settled = await Promise.allSettled(roleKeys.map((role) => resolveRole(role)));
+    const next: Record<string, RoleResolveResult> = {};
+    settled.forEach((res, i) => {
+      if (res.status === "fulfilled") next[roleKeys[i]] = res.value;
+    });
+    resolutions.value = next;
   } catch (e) {
     error.value = errMsg(e, "模型列表加载失败");
   } finally {
@@ -491,17 +510,41 @@ function boundValue(role: string): string | undefined {
 }
 
 /**
- * 角色就绪状态。照「绑定 → 存在 → 启用 → 有 Key」的顺序逐环降级，
- * 任何一环不过都要给出可读原因，而不是笼统显示「未绑定」。
+ * 角色就绪状态（S5-UI-4-1-C）：优先以后端 GET /models/resolve/:role 的
+ * usable/reason 为准——这才是实际生成时 tryResolveForRole 的真源，
+ * 前端不再自行复刻能力/协议判断（此前只判绑定/启用/Key，会误报「就绪」）。
+ *
+ * reason → 短文案只是把后端提示压成 tag 文字；是否可用完全由 usable 决定。
+ * 接口未返回该角色（失败降级）时，回落到本地基础判断，保证页面不崩。
  */
-function bindState(role: string): { type: TagType; text: string } {
+function bindState(role: string): { type: TagType; text: string; tip: string } {
+  const resolved = resolutions.value[role];
+  if (resolved) {
+    if (resolved.usable) return { type: "success", text: "就绪", tip: "后端解析可用，可用于该角色" };
+    const reason = resolved.reason ?? "";
+    let text = "不可用";
+    if (reason.includes("尚未给")) text = "未绑定";
+    else if (reason.includes("已不存在")) text = "绑定已失效";
+    else if (reason.includes("已被停用")) text = "模型已停用";
+    else if (reason.includes("能力")) text = "能力不匹配";
+    else if (reason.includes("尚未实现")) text = "协议未实现";
+    else if (reason.includes("协议")) text = "协议不匹配";
+    else if (reason.includes("API Key")) text = "未填 API Key";
+    else text = "不可用";
+    const type: TagType =
+      text === "未绑定" ? "info"
+      : text === "未填 API Key" ? "warning"
+      : "danger";
+    return { type, text, tip: reason || "该角色当前不可用" };
+  }
+  // 降级：resolve 接口未返回时的本地基础判断（不覆盖能力/协议，仅基础环）
   const b = bindings.value[role];
-  if (!b || b.modelId == null) return { type: "info", text: "未绑定" };
+  if (!b || b.modelId == null) return { type: "info", text: "未绑定", tip: "尚未绑定模型" };
   const m = boundModel(role);
-  if (!m) return { type: "danger", text: "绑定已失效" };
-  if (!m.enabled) return { type: "danger", text: "模型已停用" };
-  if (!m.apiKeyMask) return { type: "warning", text: "未填 API Key" };
-  return { type: "success", text: "就绪" };
+  if (!m) return { type: "danger", text: "绑定已失效", tip: "绑定的模型已不存在" };
+  if (!m.enabled) return { type: "danger", text: "模型已停用", tip: "模型已被停用" };
+  if (!m.apiKeyMask) return { type: "warning", text: "未填 API Key", tip: "模型未配置 API Key" };
+  return { type: "success", text: "就绪", tip: "已绑定且基础条件满足（后端解析状态暂不可用）" };
 }
 
 async function onBindChange(role: string, raw: unknown) {
@@ -575,21 +618,17 @@ function onModelCommand(cmd: string, row: LlmModelView) {
 
 <template>
   <div class="wb-page" v-loading="loading" element-loading-text="正在加载模型…">
-    <header class="wb-page-head">
-      <div>
-        <h2>模型配置</h2>
-        <p class="wb-page-desc">
-          共 {{ models.length }} 个模型 · 启用 {{ enabledCount }} 个 · Key
-          加密落库只回掩码
-        </p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead
+      title="模型配置"
+      :desc="`共 ${models.length} 个模型 · 启用 ${enabledCount} 个 · Key 加密落库只回掩码`"
+    >
+      <template #actions>
         <el-button :icon="Refresh" @click="load">刷新</el-button>
         <el-button :icon="Plus" type="primary" @click="openCreate"
           >新增模型</el-button
         >
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="error" :message="error" @retry="load" />
 
@@ -608,7 +647,7 @@ function onModelCommand(cmd: string, row: LlmModelView) {
     <el-card shadow="never">
       <template #header>角色绑定</template>
 
-      <el-empty
+      <EmptyState
         v-if="models.length === 0"
         description="还没有模型，先新增一个再来绑定"
         :image-size="64"
@@ -627,13 +666,18 @@ function onModelCommand(cmd: string, row: LlmModelView) {
               <label class="bind-label" :for="`bind-${role.role}`">{{
                 role.label
               }}</label>
-              <el-tag
-                :type="bindState(role.role).type"
-                size="small"
-                effect="light"
+              <el-tooltip
+                :content="bindState(role.role).tip"
+                placement="top"
               >
-                {{ bindState(role.role).text }}
-              </el-tag>
+                <el-tag
+                  :type="bindState(role.role).type"
+                  size="small"
+                  effect="light"
+                >
+                  {{ bindState(role.role).text }}
+                </el-tag>
+              </el-tooltip>
             </div>
             <el-select
               :id="`bind-${role.role}`"
@@ -770,7 +814,7 @@ function onModelCommand(cmd: string, row: LlmModelView) {
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty description="还没有配置模型" :image-size="60">
+          <EmptyState description="还没有配置模型" :image-size="60">
             <el-button
               type="primary"
               :icon="Plus"
@@ -778,7 +822,7 @@ function onModelCommand(cmd: string, row: LlmModelView) {
               @click="openCreate"
               >新增模型</el-button
             >
-          </el-empty>
+          </EmptyState>
         </template>
       </el-table>
     </el-card>

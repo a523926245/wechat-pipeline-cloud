@@ -21,12 +21,13 @@ import { createHash } from 'node:crypto';
 import { prisma } from '../db.ts';
 import { packJson, unpackJson } from '../db-json.ts';
 import { logger } from '../logger.ts';
+import { Prisma } from '@prisma/client';
 import type { LintIssue, LintReport, LintStats } from './lint.ts';
 
 /** 检查触发入口。新增入口必须在这里登记，避免库里出现来历不明的 trigger 值。 */
-export type LintTrigger = 'check' | 'save' | 'push';
+export type LintTrigger = 'check' | 'save' | 'push' | 'revise';
 
-const TRIGGERS: readonly LintTrigger[] = ['check', 'save', 'push'];
+const TRIGGERS: readonly LintTrigger[] = ['check', 'save', 'push', 'revise'];
 
 /** 生效规则快照：回答「这条结论是按哪套 checks/relax 算出来的」。 */
 export interface LintRuleSnapshot {
@@ -142,21 +143,65 @@ export async function recordLintRun(input: RecordLintInput): Promise<LintPersist
   }
 }
 
-/** 最近一次体检记录（按 id 倒序；同一毫秒内多次写入也不会取错）。 */
-export async function latestLintRun(articleId: number): Promise<LintRunDetail | null> {
-  const row = await prisma.articleLintRun.findFirst({
-    where: { articleId },
-    orderBy: { id: 'desc' },
-  });
-  return row ? toDetail(row) : null;
+/**
+ * 读路径降级时的日志字段。
+ *
+ * 为什么「读」要降级、「写」不降级：
+ * - 写（recordLintRun）失败必须让人看见 → 返回 `saved:false`，绝不吞；
+ * - 读（存档面板 / 历史列表）只是**辅助信息**。表还没部署（P2021）或库抖动时，
+ *   让「打开文章预览」整条主流程跟着 500，是拿非核心功能拖垮核心功能。
+ *   所以这里降级为「无存档 / 空历史」，但仍打 warn —— 降级不等于静默。
+ *
+ * 日志只带文章 id、Prisma 错误码与错误消息，不带连接串/密码。
+ */
+function readFailureContext(articleId: number, e: unknown): Record<string, unknown> {
+  const code = e instanceof Prisma.PrismaClientKnownRequestError ? e.code : null;
+  return {
+    articleId,
+    code,
+    /** P2021 = 表不存在（当前真实场景：ArticleLintRun 迁移尚未部署到业务库）。 */
+    tableMissing: code === 'P2021',
+    err: e instanceof Error ? e.message : String(e),
+  };
 }
 
-/** 历史记录（新的在前）。改稿页用它回答「这篇以前检查过几次、每次结论如何」。 */
+/**
+ * 最近一次体检记录（按 id 倒序；同一毫秒内多次写入也不会取错）。
+ * 查询失败 → `null`（调用方展示「无记录」），不伪造记录、不当成「体检通过」。
+ */
+export async function latestLintRun(articleId: number): Promise<LintRunDetail | null> {
+  try {
+    const row = await prisma.articleLintRun.findFirst({
+      where: { articleId },
+      orderBy: { id: 'desc' },
+    });
+    return row ? toDetail(row) : null;
+  } catch (e) {
+    logger.warn(
+      readFailureContext(articleId, e),
+      '成稿体检存档读取失败（latestLintRun）：按「无存档」降级，不影响预览/改稿主流程',
+    );
+    return null;
+  }
+}
+
+/**
+ * 历史记录（新的在前）。改稿页用它回答「这篇以前检查过几次、每次结论如何」。
+ * 查询失败 → `[]`（调用方展示「无历史」），不伪造、不回填。
+ */
 export async function listLintRuns(articleId: number, limit = 20): Promise<LintRunDetail[]> {
-  const rows = await prisma.articleLintRun.findMany({
-    where: { articleId },
-    orderBy: { id: 'desc' },
-    take: Math.min(Math.max(limit, 1), 100),
-  });
-  return rows.map(toDetail);
+  try {
+    const rows = await prisma.articleLintRun.findMany({
+      where: { articleId },
+      orderBy: { id: 'desc' },
+      take: Math.min(Math.max(limit, 1), 100),
+    });
+    return rows.map(toDetail);
+  } catch (e) {
+    logger.warn(
+      readFailureContext(articleId, e),
+      '成稿体检历史读取失败（listLintRuns）：按「空历史」降级，不影响预览/改稿主流程',
+    );
+    return [];
+  }
 }

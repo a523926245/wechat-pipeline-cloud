@@ -59,17 +59,31 @@ plansRouter.post(
 
     const result = await runPipelineForAccount(body.accountId, body.pipeline ?? 'article', body.count);
 
+    // 结果语义（S5-UI-5-P1）：ok 只看真实创建的文章，不把失败/跳过算成功。
+    const succeeded = result.created.length;
+    const failed = result.failed.length;
+    const skipped = result.skipped;
+    let message: string;
+    if (succeeded > 0 && failed === 0) {
+      message = `已为「${result.account}」生成 ${succeeded} 篇草稿`;
+    } else if (succeeded > 0 && failed > 0) {
+      message = `已为「${result.account}」生成 ${succeeded} 篇草稿，${failed} 篇失败`;
+    } else if (failed > 0) {
+      message = `本批 ${failed} 篇建稿失败，未生成草稿：${result.failed.map((f) => f.note).join('；').slice(0, 200)}`;
+    } else {
+      // 无成功、无失败：全部跳过（配额满 / 无可消费选题），用后端给出的真实原因。
+      message = result.reason ?? '本批未生成草稿（无可排产选题）';
+    }
     res.status(200).json({
-      ok: result.created.length > 0,
+      ok: succeeded > 0,
       accountId: result.accountId,
       account: result.account,
       need: result.need,
       created: result.created,
+      failed: result.failed,
+      skipped,
       reason: result.reason ?? null,
-      message:
-        result.created.length > 0
-          ? `已为「${result.account}」生成 ${result.created.length} 篇草稿`
-          : result.reason ?? '未生成',
+      message,
     });
   }),
 );

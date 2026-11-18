@@ -287,13 +287,23 @@ articlesRouter.post(
 );
 
 /**
- * 列表：供前端文章页使用。支持 status / accountId / angleId / pipeline 过滤与分页。
+ * 列表：供前端文章页使用。支持 status / needs / accountId / angleId / pipeline 过滤与分页。
  * 默认按创建时间倒序，返回精简字段（不含正文，避免列表响应过大）。
+ *
+ * `needs`（S5-UI-2-D-2）：工作台待办的专项筛选，只认 `draft_unpushed` / `repush`，
+ * 非法值按未传处理（不 400，与 pipeline 的处理风格一致）。
+ *   - 与 `status` **互斥**：同传时 needs 优先，status 被忽略（两套条件叠起来只会互相打架）。
+ *   - 隐含 `pipeline='article'`：漫画草稿不属于这两类待办，天然排除。
+ *   - 可与 accountId / angleId / limit / offset 叠加；member 归属过滤照常生效。
+ *   - items 与 total 共用同一个 where，禁止任何一侧另算。
  */
 articlesRouter.get(
   '/',
   asyncHandler(async (req, res) => {
     const status = typeof req.query.status === 'string' && req.query.status ? req.query.status : undefined;
+    const needsRaw = typeof req.query.needs === 'string' ? req.query.needs : '';
+    const needs: 'draft_unpushed' | 'repush' | undefined =
+      needsRaw === 'draft_unpushed' || needsRaw === 'repush' ? needsRaw : undefined;
     const accountId = req.query.accountId ? Number(req.query.accountId) : undefined;
     const angleId = req.query.angleId ? Number(req.query.angleId) : undefined;
     // 产线过滤：'article' | 'comic'；不传则不过滤（兼容旧前端）
@@ -308,10 +318,33 @@ articlesRouter.get(
 
     const principal = requirePrincipal(req);
     const where: Record<string, unknown> = {};
-    if (status) where.status = status;
+    if (needs) {
+      // needs 优先：与 status / pipeline 同传时以 needs 为准（pipeline 由 needs 固定为 article）
+      where.pipeline = 'article';
+      if (needs === 'draft_unpushed') {
+        // 从未推送过：状态是草稿，且两个推送事实字段都为空。
+        // 只判 ''（不用 TRIM / Raw SQL）：写入侧只产生 '' 或真实值，幻影空白属人工改库，
+        // 由 smoke 的空白监测兜底（见 scripts/smoke-dashboard.ts 的 [10] 段）。
+        where.status = 'draft';
+        where.mediaId = '';
+        where.pushDate = '';
+      } else {
+        // 待重推：已改写等推送（updated），或草稿态但曾有推送痕迹（如换封面被退回 draft）。
+        // 后者必须用 OR 表达「两个字段任一非空」，且与 status='draft' 是 AND 关系。
+        where.OR = [
+          { status: 'updated' },
+          {
+            status: 'draft',
+            OR: [{ mediaId: { not: '' } }, { pushDate: { not: '' } }],
+          },
+        ];
+      }
+    } else {
+      if (status) where.status = status;
+      if (pipeline) where.pipeline = pipeline;
+    }
     if (accountId && Number.isFinite(accountId)) where.accountId = accountId;
     if (angleId && Number.isFinite(angleId)) where.angleId = angleId;
-    if (pipeline) where.pipeline = pipeline;
     // P3 归属过滤：member 只见自己账号名下的文章
     if (!isAdmin(principal)) where.account = { ownerUserId: principal.userId ?? -1 };
 
@@ -357,6 +390,8 @@ articlesRouter.get(
         blocks: r.blocks,
         mediaId: r.mediaId,
         pushDate: r.pushDate,
+        // 产线标识（S5-UI-3-3 · A）：select 已含该字段，列表据此区分文章/漫画。
+        pipeline: r.pipeline,
         createdAt: r.createdAt.toISOString(),
       })),
     });

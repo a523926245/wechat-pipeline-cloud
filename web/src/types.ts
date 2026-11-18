@@ -406,6 +406,14 @@ export interface ReviseApplyResult {
   title: string;
   digest: string;
   contentWechat: string;
+  /** 改写后对**最终正文**的成稿体检结果；体检本身出错时为 null（正文仍已保存）。 */
+  lint?: ArticleLint | null;
+  /** 体检留痕（S4-3）；落库失败为 null 且带 lintPersistError。 */
+  lintRun?: ArticleLintRun | null;
+  /** 体检结果未能存档的原因（显式暴露，不伪装成已留存）。 */
+  lintPersistError?: string;
+  /** 面向使用者的一句话结论（含体检是否有问题）。 */
+  message?: string;
 }
 
 // ── 封面生图 ──
@@ -469,7 +477,12 @@ export interface TriggerResult {
   accountId: number;
   account: string;
   need: number;
+  /** 只含真实创建成功的文章（id>0）；失败项在 failed，不再混入这里。 */
   created: { id: number; title?: string; angleId?: number | null; modelUsed?: string | null; note?: string | null }[];
+  /** 本批失败项（无文章 id），仅用于反馈；兼容旧响应缺省为 []。 */
+  failed?: { title?: string; angleId?: number | null; note?: string | null }[];
+  /** 本批跳过条数；兼容旧响应缺省为 0。 */
+  skipped?: number;
   reason?: string | null;
   message: string;
 }
@@ -495,6 +508,15 @@ export interface MyAutomation {
   writeTime: string;
 }
 
+/** 推送意图：本次排产到底会不会推到公众号草稿箱。
+ *  真源在后端（按每账号 owner 的 automationMode 聚合），前端只消费、不自行推断。 */
+export type PushIntentStatus = 'none' | 'partial' | 'all' | 'unknown';
+
+export interface PushIntent {
+  /** none=不会推 / partial=部分账号会推 / all=全部就绪账号都会推 / unknown=无就绪账号，无法判断 */
+  status: PushIntentStatus;
+}
+
 export interface SchedulerStatus {
   running: boolean;
   intervalMs: number;
@@ -502,6 +524,8 @@ export interface SchedulerStatus {
   my: MyAutomation;
   modeOptions?: Array<{ value: AutomationMode; label: string }>;
   lastTick: TickResult | null;
+  /** 推送意图（服务端真源）。缺省=旧后端，前端不显示横幅而不是猜一个结论。 */
+  pushIntent?: PushIntent;
 }
 
 export interface TickWritten {
@@ -606,6 +630,110 @@ export interface DashboardData {
     createdAt: string;
   }>;
   warnings: string[];
+  degraded: string[];
+  /**
+   * 待办队列（S5-UI-2）。后端总是返回该字段；声明为可选只是为了让
+   * 「前端已更新、后端还没上」的过渡期不炸——缺失时不渲染待办卡，不伪造数字。
+   */
+  todos?: TodoBlock;
+}
+
+/**
+ * 工作台待办（S5-UI-2）。
+ *
+ * 口径约定（与 server/src/services/dashboard.ts 一一对应）：
+ *   - 数字类型是 `number | null`：0 = 查询成功且确实没有；null = 该块查询失败，
+ *     UI 必须显示「统计暂不可用」，**不得显示成 0**。
+ *   - `angles` 为 null 有两种语义：member 权限（正常）或 admin 的该块查询失败（降级）。
+ *     区分方式：看 `degraded` 里是否含 'angles'。
+ */
+export type TodoScope = 'all' | 'own';
+
+export interface TodoAngleItem {
+  id: number;
+  trackId: number;
+  track: string;
+  status: string;
+  theme: string;
+  content: string;
+  /** 六维总分（未评分为 null，不视为高质量）。 */
+  scoreTotal: number | null;
+  updatedAt: string;
+}
+
+export interface TodoAnglesBlock {
+  total: number | null;
+  candidate: number | null;
+  needsRevision: number | null;
+  /** 等最久的候选等了几天（按 updatedAt 算）。 */
+  oldestWaitingDays: number | null;
+  byTrack: Array<{ trackId: number; track: string; candidate: number; needsRevision: number }>;
+  recent: TodoAngleItem[];
+}
+
+export type TodoArticleReason = 'draft_unpushed' | 'repush' | 'push_failed';
+
+export interface TodoArticleItem {
+  id: number;
+  title: string;
+  status: string;
+  pipeline: string;
+  account: string | null;
+  reason: TodoArticleReason;
+  updatedAt: string;
+}
+
+export interface TodoArticlesBlock {
+  draftUnpushed: number | null;
+  repush: number | null;
+  pushFailed: number | null;
+  /** 漫画待推草稿：独立口径，不与上面三项相加。 */
+  comicDraft: number | null;
+  oldestDraftDays: number | null;
+  recent: TodoArticleItem[];
+}
+
+export interface TodoLintItem {
+  articleId: number;
+  title: string;
+  trigger: string;
+  errorCount: number;
+  warnCount: number;
+  checkedAt: string;
+  stale: boolean;
+}
+
+export interface TodoLintBlock {
+  /** 最新一次体检不通过、且记录与当前正文一致的篇数。 */
+  failed: number | null;
+  recent: TodoLintItem[];
+}
+
+export interface TodoRunItem {
+  id: number;
+  jobType: string;
+  accountId: number | null;
+  account: string | null;
+  articleId: number | null;
+  errorCode: string;
+  errorMessage: string;
+  createdAt: string;
+}
+
+export interface TodoRunsBlock {
+  windowDays: number;
+  /** 窗口内「同键最新一条仍失败」的次数（write/comic_script 是批次，按「次」不看「篇」）。 */
+  unresolved: number | null;
+  recent: TodoRunItem[];
+}
+
+export interface TodoBlock {
+  scope: TodoScope;
+  angles: TodoAnglesBlock | null;
+  articles: TodoArticlesBlock;
+  lint: TodoLintBlock;
+  runs: TodoRunsBlock;
+  /** 查询失败的块名（angles / articles / lint / runs）。权限限制不会出现在这里。 */
   degraded: string[];
 }
 
@@ -751,8 +879,8 @@ export interface ArticleRenderResult {
 /** 单次成稿体检记录：一次检查一行，历史保留（S4-3 落库）。 */
 export interface ArticleLintRun {
   id: number;
-  /** check=改稿页手动重新检查 / save=保存正文 / push=推送门禁 */
-  trigger: 'check' | 'save' | 'push';
+  /** check=改稿页手动重新检查 / save=保存正文 / push=推送门禁 / revise=AI 改写后自动复检 */
+  trigger: 'check' | 'save' | 'push' | 'revise';
   ok: boolean;
   errorCount: number;
   warnCount: number;
@@ -789,6 +917,11 @@ export interface ArticleLintIssue {
   level: 'error' | 'warn';
   code: string;
   message: string;
+  /**
+   * 命中片段（后端能精确定位时给出，最多 3 条；带上下文的字符串）。
+   * 可选：很多规则（sections/chars/ending_hook 等）没有 hits。
+   */
+  hits?: string[];
 }
 
 export interface PushResult {
@@ -800,6 +933,8 @@ export interface PushResult {
   errcode?: number | null;
   detail?: unknown;
   reason?: string;
+  /** 本次操作前是否已有推送痕迹（mediaId/pushDate 任一非空）——用于区分「首次推送失败」与「曾经推送过、后续失败」。 */
+  everPushed?: boolean;
   /** 被体检门禁拦下时带上完整报告。 */
   lint?: ArticleLint | null;
   /** 本次推送门禁体检的落库记录（S4-3）。 */

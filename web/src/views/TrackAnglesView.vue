@@ -25,7 +25,7 @@ import {
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import type { FormInstance, FormRules } from "element-plus";
-import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import { errMsg } from "../api/http.ts";
@@ -45,7 +45,10 @@ import {
   updateAngle,
 } from "../api/index.ts";
 import BatchBar from "../components/BatchBar.vue";
+import EmptyState from "../components/EmptyState.vue";
+import PageHead from "../components/PageHead.vue";
 import StateError from "../components/StateError.vue";
+import StatusTag from "../components/StatusTag.vue";
 import RowActions, { type RowAction } from "../components/RowActions.vue";
 import { useBatchDelete } from "../composables/useBatchDelete.ts";
 import type {
@@ -57,7 +60,7 @@ import type {
   AngleUsedFilter,
   TopicReviewRecord,
 } from "../types.ts";
-import { angleScopeText } from "../utils/format.ts";
+import { angleScopeText, angleStatusText } from "../utils/format.ts";
 
 /** 用途选项：与后端 Angle.scope 一一对应，文案由 /api/pipelines 下发（有兜底）。 */
 const SCOPE_OPTIONS: AngleScopeFilter[] = ["article", "comic", "shared"];
@@ -216,11 +219,24 @@ async function reassignOffIp() {
   }
 }
 
+/**
+ * 窄屏紧凑模式（S5-UI-4-1-B）：≤1100px 时移除低优先级列，把「审核 / 评分」固定到左侧，
+ * 让标题、审核态、总评分与操作在窄屏第一屏可见。与 S5-UI-3-3 文章工作台同一套做法，
+ * 只在本地 table 生效，不改全局 CSS、不碰业务数据。
+ */
+const narrow = ref(false);
+function syncNarrow() {
+  narrow.value = window.matchMedia("(max-width: 1100px)").matches;
+}
+
 onMounted(() => {
+  syncNarrow();
+  window.addEventListener("resize", syncNarrow);
   void loadTrackName();
   void load();
   void loadOffIpCount();
 });
+onUnmounted(() => window.removeEventListener("resize", syncNarrow));
 watch([used, keyword, scope, status, sort, page, trackId], load);
 
 function setQuery(patch: Record<string, string | number | undefined>) {
@@ -603,17 +619,10 @@ async function rescore(row: AngleItem) {
   }
 }
 
-function statusText(s: AngleStatus): string {
-  return (
-    { candidate: "候选待审", needs_revision: "待修改", approved: "已通过", rejected: "已拒绝" } as const
-  )[s];
-}
-
-function statusTagType(s: AngleStatus): "info" | "warning" | "success" | "danger" {
-  return (
-    { candidate: "info", needs_revision: "warning", approved: "success", rejected: "danger" } as const
-  )[s];
-}
+/**
+ * 状态词表已上收到 utils/format.ts 的 statusMeta（S5-UI-1）。
+ * 这里不再保留本地 statusText / statusTagType 副本——两份词表迟早会分叉。
+ */
 
 /** 六维标签（与后端 SCORE_DIMENSION_LABELS 同源文案）。 */
 const SCORE_LABELS: Array<{ key: string; label: string }> = [
@@ -697,9 +706,7 @@ async function openReviewRecords(row: AngleItem) {
   }
 }
 
-function reviewVerdictText(v: AngleReviewVerdict): string {
-  return v === "approved" ? "通过" : v === "rejected" ? "拒绝" : "要求修改";
-}
+/** 审核结论文案同样来自 utils/format.ts（StatusTag kind="verdict"），此处不再复制。 */
 
 function angleActions(row: AngleItem): RowAction[] {
   const actions: RowAction[] = [{ command: "edit", label: "编辑", icon: Edit }];
@@ -811,15 +818,11 @@ function onAngleCommand(cmd: string, row: AngleItem) {
 
 <template>
   <div class="wb-page">
-    <header class="wb-page-head">
-      <div>
-        <h2>选题库</h2>
-        <p class="wb-page-desc">
-          {{ trackName ? `赛道「${trackName}」` : "赛道" }} · 共
-          {{ total }} 条{{ scope === "all" ? "" : angleScopeText(scope) }}选题
-        </p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead
+      title="选题库"
+      :desc="`${trackName ? `赛道「${trackName}」` : '赛道'} · 共 ${total} 条${scope === 'all' ? '' : angleScopeText(scope)}选题`"
+    >
+      <template #actions>
         <el-button :icon="Refresh" @click="load">刷新</el-button>
         <el-button :icon="MagicStick" @click="openExpand"
           >AI 扩充选题</el-button
@@ -828,8 +831,8 @@ function onAngleCommand(cmd: string, row: AngleItem) {
         <el-button type="primary" :icon="Plus" @click="openCreate"
           >新增选题</el-button
         >
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <!-- 漫画选题体检：一眼看出有多少条画不出来，并给一键处置 -->
     <el-alert
@@ -896,7 +899,7 @@ function onAngleCommand(cmd: string, row: AngleItem) {
             <el-option
               v-for="s in STATUS_OPTIONS"
               :key="s"
-              :label="statusText(s)"
+              :label="angleStatusText(s)"
               :value="s"
             />
           </el-select>
@@ -959,9 +962,9 @@ function onAngleCommand(cmd: string, row: AngleItem) {
       >
         <!-- reserve-selection：翻页后仍保留勾选（配合 row-key），
              这样可以「第 1 页勾 5 条 → 第 3 页再勾 5 条 → 一次删 10 条」 -->
-        <el-table-column type="selection" width="46" reserve-selection />
-        <el-table-column prop="id" label="ID" width="62" />
-        <el-table-column label="主题" width="110" show-overflow-tooltip>
+        <el-table-column type="selection" width="46" reserve-selection :fixed="narrow ? 'left' : false" />
+        <el-table-column v-if="!narrow" prop="id" label="ID" width="62" />
+        <el-table-column v-if="!narrow" label="主题" width="110" show-overflow-tooltip>
           <template #default="{ row }">
             <span :class="{ 'wb-muted': !row.theme }">{{
               row.theme || "—"
@@ -971,11 +974,11 @@ function onAngleCommand(cmd: string, row: AngleItem) {
         <el-table-column
           prop="content"
           label="选题内容"
-          min-width="300"
+          :min-width="narrow ? 140 : 300"
           show-overflow-tooltip
         />
         <!-- 用途决定这条选题归哪条产线：漫画线只吃「漫画专用/共享」 -->
-        <el-table-column label="用途" width="200">
+        <el-table-column v-if="!narrow" label="用途" width="200">
           <template #default="{ row }">
             <el-tag
               :type="scopeTagType(row.scope)"
@@ -997,11 +1000,13 @@ function onAngleCommand(cmd: string, row: AngleItem) {
           </template>
         </el-table-column>
         <!-- 审核态（S4-1）：candidate/needs_revision/approved/rejected，与消费态（已用/未用）是两个维度 -->
-        <el-table-column label="审核" width="150">
+        <el-table-column
+          label="审核"
+          :width="narrow ? 96 : 150"
+          :fixed="narrow ? 'left' : false"
+        >
           <template #default="{ row }">
-            <el-tag :type="statusTagType(row.status)" size="small">
-              {{ statusText(row.status) }}
-            </el-tag>
+            <StatusTag kind="angle" :value="row.status" />
             <span
               v-if="row.reviewRound > 0"
               class="wb-muted review-round"
@@ -1041,7 +1046,11 @@ function onAngleCommand(cmd: string, row: AngleItem) {
           </template>
         </el-table-column>
         <!-- 六维评分（0-5/维，总分=等权合计 0-30）：只做排序与人工参考，无阈值、不自动批准 -->
-        <el-table-column label="评分" width="96">
+        <el-table-column
+          label="评分"
+          :width="narrow ? 72 : 96"
+          :fixed="narrow ? 'left' : false"
+        >
           <template #default="{ row }">
             <el-popover v-if="row.scores" placement="left" :width="230" trigger="hover">
               <template #reference>
@@ -1072,18 +1081,16 @@ function onAngleCommand(cmd: string, row: AngleItem) {
             >
           </template>
         </el-table-column>
-        <el-table-column label="状态" min-width="180" show-overflow-tooltip>
+        <el-table-column v-if="!narrow" label="状态" min-width="180" show-overflow-tooltip>
           <template #default="{ row }">
-            <el-tag :type="row.used ? 'info' : 'success'" size="small">
-              {{ row.used ? "已用" : "未用" }}
-            </el-tag>
+            <StatusTag kind="usage" :value="row.used ? 'used' : 'unused'" />
             <span v-if="row.used" class="wb-muted used-by">
               {{ row.usedBy || "未知"
               }}<template v-if="row.usedDate"> · {{ row.usedDate }}</template>
             </span>
           </template>
         </el-table-column>
-        <el-table-column label="关联文章" width="88">
+        <el-table-column v-if="!narrow" label="关联文章" width="88">
           <template #default="{ row }">
             <!-- 有关联才可点：跳到文章页按该选题过滤 -->
             <el-link
@@ -1099,6 +1106,7 @@ function onAngleCommand(cmd: string, row: AngleItem) {
           </template>
         </el-table-column>
         <el-table-column
+          v-if="!narrow"
           label="来源"
           width="110"
           class-name="col-optional"
@@ -1121,13 +1129,14 @@ function onAngleCommand(cmd: string, row: AngleItem) {
         </el-table-column>
       </el-table>
 
-      <el-empty
+      <EmptyState
         v-else
         :description="
           filtered
             ? '当前筛选没有匹配的选题'
             : '这个赛道还没有选题，可点「新增选题」手动添加'
         "
+        :hint="filtered ? '换个筛选条件，或点「重置筛选」看全部选题' : undefined"
         :image-size="60"
       >
         <!-- 空态给出路：没选题给「新增」，筛不出来给「重置筛选」 -->
@@ -1150,7 +1159,7 @@ function onAngleCommand(cmd: string, row: AngleItem) {
             >新增选题</el-button
           >
         </template>
-      </el-empty>
+      </EmptyState>
 
       <div v-if="total > PAGE_SIZE" class="wb-pager">
         <el-pagination
@@ -1292,7 +1301,7 @@ function onAngleCommand(cmd: string, row: AngleItem) {
         <p class="wb-muted review-head">
           {{ reviewDialog.content }}
         </p>
-        <el-empty
+        <EmptyState
           v-if="!reviewDialog.loading && reviewDialog.items.length === 0"
           description="还没有审核记录"
           :image-size="48"
@@ -1303,9 +1312,7 @@ function onAngleCommand(cmd: string, row: AngleItem) {
           class="review-row"
         >
           <div class="review-row-head">
-            <el-tag :type="statusTagType(r.verdict)" size="small">
-              {{ reviewVerdictText(r.verdict) }}
-            </el-tag>
+            <StatusTag kind="verdict" :value="r.verdict" />
             <span class="wb-muted"
               >第 {{ r.round }} 轮 · {{ r.createdAt.slice(0, 19).replace("T", " ")
               }}<template v-if="r.reviewedBy"> · {{ r.reviewedBy }}</template></span

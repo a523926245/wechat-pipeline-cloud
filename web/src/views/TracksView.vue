@@ -3,7 +3,7 @@ import { Delete, Edit, Files, InfoFilled, MagicStick, Plus, Refresh, Setting } f
 import { ElMessage, ElMessageBox } from 'element-plus';
 import type { FormInstance, FormRules } from 'element-plus';
 import { computed, nextTick, onMounted, reactive, ref } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 
 import { errMsg } from '../api/http.ts';
 import {
@@ -17,18 +17,43 @@ import {
   getPipelines,
 } from '../api/index.ts';
 import BatchBar from '../components/BatchBar.vue';
+import EmptyState from '../components/EmptyState.vue';
+import PageHead from '../components/PageHead.vue';
+import SaveBar from '../components/SaveBar.vue';
 import StateError from '../components/StateError.vue';
+import StatusTag from '../components/StatusTag.vue';
 import RowActions, { type RowAction } from '../components/RowActions.vue';
 import { useBatchDelete } from '../composables/useBatchDelete.ts';
-import { pipelineDesc, pipelineTagType, pipelineText } from '../utils/format.ts';
+import { pipelineDesc, pipelineText } from '../utils/format.ts';
+import { parsePendingTrackIds } from '../utils/todo-nav.ts';
 import type { AngleScopeFilter, TrackItem } from '../types.ts';
 
 const router = useRouter();
+const route = useRoute();
 
 const items = ref<TrackItem[]>([]);
 const loading = ref(false);
 const error = ref('');
 const busyId = ref<number | null>(null);
+
+/* ── 工作台待办承接：`?pending=3,5` ──
+   参数只由工作台按真实待审计数生成；手工改动/写错的 id 会被解析层丢弃，
+   最坏结果只是少一个标记，不会把页面弄坏。刷新（URL 还在）时提示仍在。 */
+const pendingIds = computed<number[]>(() => parsePendingTrackIds(route.query.pending));
+const pendingSet = computed(() => new Set(pendingIds.value));
+/** 只标记**当前列表里真实存在**的赛道——参数里不存在的 id 视为过期，静默忽略。 */
+const pendingTracks = computed(() => items.value.filter((t) => pendingSet.value.has(t.id)));
+
+function isPendingTrack(row: TrackItem): boolean {
+  return pendingSet.value.has(row.id);
+}
+
+/** 用户移除提示 = 去掉 URL 参数，回到普通赛道列表（其余参数原样保留）。 */
+function clearPending() {
+  const query = { ...route.query };
+  delete query.pending;
+  void router.replace({ path: '/tracks', query });
+}
 
 async function load() {
   loading.value = true;
@@ -400,19 +425,15 @@ function onTrackCommand(cmd: string, row: TrackItem) {
 
 <template>
   <div class="wb-page" v-loading="loading" element-loading-text="正在加载赛道…">
-    <header class="wb-page-head">
-      <div>
-        <h2>赛道管理</h2>
-        <p class="wb-page-desc">
-          共 {{ items.length }} 个赛道 · 选题 {{ unusedAngles }}/{{ totalAngles }} 条可用 ·
-          点左侧箭头展开「产线」（配额 / 开关 / 可用选题 / 扩题）
-        </p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead
+      title="赛道管理"
+      :desc="`共 ${items.length} 个赛道 · 选题 ${unusedAngles}/${totalAngles} 条可用 · 点左侧箭头展开「产线」（配额 / 开关 / 可用选题 / 扩题）`"
+    >
+      <template #actions>
         <el-button :icon="Refresh" @click="load">刷新</el-button>
         <el-button type="primary" :icon="Plus" @click="openCreate">新增赛道</el-button>
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="error" :message="error" @retry="load" />
 
@@ -422,6 +443,23 @@ function onTrackCommand(cmd: string, row: TrackItem) {
       :closable="false"
       title="赛道决定账号用哪个选题池：同赛道多账号共享一套选题。新建的赛道角度池是空的，需先「扩充选题」才能开始创作。"
     />
+
+    <!-- 工作台「去审核」多赛道落点：点明是哪几个赛道在等审核，而不是让人逐个点进去找 -->
+    <el-alert
+      v-if="pendingTracks.length"
+      type="info"
+      show-icon
+      :closable="false"
+      class="pending-alert"
+      :title="`从工作台待办进入：${pendingTracks.length} 个赛道有选题等待审核`"
+    >
+      <div class="pending-alert__body">
+        <span class="wb-secondary">
+          {{ pendingTracks.map((t) => t.name).join('、') }} —— 点该行「选题池」进入后，用「审核」下拉筛选候选 / 待修改。
+        </span>
+        <el-button link type="primary" @click="clearPending">只看全部赛道</el-button>
+      </div>
+    </el-alert>
 
     <el-card shadow="never">
       <!-- 批量操作条：有勾选时才出现 -->
@@ -448,23 +486,20 @@ function onTrackCommand(cmd: string, row: TrackItem) {
           <template #default="{ row }">
             <div class="pipeline-panel">
               <div class="pipeline-head">
-                <span class="wb-muted">
-                  产线：配额与开关各自独立，可用选题按切片统计（不是赛道总数）
-                </span>
-                <div class="pipeline-head-actions">
-                  <el-tag v-if="isPipelineDirty(row.id)" type="warning" size="small">
-                    有未保存改动
-                  </el-tag>
-                  <el-button
-                    size="small"
-                    type="primary"
-                    :loading="savingPipelineId === row.id"
-                    :disabled="!isPipelineDirty(row.id)"
-                    @click="savePipelines(row)"
-                  >
-                    保存产线
-                  </el-button>
-                </div>
+                <!-- 产线面板的保存状态与动作统一走 SaveBar：dirty 时可用，saving 时防重复提交 -->
+                <SaveBar
+                  class="pipeline-savebar"
+                  :state="
+                    savingPipelineId === row.id
+                      ? 'saving'
+                      : isPipelineDirty(row.id)
+                        ? 'dirty'
+                        : 'clean'
+                  "
+                  hint="产线：配额与开关各自独立，可用选题按切片统计（不是赛道总数）"
+                  save-label="保存产线"
+                  @save="savePipelines(row)"
+                />
               </div>
 
               <el-table
@@ -475,9 +510,7 @@ function onTrackCommand(cmd: string, row: TrackItem) {
               >
                 <el-table-column label="产线" width="110">
                   <template #default="{ row: p }">
-                    <el-tag :type="pipelineTagType(p.kind)" size="small">
-                      {{ pipelineText(p.kind) }}
-                    </el-tag>
+                    <StatusTag kind="pipeline" :value="p.kind" />
                   </template>
                 </el-table-column>
                 <el-table-column label="配额/天" width="150">
@@ -527,7 +560,7 @@ function onTrackCommand(cmd: string, row: TrackItem) {
                   </template>
                 </el-table-column>
               </el-table>
-              <el-empty v-else description="该赛道暂无产线配置" :image-size="48" />
+              <EmptyState v-else description="该赛道暂无产线配置" :image-size="48" />
 
               <!-- 开了产线却没有它能吃的选题，是「排产报角度不足」的第一原因，就地给出路 -->
               <el-alert
@@ -555,7 +588,18 @@ function onTrackCommand(cmd: string, row: TrackItem) {
         <!-- 有账号的赛道不可勾选：删不掉（单条删除也是 409），勾了只会白等一次失败 -->
         <el-table-column type="selection" width="46" reserve-selection :selectable="canSelectTrack" />
         <el-table-column prop="id" label="ID" width="62" />
-        <el-table-column prop="name" label="赛道" min-width="180" show-overflow-tooltip />
+        <el-table-column prop="name" label="赛道" min-width="180" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span>{{ row.name }}</span>
+            <el-tooltip
+              v-if="isPendingTrack(row)"
+              placement="top"
+              content="该赛道有候选 / 待修改选题等待人工审核（来自工作台待办）"
+            >
+              <el-tag type="warning" effect="plain" size="small" class="pending-tag">待审核</el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column
           prop="slug"
           label="标识"
@@ -638,9 +682,9 @@ function onTrackCommand(cmd: string, row: TrackItem) {
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty description="还没有赛道，新增一个开始创作">
+          <EmptyState description="还没有赛道，新增一个开始创作">
             <el-button type="primary" :icon="Plus" size="small" @click="openCreate">新增赛道</el-button>
-          </el-empty>
+          </EmptyState>
         </template>
       </el-table>
     </el-card>
@@ -753,17 +797,15 @@ function onTrackCommand(cmd: string, row: TrackItem) {
 .pipeline-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: var(--wb-space-3);
   flex-wrap: wrap;
   margin-bottom: var(--wb-space-2);
-  font-size: 12px;
+  font-size: var(--wb-fs-aux);
 }
 
-.pipeline-head-actions {
-  display: flex;
-  align-items: center;
-  gap: var(--wb-space-2);
+/* SaveBar 自带 flex 排布，撑满整行即可（原右侧动作容器已并入组件） */
+.pipeline-savebar {
+  flex: 1;
 }
 
 .pipeline-table {
@@ -778,6 +820,32 @@ function onTrackCommand(cmd: string, row: TrackItem) {
 
 .pipeline-alert {
   margin-top: var(--wb-space-3);
+}
+
+/* 待审核提示：信息色 + 行内小标签，克制、不抢赛道本身的视觉重心 */
+.pending-alert {
+  margin-top: var(--wb-space-3);
+}
+
+.pending-alert__body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--wb-space-2);
+  flex-wrap: wrap;
+}
+
+.pending-tag {
+  margin-left: var(--wb-space-2);
+  vertical-align: middle;
+}
+
+/* 窄屏表格本来就要挤（列宽合计 > 视口），半个标签比没有更糟；
+   那种宽度下以顶部提示条为准，它同样列出了赛道名。 */
+@media (max-width: 1024px) {
+  .pending-tag {
+    display: none;
+  }
 }
 
 .pipeline-tags {

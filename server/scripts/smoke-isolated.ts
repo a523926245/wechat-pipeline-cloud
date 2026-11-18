@@ -19,7 +19,7 @@
  *      非 OS 级全网络隔离，报告如实标注。
  *
  * 用法：
- *   node --experimental-strip-types scripts/smoke-isolated.ts run <lint|style|angles|bulk>
+ *   node --experimental-strip-types scripts/smoke-isolated.ts run <lint|style|angles|bulk|push|dashboard>
  *   node --experimental-strip-types scripts/smoke-isolated.ts verify   （10 项验收台）
  *   node --experimental-strip-types scripts/smoke-isolated.ts fp       （只读：打印业务库指纹，
  *                                                                    与 verify ⑦ 同一函数/同一表集合）
@@ -883,7 +883,7 @@ async function main(): Promise<number> {
   if (cmd === 'verify') return verify();
   if (cmd === 'fp') return printFingerprint();
   if (cmd !== 'run') {
-    console.error('用法：smoke-isolated.ts run <lint|style|angles|bulk> | verify | fp');
+    console.error('用法：smoke-isolated.ts run <lint|style|angles|bulk|push|dashboard> | verify | fp');
     return 2;
   }
 

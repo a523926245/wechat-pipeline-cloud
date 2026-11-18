@@ -16,11 +16,13 @@ import {
   updateCredential,
 } from '../api/index.ts';
 import BatchBar from '../components/BatchBar.vue';
+import EmptyState from '../components/EmptyState.vue';
+import PageHead from '../components/PageHead.vue';
 import StateError from '../components/StateError.vue';
 import RowActions, { type RowAction } from '../components/RowActions.vue';
 import { useBatchDelete } from '../composables/useBatchDelete.ts';
 import type { CredentialItem, TrackItem } from '../types.ts';
-import { credTag, credText } from '../utils/format.ts';
+import { credHint, credTag, credText } from '../utils/format.ts';
 
 const items = ref<CredentialItem[]>([]);
 const loading = ref(false);
@@ -70,7 +72,7 @@ const rows = computed(() => {
   );
 });
 
-const readyCount = computed(() => items.value.filter((i) => i.credStatus === 'ok').length);
+const credOkCount = computed(() => items.value.filter((i) => i.credStatus === 'ok').length);
 
 function trackName(trackId: number): string {
   return tracks.value.find((t) => t.id === trackId)?.name ?? `#${trackId}`;
@@ -327,14 +329,11 @@ function onAccountCommand(cmd: string, row: CredentialItem) {
 
 <template>
   <div class="wb-page" v-loading="loading" element-loading-text="正在加载账号…">
-    <header class="wb-page-head">
-      <div>
-        <h2>账号管理</h2>
-        <p class="wb-page-desc">
-          共 {{ items.length }} 个公众号账号 · 就绪 {{ readyCount }} 个 · Secret 只显示掩码
-        </p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead
+      title="账号管理"
+      :desc="`共 ${items.length} 个公众号账号 · 凭据格式合规 ${credOkCount} 个（不代表接口已验证） · Secret 只显示掩码`"
+    >
+      <template #actions>
         <el-input
           v-model="keyword"
           :prefix-icon="Search"
@@ -345,8 +344,8 @@ function onAccountCommand(cmd: string, row: CredentialItem) {
         />
         <el-button :icon="Refresh" @click="load">刷新</el-button>
         <el-button type="primary" :icon="Plus" @click="openCreate">新增账号</el-button>
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="error" :message="error" @retry="load" />
 
@@ -409,7 +408,9 @@ function onAccountCommand(cmd: string, row: CredentialItem) {
         />
         <el-table-column label="状态" width="96">
           <template #default="{ row }">
-            <el-tag :type="credTag(row.credStatus)" size="small">{{ credText(row.credStatus) }}</el-tag>
+            <el-tooltip :content="credHint(row.credStatus)" placement="top">
+              <el-tag :type="credTag(row.credStatus)" size="small">{{ credText(row.credStatus) }}</el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="启用" width="72">
@@ -428,11 +429,14 @@ function onAccountCommand(cmd: string, row: CredentialItem) {
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty :description="keyword ? '没有匹配的账号' : '还没有账号，新增一个开始创作'">
+          <EmptyState
+            :description="keyword ? '没有匹配的账号' : '还没有账号，新增一个开始创作'"
+            :hint="keyword ? '清空搜索框可看全部账号' : undefined"
+          >
             <el-button v-if="!keyword" type="primary" :icon="Plus" size="small" @click="openCreate">
               新增账号
             </el-button>
-          </el-empty>
+          </EmptyState>
         </template>
       </el-table>
     </el-card>

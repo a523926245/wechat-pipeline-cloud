@@ -262,6 +262,8 @@ export const getSystemStatus = () => http.get<SystemStatus>('/dashboard/status')
 // ── 文章 ──
 export const listArticles = (params?: {
   status?: string;
+  /** 待办专项筛选（S5-UI-2-D-2）：服务端精确下推，total 与集合同源。 */
+  needs?: 'draft_unpushed' | 'repush';
   accountId?: number;
   angleId?: number;
   /** 产线过滤（article / comic）。 */

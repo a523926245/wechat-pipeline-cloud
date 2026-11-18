@@ -11,6 +11,7 @@ import {
   MagicStick,
   Memo,
   Moon,
+  Odometer,
   Operation,
   Refresh,
   Setting,
@@ -39,6 +40,8 @@ const health = ref<Health | null>(null);
 const healthErr = ref('');
 const collapsed = ref(false);
 const status = ref<SystemStatus | null>(null);
+/** 系统状态浮层开关：由右上角「系统状态」按钮触发（替代侧栏底部常驻块） */
+const statusOpen = ref(false);
 // 登录态：模块级单例（useAuth），LoginView 登录成功后刷新 → 菜单/顶栏即时更新，无需手动刷新页面
 const { loadAuth, userRole, userName } = useAuth();
 
@@ -62,43 +65,52 @@ interface MenuGroup {
   items: MenuItem[];
 }
 
-const menuGroups = computed<MenuGroup[]>(() => {
-  const groups: MenuGroup[] = [
-    {
-      key: 'create',
-      label: '创作',
-      icon: Edit,
-      items: [
-        { path: '/plan', label: '创作计划', icon: List, roles: ['admin', 'member'] },
-        { path: '/articles', label: '文章', icon: Document, roles: ['admin', 'member', 'guest'] },
-      ],
-    },
-    {
-      key: 'ops',
-      label: '运营',
-      icon: Operation,
-      items: [
-        { path: '/scheduler', label: '自动调度', icon: Timer, roles: ['admin', 'member'] },
-        { path: '/accounts', label: '账号管理', icon: User, roles: ['admin', 'member'] },
-      ],
-    },
-    {
-      key: 'system',
-      label: '系统管理',
-      icon: Setting,
-      items: [
-        { path: '/tracks', label: '赛道管理', icon: Files, roles: ['admin'] },
-        { path: '/style-prompts', label: '文风配置', icon: EditPen, roles: ['admin'] },
-        { path: '/prefixes', label: '标题前缀', icon: Memo, roles: ['admin'] },
-        { path: '/models', label: '模型配置', icon: MagicStick, roles: ['admin'] },
-        { path: '/users', label: '用户管理', icon: UserFilled, roles: ['admin'] },
-      ],
-    },
-  ];
-  return groups
-    .map((g) => ({ ...g, items: g.items.filter((it) => it.roles.includes(userRole.value)) }))
-    .filter((g) => g.items.length > 0);
-});
+/**
+ * 完整菜单定义（含 roles）。
+ * 侧栏用它做角色过滤，面包屑用它做「页面属于哪个分组」的查表——
+ * 面包屑不能依赖过滤结果：否则当前角色看不到某个菜单项时（例如非 admin 落到管理页），
+ * 面包屑会莫名少一级。分组只是导航上的归属，与权限无关。
+ */
+const MENU_GROUPS: MenuGroup[] = [
+  {
+    key: 'create',
+    label: '创作',
+    icon: Edit,
+    items: [
+      { path: '/plan', label: '创作计划', icon: List, roles: ['admin', 'member'] },
+      { path: '/articles', label: '文章', icon: Document, roles: ['admin', 'member', 'guest'] },
+    ],
+  },
+  {
+    key: 'ops',
+    label: '运营',
+    icon: Operation,
+    items: [
+      { path: '/scheduler', label: '自动调度', icon: Timer, roles: ['admin', 'member'] },
+      { path: '/accounts', label: '账号管理', icon: User, roles: ['admin', 'member'] },
+    ],
+  },
+  {
+    key: 'system',
+    label: '系统管理',
+    icon: Setting,
+    items: [
+      { path: '/tracks', label: '赛道管理', icon: Files, roles: ['admin'] },
+      { path: '/style-prompts', label: '文风配置', icon: EditPen, roles: ['admin'] },
+      { path: '/prefixes', label: '标题前缀', icon: Memo, roles: ['admin'] },
+      { path: '/models', label: '模型配置', icon: MagicStick, roles: ['admin'] },
+      { path: '/users', label: '用户管理', icon: UserFilled, roles: ['admin'] },
+    ],
+  },
+];
+
+/** 侧栏实际渲染的菜单：admin 全量；member 隐去系统管理；guest 只读（仪表盘/文章）。 */
+const menuGroups = computed<MenuGroup[]>(() =>
+  MENU_GROUPS.map((g) => ({
+    ...g,
+    items: g.items.filter((it) => it.roles.includes(userRole.value)),
+  })).filter((g) => g.items.length > 0),
+);
 
 /** 仪表盘常驻顶层（所有角色可见）。 */
 const dashboardItem: MenuItem = {
@@ -151,7 +163,7 @@ async function loadPipelineMeta() {
   }
 }
 
-/** 轻量系统状态（模型绑定 + 健康），侧边栏底部常驻显示。失败静默：区块整体隐藏。 */
+/** 轻量系统状态（模型绑定 + 健康），供右上角状态浮层显示。失败静默：浮层内提示未取到。 */
 async function loadStatus() {
   try {
     status.value = await getSystemStatus();
@@ -184,6 +196,17 @@ const statusRoles = computed(() => {
   });
 });
 
+/**
+ * 异常提示：只要有一项硬健康信号不成立，右上角按钮就带红点。
+ * 只在拿到状态后判断——拿不到状态不等于系统坏了（可能只是瞬时失败），
+ * 那种情况由顶栏的后端离线标签表达。
+ */
+const statusProblem = computed(() => {
+  const s = status.value;
+  if (!s) return false;
+  return !s.health.db || !s.health.masterKey || (s.degraded?.length ?? 0) > 0;
+});
+
 /** 窄屏自动收起侧边栏，避免导航挤压内容区。 */
 function syncCollapsed() {
   collapsed.value = window.innerWidth < 1180;
@@ -203,8 +226,8 @@ onUnmounted(() => {
   window.removeEventListener('resize', syncCollapsed);
 });
 
+/** 顶栏面包屑与 document.title 用的页面标题（来自路由 meta）；页面内部标题由页面自己渲染。 */
 const pageTitle = computed(() => (route.meta.title as string | undefined) ?? '控制台');
-const pageDesc = computed(() => (route.meta.desc as string | undefined) ?? '');
 
 /**
  * 独立页（登录/注册）：不套侧边栏与头部，整页只渲染自己。
@@ -221,6 +244,38 @@ const activeMenu = computed(() => {
   if (p.startsWith('/tracks')) return '/tracks';
   if (p.startsWith('/articles')) return '/articles';
   return p;
+});
+
+/**
+ * 面包屑：首页 / 分组 / 父级（仅下钻页）/ 当前页。
+ * 分组名取自 menuGroups，保证「导航里叫什么，面包屑里就叫什么」，不在两处各写一份。
+ * 当前页只显示文字（不可点），避免点了没反应。
+ */
+interface Crumb {
+  label: string;
+  path: string;
+}
+const crumbs = computed<Crumb[]>(() => {
+  const p = route.path;
+  if (p === '/') return [{ label: '仪表盘', path: '' }];
+
+  const list: Crumb[] = [{ label: '首页', path: '/' }];
+
+  const group = MENU_GROUPS.find((g) =>
+    g.items.some((it) => p === it.path || p.startsWith(`${it.path}/`)),
+  );
+  if (group) list.push({ label: group.label, path: '' });
+
+  // 下钻页补一级父栏目，否则「在线改稿」看不出属于文章
+  const parent = p.startsWith('/articles/')
+    ? { label: '文章', path: '/articles' }
+    : p.startsWith('/tracks/')
+      ? { label: '赛道管理', path: '/tracks' }
+      : null;
+  if (parent) list.push(parent);
+
+  list.push({ label: pageTitle.value, path: '' });
+  return list;
 });
 
 const backend = computed(() => {
@@ -281,36 +336,6 @@ const backend = computed(() => {
           </el-sub-menu>
         </el-menu>
       </nav>
-
-      <!-- 常驻系统状态：替代原仪表盘上的「系统健康 / 模型与角色绑定」独立板块 -->
-      <div v-if="!collapsed && status" class="sys-status" aria-label="系统状态">
-        <div class="sys-status__title">系统状态</div>
-        <div class="sys-status__row">
-          <span class="sys-chip">
-            <span class="mini-dot" :class="status.health.db ? 'ok' : 'bad'" />数据库
-          </span>
-          <span class="sys-chip">
-            <span class="mini-dot" :class="status.health.masterKey ? 'ok' : 'bad'" />密钥
-          </span>
-          <span class="sys-chip">
-            <span class="mini-dot" :class="status.health.scheduler.enabled ? 'ok' : 'off'" />调度
-          </span>
-          <span class="sys-chip sys-chip--muted">模型 {{ status.models.enabled }}/{{ status.models.total }}</span>
-        </div>
-        <el-tooltip
-          v-for="r in statusRoles"
-          :key="r.role"
-          :content="r.tip"
-          :disabled="!r.tip"
-          placement="right"
-        >
-          <div class="sys-role">
-            <span class="mini-dot" :class="r.cls" />
-            <span class="sys-role__label">{{ r.label }}</span>
-            <span class="sys-role__model">{{ r.modelName ?? '未绑定' }}</span>
-          </div>
-        </el-tooltip>
-      </div>
     </el-aside>
 
     <el-container>
@@ -324,14 +349,83 @@ const backend = computed(() => {
           >
             <el-icon><component :is="collapsed ? Expand : Fold" /></el-icon>
           </el-button>
-          <div class="titles">
-            <strong>{{ pageTitle }}</strong>
-            <span v-if="pageDesc" class="wb-muted">{{ pageDesc }}</span>
-          </div>
+          <!-- 顶栏只负责「我在哪」：面包屑导航。页面主标题由页内 PageHead 渲染，不在此重复 -->
+          <el-breadcrumb class="crumbs" separator="/" aria-label="面包屑导航">
+            <el-breadcrumb-item
+              v-for="(c, i) in crumbs"
+              :key="`${i}-${c.label}`"
+              :to="c.path ? { path: c.path } : undefined"
+            >
+              <span :class="{ 'crumb-current': i === crumbs.length - 1 }">{{ c.label }}</span>
+            </el-breadcrumb-item>
+          </el-breadcrumb>
         </div>
         <div class="header-right">
-          <span class="status-dot" :class="`status-dot--${backend.type}`" aria-hidden="true" />
           <el-tag class="backend-tag" :type="backend.type" size="small" effect="light">{{ backend.text }}</el-tag>
+
+          <!-- 系统状态：原侧栏底部常驻块，改为右上角浮层（窄屏同样可达） -->
+          <el-popover
+            v-model:visible="statusOpen"
+            placement="bottom-end"
+            trigger="click"
+            :width="330"
+            popper-class="sys-pop"
+          >
+            <template #reference>
+              <el-button class="status-btn" text size="small" aria-label="系统状态">
+                <el-icon><Odometer /></el-icon>
+                <span v-if="statusProblem" class="status-btn__dot" aria-hidden="true" />
+              </el-button>
+            </template>
+
+            <div class="sys-pop__body">
+              <div class="sys-pop__head">
+                <strong>系统状态</strong>
+                <el-button link type="primary" size="small" :icon="Refresh" @click="refreshAll">刷新</el-button>
+              </div>
+
+              <template v-if="status">
+                <div class="sys-status__row">
+                  <span class="sys-chip">
+                    <span class="mini-dot" :class="status.health.db ? 'ok' : 'bad'" />数据库
+                  </span>
+                  <span class="sys-chip">
+                    <span class="mini-dot" :class="status.health.masterKey ? 'ok' : 'bad'" />密钥
+                  </span>
+                  <span class="sys-chip">
+                    <span class="mini-dot" :class="status.health.scheduler.enabled ? 'ok' : 'off'" />调度
+                  </span>
+                  <span class="sys-chip sys-chip--muted">模型 {{ status.models.enabled }}/{{ status.models.total }}</span>
+                </div>
+
+                <div class="sys-pop__sub">角色绑定</div>
+                <el-tooltip
+                  v-for="r in statusRoles"
+                  :key="r.role"
+                  :content="r.tip"
+                  :disabled="!r.tip"
+                  placement="left"
+                >
+                  <div class="sys-role">
+                    <span class="mini-dot" :class="r.cls" />
+                    <span class="sys-role__label">{{ r.label }}</span>
+                    <span class="sys-role__model">{{ r.modelName ?? '未绑定' }}</span>
+                  </div>
+                </el-tooltip>
+
+                <p v-if="status.degraded?.length" class="sys-pop__warn">
+                  部分模块数据降级：{{ status.degraded.join('、') }}
+                </p>
+              </template>
+
+              <p v-else class="sys-pop__warn">
+                未取到系统状态（后端可能未连接）。点「刷新」重试，或查看顶栏的连接状态。
+              </p>
+
+              <p class="sys-pop__foot wb-muted">自动发布始终关闭；推送只进草稿箱，不群发。</p>
+            </div>
+          </el-popover>
+
           <el-dropdown trigger="click" :aria-label="'主题：' + (pref === 'system' ? '跟随系统' : pref === 'dark' ? '深色' : '浅色')" @command="setTheme">
             <el-button :icon="themeIcon" size="small" text />
             <template #dropdown>
@@ -342,7 +436,6 @@ const backend = computed(() => {
               </el-dropdown-menu>
             </template>
           </el-dropdown>
-          <el-button :icon="Refresh" size="small" text @click="refreshAll">刷新状态</el-button>
           <el-dropdown trigger="click" aria-label="用户菜单" @command="(c: string) => { if (c === 'logout') doLogout(); }">
             <el-button size="small" text>
               <el-icon><User /></el-icon>&nbsp;{{ userName || '未登录' }}
@@ -395,30 +488,6 @@ const backend = computed(() => {
   align-items: center;
   border-bottom: 1px solid var(--wb-border);
   min-height: 56px;
-}
-
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex: none;
-  background: var(--wb-text-muted);
-  box-shadow: 0 0 0 3px rgba(134, 144, 156, 0.18);
-}
-
-.status-dot--success {
-  background: #16a34a;
-  box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.16);
-}
-
-.status-dot--danger {
-  background: var(--wb-danger);
-  box-shadow: 0 0 0 3px rgba(213, 73, 65, 0.16);
-}
-
-.status-dot--info {
-  background: var(--wb-text-muted);
-  box-shadow: 0 0 0 3px rgba(134, 144, 156, 0.18);
 }
 
 .menu {
@@ -478,8 +547,7 @@ const backend = computed(() => {
   margin: 2px 6px;
 }
 
-/* nav 是侧边栏的 flex 子元素，必须由它撑开剩余高度，
-   系统状态块才能被推到侧边栏底部（左下角）。 */
+/* nav 是侧边栏的 flex 子元素，必须由它撑开剩余高度（折叠态下菜单占满整列）。 */
 nav {
   flex: 1;
   display: flex;
@@ -491,27 +559,46 @@ nav .menu {
   flex: 1;
 }
 
-/* ── 侧边栏底部系统状态 ── */
-.sys-status {
-  border-top: 1px solid var(--wb-border);
-  padding: 10px 16px 12px;
-  font-size: 12px;
+/* ── 系统状态浮层（内容） ── */
+.sys-pop__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wb-space-2);
+  max-height: 60vh;
+  overflow-y: auto;
+  font-size: var(--wb-fs-aux);
   color: var(--wb-text-secondary);
-  flex: none;
 }
 
-.sys-status__title {
+.sys-pop__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--wb-space-2);
+  color: var(--wb-text);
+}
+
+.sys-pop__sub {
   font-weight: 600;
   color: var(--wb-text-muted);
   letter-spacing: 0.02em;
-  margin-bottom: 6px;
+}
+
+.sys-pop__warn {
+  margin: 0;
+  color: var(--wb-warning);
+  line-height: 1.6;
+}
+
+.sys-pop__foot {
+  margin: var(--wb-space-1) 0 0;
+  line-height: 1.6;
 }
 
 .sys-status__row {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 10px;
-  margin-bottom: 6px;
 }
 
 .sys-chip {
@@ -534,7 +621,7 @@ nav .menu {
 }
 
 .mini-dot.ok {
-  background: #16a34a;
+  background: var(--wb-success);
 }
 
 .mini-dot.bad {
@@ -592,15 +679,29 @@ nav .menu {
   flex: none;
 }
 
-.titles {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.3;
+/* 面包屑：字号与正文一致，末级用主文字色加粗，前级弱化 */
+.crumbs {
   min-width: 0;
+  font-size: 13px;
+  line-height: 1.4;
 }
 
-.titles strong {
-  font-size: 15px;
+.crumbs :deep(.el-breadcrumb__inner) {
+  color: var(--wb-text-muted);
+  font-weight: 400;
+}
+
+.crumbs :deep(.el-breadcrumb__inner.is-link:hover) {
+  color: var(--wb-primary);
+}
+
+.crumbs :deep(.el-breadcrumb__separator) {
+  color: var(--wb-border-strong);
+}
+
+.crumb-current {
+  color: var(--wb-text);
+  font-weight: 600;
 }
 
 .header-right {
@@ -610,9 +711,38 @@ nav .menu {
   flex: none;
 }
 
+.status-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  font-size: 16px;
+}
+
+/* 异常红点：只在真有问题时出现（见 statusProblem），不伪造任何状态 */
+.status-btn__dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--wb-danger);
+  box-shadow: 0 0 0 2px var(--wb-surface);
+}
+
 .main {
   overflow: auto;
-  padding: var(--wb-space-4) 20px 32px;
+  padding: var(--wb-space-4) var(--wb-space-5) var(--wb-space-6);
+}
+
+@media (max-width: 900px) {
+  /* 状态信息在浮层里仍可看，窄屏把顶栏的后端标签让位给面包屑 */
+  .backend-tag {
+    display: none;
+  }
 }
 
 @media (max-width: 767px) {
@@ -622,9 +752,15 @@ nav .menu {
 
   .header {
     padding: 0 10px;
+    gap: var(--wb-space-2);
   }
 
-  .titles span {
+  .crumbs {
+    font-size: 12px;
+  }
+
+  /* 窄屏只留末两级，避免面包屑把折叠按钮挤走 */
+  .crumbs :deep(.el-breadcrumb__item:not(:nth-last-child(-n + 2))) {
     display: none;
   }
 

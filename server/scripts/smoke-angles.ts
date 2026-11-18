@@ -1506,6 +1506,71 @@ async function main(): Promise<void> {
     const okDefault = await putRule(`__smoke_b_okdefault_${stamp}`, { checks: [], angleMode: 'default' });
     expect('B9 合法 default 原样保留', okDefault.angleMode === 'default', okDefault.angleMode);
 
+    // ── B10 反模板规则（S3 收尾微调：科技句式模板化 8/10 → 补 7-10 条）──
+    // 断言的是「实际拼装进 messages 的文本」，不是常量存在与否；全程 Mock，不外呼。
+    console.log('— B10 科技反模板规则 —');
+    expect('B10 科技提示词含反模板规则（避免句式重复）', scenePrompt.includes('避免句式重复'), scenePrompt.length);
+    expect(
+      'B10 科技提示词禁止把「不再……」当默认结尾',
+      scenePrompt.includes('不要把「不再……」当成默认结尾'),
+      scenePrompt.includes('不要把「不再……」当成默认结尾'),
+    );
+    expect('B10 科技提示词含表达多样化要求', scenePrompt.includes('表达可以多变'));
+    expect('B10 科技提示词含「反模板不是硬指标」', scenePrompt.includes('反模板不是硬指标'));
+    expect('B10 科技提示词含两条反例', scenePrompt.includes('✗「AI 导航') && scenePrompt.includes('✗「智能相册'));
+
+    // 10.2 原有 scene 六条核心要求仍都在
+    expect(
+      'B10 scene 核心①真实具体应用场景仍在',
+      scenePrompt.includes('真实、具体的应用场景'),
+    );
+    expect('B10 scene 核心②普通读者看得懂仍在', scenePrompt.includes('让普通读者看得懂'));
+    expect(
+      'B10 scene 核心③比喻/具体结果/判断信号仍在',
+      scenePrompt.includes('普通读者能感知的比喻') &&
+        scenePrompt.includes('具体结果') &&
+        scenePrompt.includes('明确判断信号'),
+    );
+    expect(
+      'B10 scene 核心④不强制争议冲突仍在',
+      scenePrompt.includes('不强制**争议、冲突或技术对立'),
+      scenePrompt.includes('不强制'),
+    );
+    expect(
+      'B10 scene 核心⑤不要求方法钩子仍在',
+      scenePrompt.includes('不要求**「怎么/如何/怎么办」这类方法钩子'),
+    );
+    expect('B10 scene 核心⑥theme 用具体物件仍在', scenePrompt.includes('theme 用具体物件或动作'));
+
+    // 10.3 moment 规则未被改动，且未混入反模板条目
+    expect('B10 moment 核心①普通时刻仍在', momentPrompt.includes('普通、具体的生活或工作时刻'));
+    expect('B10 moment 核心②一件小事仍在', momentPrompt.includes('一件小事'));
+    expect('B10 moment 未混入反模板规则', !momentPrompt.includes('避免句式重复') && !momentPrompt.includes('反模板不是硬指标'));
+    expect('B10 default 未混入反模板规则', !defaultPrompt.includes('避免句式重复'));
+
+    // 10.4 不强制冲突 / 不强制方法钩子 的要求仍在（moment + scene 双向）
+    expect('B10 scene 不强制冲突仍在', scenePrompt.includes('不强制**争议、冲突或技术对立'));
+    expect('B10 moment 不强制冲突仍在', momentPrompt.includes('不强制**重大事件、戏剧冲突或强烈反差'));
+    expect('B10 moment 不要求方法钩子仍在', momentPrompt.includes('不要求**「怎么/如何/怎么办/该不该」这类方法钩子'));
+
+    // 10.5 新增约束本身不得引入焦虑式表达；反例里的负面写法必须明确标为「应避免」
+    const sceneLines = scenePrompt.split(/\r?\n/);
+    const anxietyLines = sceneLines.filter((l) => /不再(担心|害怕|焦虑)/.test(l));
+    expect(
+      'B10 焦虑式否定只出现在两条反例里，且都带 ✗ 标记',
+      anxietyLines.length === 2 && anxietyLines.every((l) => l.includes('✗')),
+      anxietyLines.map((l) => l.trim().slice(0, 40)),
+    );
+    expect('B10 反例块标注「应避免」', scenePrompt.includes('应避免'));
+    const startIdx = sceneLines.findIndex((l) => /^\s*7\./.test(l));
+    const endIdx = sceneLines.findIndex((l) => l.includes('✗「AI 导航'));
+    const normative = startIdx >= 0 && endIdx > startIdx ? sceneLines.slice(startIdx, endIdx).join('\n') : '';
+    expect(
+      'B10 新增 7-9 条约束正文（含续行）无焦虑式表达',
+      normative.length > 0 && !/不再(担心|害怕|焦虑)/.test(normative) && !/恐吓|威胁/.test(normative),
+      normative.slice(0, 120),
+    );
+
     console.log(`\nSMOKE ANGLES: ALL PASS (${passed} 项)`);
   } finally {
     // ── 清理：绝不留下脏数据（TopicReview 随 Angle 级联删） ──

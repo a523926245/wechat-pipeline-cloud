@@ -160,13 +160,53 @@ export interface TickResult {
   } | null;
 }
 
+/**
+ * 「就绪账号」口径**唯一真源**：已启用 + 凭据格式合规。
+ * tick 排产与 pushIntent 预测必须共用它，否则两处判断会各自漂移。
+ */
+const READY_ACCOUNT_WHERE = { enabled: true, credStatus: 'ok' } as const;
+
 /** 查询当前可排产账号（已启用且凭据就绪）。 */
 async function listReadyAccounts() {
   return prisma.oAAccount.findMany({
-    where: { enabled: true, credStatus: 'ok' },
+    where: { ...READY_ACCOUNT_WHERE },
     include: { track: true },
     orderBy: { id: 'asc' },
   });
+}
+
+/** 就绪账号的最小投影（带归属过滤），供路由计算推送意图；与 tick 的筛选口径同源。 */
+export async function listReadyAccountRefs(ownerWhere: { ownerUserId?: number }) {
+  return prisma.oAAccount.findMany({
+    where: { ...READY_ACCOUNT_WHERE, ...ownerWhere },
+    select: { id: true, ownerUserId: true },
+    orderBy: { id: 'asc' },
+  });
+}
+
+/** 推送意图（只读预测）：本次排产到底会不会推到草稿箱。 */
+export type PushIntentStatus = 'none' | 'partial' | 'all' | 'unknown';
+
+export interface PushIntent {
+  status: PushIntentStatus;
+}
+
+/**
+ * 纯分类（不碰 DB，便于单测）：给定「就绪账号」的自动化模式集合，判断推送意图。
+ *
+ *   none    — 没有任何账号是 auto_draft_push（含全部 manual），本次不会推；
+ *   all     — 全部就绪账号都是 auto_draft_push，本次都会推；
+ *   partial — 只有一部分账号会推，其余只写草稿；
+ *   unknown — 一个就绪账号都没有（未启用或凭据不合规），既不能说"会推"也不能说"不会推"。
+ *
+ * ⚠️ 这里只看**配置意图**，不掺「是否到点 / 产线是否启用 / 今日配额是否已满」——
+ *    那些是运行时条件，会把横幅变成随时变化的预测；横幅要回答的是"配好之后会不会推"。
+ */
+export function classifyPushIntent(modes: readonly AutomationMode[]): PushIntentStatus {
+  if (modes.length === 0) return 'unknown';
+  const pushable = modes.filter((m) => m === 'auto_draft_push').length;
+  if (pushable === 0) return 'none';
+  return pushable === modes.length ? 'all' : 'partial';
 }
 
 /** 各账号各产线今日已产数（配额幂等判断），key = `${accountId}:${pipeline}`。 */

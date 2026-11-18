@@ -16,7 +16,7 @@
  *   - 每个配置项独立 dirty 检测与保存，顶部汇总「N 处未保存」+ 全部保存；
  *   - 切页/关页有拦截，避免改了一屏全丢。
  *
- * key 约定：'global' | '{赛道名}' | 'v:{赛道}:{dim}'（dim ∈ title|structure|length）。
+ * key 约定：'global' | '{赛道名}' | 'sys:{赛道}' | 's:{赛道}' | 'r:{赛道}' | 'v:{赛道}:{dim}'（dim ∈ title|structure|length）。
  */
 import {
   Check,
@@ -41,6 +41,9 @@ import {
   listTracks,
   upsertStylePrompt,
 } from '../api/index.ts';
+import EmptyState from '../components/EmptyState.vue';
+import PageHead from '../components/PageHead.vue';
+import SaveBar from '../components/SaveBar.vue';
 import StateError from '../components/StateError.vue';
 import VariantLinesEditor from '../components/VariantLinesEditor.vue';
 import { splitVariantBlocks } from '../utils/variants.ts';
@@ -56,8 +59,10 @@ const DIMS = [
 type Dim = (typeof DIMS)[number]['dim'];
 
 const vkey = (track: string, dim: string) => `v:${track}:${dim}`;
+/** 写作规范前缀（与后端 style-prompts.ts 的 SPEC_PREFIX 同源）——`s:{赛道}`。 */
+const SPEC_PREFIX = 's:';
 /** 写作规范（段落形态 / 强调标注 / 句式补充）——按赛道一份。 */
-const skey = (track: string) => `s:${track}`;
+const skey = (track: string) => `${SPEC_PREFIX}${track}`;
 /** 系统提示词（`## system` + `## tail`）——按赛道一份，这是决定「文章长什么样」的那份。 */
 const syskey = (track: string) => `sys:${track}`;
 
@@ -132,10 +137,33 @@ const currentEditorKey = computed(() => {
 
 const isDirty = (key: string) => (buf[key] ?? '') !== (saved[key] ?? '');
 
+/**
+ * 单个配置项的保存态（供 SaveBar 展示）：saving > dirty > 已落库过(saved) > 从未落库(clean)。
+ * 纯展示口径，不改任何保存行为——真正的写入仍走 saveKey / 结果回灌 saved。
+ */
+function saveStateOf(key: string): 'clean' | 'dirty' | 'saving' | 'saved' {
+  if (saving.value === key) return 'saving';
+  if (isDirty(key)) return 'dirty';
+  return savedAt.value[key] ? 'saved' : 'clean';
+}
+
+/** SaveBar 的补充说明：上次保存时间 / 有改动但未落库 / 尚未配置（三种真实情况，不硬凑一句话）。 */
+function saveHintOf(key: string): string {
+  const at = savedAt.value[key];
+  if (at) return `上次保存 ${fmt(at)}`;
+  return isDirty(key) ? '这一项还没落库' : '尚未配置';
+}
+
+/** 某一维的编辑提示（如「一条一个标题公式，按顺序轮换」）。 */
+function dimHint(dim: Dim): string {
+  return DIMS.find((d) => d.dim === dim)?.hint ?? '';
+}
+
 const dirtyKeys = computed(() => Object.keys(buf).filter((k) => (buf[k] ?? '') !== (saved[k] ?? '')));
 
 const trackDirty = (name: string) =>
-  isDirty(name) || isDirty(syskey(name)) || DIMS.some((d) => isDirty(vkey(name, d.dim)));
+  isDirty(name) || isDirty(syskey(name)) || isDirty(skey(name)) ||
+  DIMS.some((d) => isDirty(vkey(name, d.dim)));
 
 const trackMap = computed(() => {
   const m: Record<string, TrackItem> = {};
@@ -346,10 +374,13 @@ function discardAll() {
 async function restoreKey(key: string) {
   const d = defaults.value;
   if (!d) return;
+  // 写作规范（s:{赛道}）的出厂默认在 allDefaults().specs 里以「裸赛道名」为 key，
+  // 其余家族（sys:/v:/r:）的 key 带前缀。按前缀取对，避免误报「没有出厂默认值」。
+  const specDefault = key.startsWith(SPEC_PREFIX) ? d.specs[key.slice(SPEC_PREFIX.length)] : undefined;
   const v =
     d.variants[key] ??
     d.systems[key] ??
-    d.specs[key] ??
+    specDefault ??
     d.rules[key] ??
     d.tracks[key] ??
     (key === K_GLOBAL ? d.global : undefined);
@@ -421,7 +452,7 @@ async function submitCreate() {
 async function removeTrack(name: string) {
   try {
     await ElMessageBox.confirm(
-      `删除「${name}」的赛道文体与三条变体库？写稿时会回落到全局配置（不影响赛道管理里的赛道本身）。`,
+      `删除「${name}」的赛道文体、写作规范与三条变体库？写稿时会回落到全局配置（不影响赛道管理里的赛道本身）。`,
       '删除赛道文风配置',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     );
@@ -490,20 +521,17 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="wb-page">
-    <header class="wb-page-head">
-      <div>
-        <h2>文风配置</h2>
-        <p class="wb-page-desc">
-          创作总纲、赛道文体与三维变体（标题/结构/篇幅）的单一真源。左侧选配置项，改完在底部保存，写稿与题库扩库都读这里。
-        </p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead
+      title="文风配置"
+      desc="创作总纲、赛道文体与三维变体（标题/结构/篇幅）的单一真源。左侧选配置项，改完在底部保存，写稿与题库扩库都读这里。"
+    >
+      <template #actions>
         <el-button :icon="Refresh" :loading="loading" @click="refresh">刷新</el-button>
         <el-button type="primary" :icon="Check" :loading="savingAll" :disabled="dirtyKeys.length === 0" @click="saveAll">
           全部保存<span v-if="dirtyKeys.length" class="btn-badge">{{ dirtyKeys.length }}</span>
         </el-button>
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="loadError" :message="loadError" label="文风配置加载失败" @retry="load" />
 
@@ -640,25 +668,6 @@ onBeforeUnmount(() => {
           </el-alert>
 
           <el-tabs v-model="gvTab" class="sp-tabs">
-            <el-tab-pane name="spec">
-              <template #label>
-                <span class="tab-label">
-                  写作规范
-                  <i v-if="isDirty(skey(currentTrack))" class="dirty-dot" />
-                </span>
-              </template>
-              <p class="tab-hint wb-muted">
-                按 <code>## 段落形态</code> / <code>## 强调标注</code> / <code>## 句式补充</code> 分节，每节单独注入。
-                「去AI味（预留）」小节可以留着占位，但**当前不会生效**（能力尚未开发）。
-              </p>
-              <el-input
-                v-model="buf[skey(currentTrack)]"
-                type="textarea"
-                :autosize="{ minRows: 16, maxRows: 34 }"
-                placeholder="## 段落形态&#10;- 主体段落 3-5 句、60-140 字&#10;&#10;## 强调标注&#10;- 全篇 8-12 处加粗&#10;&#10;## 句式补充&#10;- 本赛道额外禁忌…"
-              />
-            </el-tab-pane>
-
             <el-tab-pane v-for="d in DIMS" :key="d.dim" :name="d.dim">
               <template #label>
                 <span class="tab-label">
@@ -671,22 +680,14 @@ onBeforeUnmount(() => {
           </el-tabs>
 
           <div class="editor-foot">
-            <div class="foot-state">
-              <el-tag v-if="isDirty(vkey(K_GLOBAL, gvTab))" size="small" type="warning" effect="plain">未保存</el-tag>
-              <span class="wb-muted">{{ DIMS.find((d) => d.dim === gvTab)?.hint }}</span>
-            </div>
-            <div class="foot-ops">
+            <SaveBar
+              :state="saveStateOf(vkey(K_GLOBAL, gvTab))"
+              :hint="`${dimHint(gvTab)} · ${saveHintOf(vkey(K_GLOBAL, gvTab))}`"
+              save-label="保存这一维"
+              @save="saveKey(vkey(K_GLOBAL, gvTab))"
+            >
               <el-button size="small" :icon="RefreshLeft" @click="restoreKey(vkey(K_GLOBAL, gvTab))">恢复默认</el-button>
-              <el-button
-                size="small"
-                type="primary"
-                :loading="saving === vkey(K_GLOBAL, gvTab)"
-                :disabled="!isDirty(vkey(K_GLOBAL, gvTab))"
-                @click="saveKey(vkey(K_GLOBAL, gvTab))"
-              >
-                保存这一维
-              </el-button>
-            </div>
+            </SaveBar>
           </div>
         </el-card>
 
@@ -770,6 +771,26 @@ onBeforeUnmount(() => {
               />
             </el-tab-pane>
 
+            <!-- 写作规范（S5-UI-4-1-A）：按赛道一份，key = s:{赛道}，与后端 SPEC_PREFIX 同源。 -->
+            <el-tab-pane name="spec">
+              <template #label>
+                <span class="tab-label">
+                  写作规范
+                  <i v-if="isDirty(skey(currentTrack))" class="dirty-dot" />
+                </span>
+              </template>
+              <p class="tab-hint wb-muted">
+                按 <code>## 段落形态</code> / <code>## 强调标注</code> / <code>## 句式补充</code> 分节，每节单独注入。
+                「去AI味（预留）」小节可留着占位，但<strong>当前不会生效</strong>（能力已下线）。
+              </p>
+              <el-input
+                v-model="buf[skey(currentTrack)]"
+                type="textarea"
+                :autosize="{ minRows: 16, maxRows: 34 }"
+                placeholder="## 段落形态&#10;- 主体段落 3-5 句、60-140 字&#10;&#10;## 强调标注&#10;- 全篇 8-12 处加粗&#10;&#10;## 句式补充&#10;- 本赛道额外禁忌…"
+              />
+            </el-tab-pane>
+
             <el-tab-pane v-for="d in DIMS" :key="d.dim" :name="d.dim">
               <template #label>
                 <span class="tab-label">
@@ -803,32 +824,17 @@ onBeforeUnmount(() => {
           </el-tabs>
 
           <div class="editor-foot">
-            <div class="foot-state">
-              <el-tag v-if="isDirty(currentEditorKey)" size="small" type="warning" effect="plain">未保存</el-tag>
-              <span class="wb-muted">
-                {{
-                  savedAt[currentEditorKey]
-                    ? `上次保存 ${fmt(savedAt[currentEditorKey])}`
-                    : '这一项还没落库'
-                }}
-              </span>
-            </div>
-            <div class="foot-ops">
+            <SaveBar
+              :state="saveStateOf(currentEditorKey)"
+              :hint="saveHintOf(currentEditorKey)"
+              @save="saveKey(currentEditorKey)"
+            >
               <el-button size="small" :icon="RefreshLeft" @click="restoreKey(currentEditorKey)">恢复默认</el-button>
-              <el-button
-                size="small"
-                type="primary"
-                :loading="saving === currentEditorKey"
-                :disabled="!isDirty(currentEditorKey)"
-                @click="saveKey(currentEditorKey)"
-              >
-                保存
-              </el-button>
-            </div>
+            </SaveBar>
           </div>
         </el-card>
 
-        <el-empty v-else-if="!loadError" description="从左侧选一个配置项开始编辑" />
+        <EmptyState v-else-if="!loadError" description="从左侧选一个配置项开始编辑" :image-size="60" />
       </section>
     </div>
 
@@ -1139,31 +1145,14 @@ onBeforeUnmount(() => {
   margin-top: var(--wb-space-2);
 }
 
-/* 底部操作条吸底：即使变体条目很多，保存也不用往上翻 */
+/* 底部操作条吸底：即使变体条目很多，保存也不用往上翻。
+   条内的状态与按钮由 SaveBar 统一渲染（原 foot-state / foot-ops 两段样式已随之删除）。 */
 .editor-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--wb-space-3);
-  flex-wrap: wrap;
   position: sticky;
   bottom: 0;
   margin-top: var(--wb-space-3);
   padding: 10px 0 2px;
   background: linear-gradient(to top, var(--wb-surface) 72%, transparent);
-}
-
-.foot-state {
-  display: flex;
-  align-items: center;
-  gap: var(--wb-space-2);
-  flex-wrap: wrap;
-  font-size: 12px;
-}
-
-.foot-ops {
-  display: flex;
-  gap: var(--wb-space-2);
 }
 
 .form-tip {

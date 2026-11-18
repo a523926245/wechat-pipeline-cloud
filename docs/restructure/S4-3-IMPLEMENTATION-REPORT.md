@@ -5,6 +5,10 @@
 - **依据**：`00-FINAL-EXECUTION-CHARTER.md`、`RESTRUCTURE-2.0-CONVERGED-PLAN.md`（§八 S4 范围）、`docs/DEVLOG.md`、`docs/WRITING-PIPELINE.md`、`S4-0-AUDIT-REPORT.md`、`S4-2-IMPLEMENTATION-REPORT.md` 及当前工作区代码。
 - **状态**：代码与隔离验证完成，**停等人工验收。未 commit、未对业务库部署 Migration。**
 
+> **勘误索引（2026-11-17 · S5-2-HF1）**：本报告有 3 处「缺表也不会崩」类表述已就地追加勘误说明（**§4.3 末尾 / §9 第 7 条 / §10 回滚说明**）。
+> 原因：S4-3 交付时只有**写入**路径（`recordLintRun`）做了异常保护；两条**读取**路径（`latestLintRun` / `listLintRuns`）缺表会抛 P2021 导致接口 500，
+> 该缺口由后续任务 **S5-2-HF1** 修复（降级为 `null` / `[]` + `logger.warn`）。**原文一律不改写**，以保留当时的实施事实。
+
 ---
 
 ## 1. 改造前问题与代码证据
@@ -114,6 +118,12 @@ Article 1 ──── N ArticleLintRun        （onDelete: Cascade）
 
 口径刻意分成两句：**「体检做完了但没存档」≠「体检失败」**，不合并成一句「检查失败」，否则会让人怀疑结论本身。
 
+> **勘误补充（2026-11-17 · S5-2-HF1）**：以上三条只覆盖**写入**路径（`recordLintRun`）。
+> S4-3 交付时的**读取**路径（`latestLintRun` / `listLintRuns`，服务预览页「最近存档」与历史列表）**没有**异常保护——
+> 表不存在（Prisma **P2021**）或查询异常时，`GET /api/articles/:id/preview`、`GET /api/articles/:id/lint-runs` 会抛成 **500**。
+> 该缺口已在 **S5-2-HF1** 修复：两函数各自 `try/catch`，失败分别降级为 `null` / `[]`，并打 `logger.warn`（含文章 ID、Prisma 错误码、`tableMissing` 标记）；
+> 查询条件、排序（`id desc`）、分页夹取与返回字段均未改动。**属后续修复，不是 S4-3 交付时已具备的能力。**
+
 ### 4.4 过期判定（不把旧结论当现行结论）
 
 预览返回 `lintRunStale = (存档.contentHash !== 当前正文 SHA-256)`。改过稿但没保存、或正文被其他路径（强调补全/AI 改写/接口）改动后，面板显示「存档已过期（正文已改）」，避免把历史结论当作此刻的判定。
@@ -213,6 +223,10 @@ ArticleLintRun in business DB: ABSENT（迁移未部署，符合本阶段边界�
 6. **`contentHash` 不认识「语义等价改动」**：改一个空格也算过期（偏保守，不会误报「未过期」）。
 7. **Migration 已写好但未部署业务库**：业务库当前无 `ArticleLintRun` 表，**新代码在业务库运行时会因缺表而落库失败**（`recordLintRun` 会 `saved:false` + 明确错误，不会崩；但体检面板会一直显示「未能存档」）。**部署前不宜把本分支用于真实库日常使用**——部署需单独授权（§10）。
 
+> **勘误（2026-11-17，S5-2-HF1）**：本条中「不会崩」只对**写入**路径成立。S4-3 交付时两条**读取**路径（`latestLintRun` / `listLintRuns`）缺表会抛 P2021，
+> 使 `GET /:id/preview`（改稿页主流程）与 `GET /:id/lint-runs` 直接 500；该缺口已由 **S5-2-HF1** 修复为 `null` / `[]` + `logger.warn`。
+> 另：`ArticleLintRun` 迁移**截至本勘误日仍未部署**，业务库状态未因勘误或 HF1 发生任何变化。
+
 ---
 
 ## 10. 是否需要业务库部署 / 部署说明（停等授权）
@@ -232,6 +246,10 @@ npx prisma migrate status          # 期望：up to date
 ```
 
 回滚：`DROP TABLE ArticleLintRun`（纯新增表，无其他表依赖它，业务代码在缺表时会降级为「未能存档」而非崩溃）。**不建议**用 `migrate resolve` 伪造状态。
+
+> **勘误（2026-11-17，S5-2-HF1）**：上句「降级为「未能存档」而非崩溃」在 S4-3 交付时**只对写入路径成立**；
+> 读取路径（`latestLintRun` / `listLintRuns`）在缺表时会抛 P2021 使预览/历史接口 500。
+> 该缺口已由 S5-2-HF1 修复（`null` / `[]` + warn），因此「回滚到无该表」这一状态是**在 HF1 之后**才真正全程可降级。
 
 ---
 

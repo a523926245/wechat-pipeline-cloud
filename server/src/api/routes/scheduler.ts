@@ -12,13 +12,16 @@ import { asyncHandler } from '../async-handler.ts';
 import { requirePermission, principalOf } from '../permissions.ts';
 import { BadRequestError, NotFoundError } from '../../errors.ts';
 import { prisma } from '../../db.ts';
-import { isAdmin, requirePrincipal } from '../../services/ownership.ts';
+import { isAdmin, requirePrincipal, accountOwnerWhere } from '../../services/ownership.ts';
 import {
   AUTOMATION_MODES,
   AUTOMATION_MODE_LABEL,
   WRITE_TIME_RE,
+  classifyPushIntent,
   getSchedulerConfig,
   getSchedulerStatus,
+  listReadyAccountRefs,
+  resolveAutomationForAccounts,
   setSchedulerConfig,
   startScheduler,
   stopScheduler,
@@ -53,12 +56,23 @@ const configSchema = z
   })
   .refine((v) => Object.keys(v).length > 0, { message: '至少需要提供一个待修改字段' });
 
-/** 当前状态：全局开关 + **我的**每用户自动化配置 + 运行态。 */
+/** 当前状态：全局开关 + **我的**每用户自动化配置 + 运行态 + 推送意图（只读预测）。 */
 schedulerRouter.get(
   '/',
   asyncHandler(async (req, res) => {
     const principal = requirePrincipal(req);
-    const [config, status] = await Promise.all([getSchedulerConfig(), Promise.resolve(getSchedulerStatus())]);
+    const [config, status, accounts] = await Promise.all([
+      getSchedulerConfig(),
+      Promise.resolve(getSchedulerStatus()),
+      // 推送意图必须问真源：tick 是按「每账号 owner 的 automationMode」决定推不推（:289/:333），
+      // 不是全局 pushEnabled。这里复用同一份就绪账号口径与 resolveAutomationForAccounts，
+      // 只做只读预测，不改任何状态。
+      listReadyAccountRefs(accountOwnerWhere(principal)),
+    ]);
+    const automation = await resolveAutomationForAccounts(accounts);
+    const pushIntent = {
+      status: classifyPushIntent(accounts.map((a) => automation.get(a.id)?.mode ?? 'manual')),
+    };
     // 我的自动化配置（admin 令牌/冒烟主体 userId=null → 演示全局兜底值）
     const me =
       principal.userId != null
@@ -77,6 +91,7 @@ schedulerRouter.get(
       },
       modeOptions: AUTOMATION_MODES.map((m) => ({ value: m, label: AUTOMATION_MODE_LABEL[m] })),
       lastTick: status.lastTick,
+      pushIntent,
     });
   }),
 );

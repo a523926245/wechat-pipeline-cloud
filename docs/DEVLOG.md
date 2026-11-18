@@ -1748,3 +1748,358 @@ T1 拆 T1-A 基线迁移 / T1-B TrackContract / T1-C PromptVersion / T1-D Genera
 2. **S3（真实 LLM 样本验证）尚未授权、尚未执行**：激励/科技的真实扩库形态（每赛道 10 条人工比对）没有跑过。
 3. **`r:激励` 库内 `angleMode` 仍为 `default`**，与种子 `moment` 存在配置分叉——这是 B-A 方案明确接受的代价（选题形态只读代码种子，库值不参与生成/守门），已写入 `track-rules.ts` 注释。
 4. `ArticleLintRun` Migration **仍未部署**到真实业务库（S4-3 遗留，需单独授权）。
+
+## 2026-11-16（19:55）· S4-5 S3 真实样本验证：激励 moment / 科技 scene 均通过
+
+- **授权**：S3 第五步（Smoke 库真实样本生成）。**全程只连 `wechat_pipeline_smoke`，业务库零访问**；调用预算 4 次，实际 4 次，无重试无补样。
+- **环境**：Smoke 库迁移（单独授权）已建 18 表；模型配置由用户页面手工完成（`LlmModel #2 Agnes 3.0 Flash`，绑 `write`/`revise`/`expand_angles`）。**发现 8787 已被既有服务占用（PID 1804，疑连业务库）→ 改用独立端口 8797 + `SMOKE_NO_AUTH=1`，全程未访问 8787**，结束后该服务仍正常。
+- **执行**：建 Track #1 激励 / #2 科技 → `POST /api/tracks/:id/expand` 各 10 条。服务日志实证「LLM 请求」**恰好 4 条**（生成 2 + 评分 2）。生成 `requested=10 added=10 skippedOffensive=0 skippedDuplicate=0 scored=10`，20 条 `content` 无重复，全部 `status=candidate`（未据此改审核状态）。
+- **六维评分**（`write` 角色）：激励 fit4.00/scene4.20/conflict2.90/method3.50/safety4.60/novelty3.60 total22.80；科技 fit4.30/scene4.40/conflict3.70/method4.20/safety4.50/novelty3.50 total24.60。`riskHits` 20 条全空。
+- **六项人工评估**：定位 9/10 与 10/10、**形态硬线 10/10 与 10/10**、画面 9/10 与 9/10、可展开 8/10 与 10/10、无空泛套路 10/10 与 8/10、值得审核 9/10 与 9/10 —— **两赛道六项全过线**。扣分项：激励 #2 地铁（定位偏情感）、#8 电梯（画面/可展开弱）、#6 雨夜（可展开弱）；科技 #7 录音笔（比喻是字面描述）、#8 智能锁 / #9 健身环（焦虑式否定）。
+- **形态结论**：`MOMENT_ANGLE_RULES` / `SCENE_ANGLE_RULES` **真实生效**——激励全部具备「具体时刻 + 一件小事」、科技全部具备「真实场景 + 比喻/结果/信号」，20 条中无一例要求方法钩子或强行制造冲突，明示套路词（逆袭/30 天/颠覆/分水岭等）**0 命中**。
+- **系统性问题（1 项）**：科技句式模板化「像 X，……不再 Y」**8/10** → 建议下轮微调 `SCENE_ANGLE_RULES`（加反模板要求 + 2 个反例句式）。其余为偶发（科技焦虑式否定 2/10、激励定位偏移 1/10、可展开偏弱 2/10），不改规则。
+- **⚠ 评分口径冲突（需决策）**：六维的 `conflict` 计入 `total`，而形态规则明文"不强制冲突"→ 激励 `conflict` 均分仅 2.90，`total` 被系统性拉低。**`total` 不可跨赛道比较、不能用来判形态达标**；若要用于排序，需先决定 moment/scene 是否对 conflict 降权或不计分。本轮未动评分口径。
+- **清理**：删除前核对 `Article`/`TaskRun`/`TopicReview` 引用均 0；按**显式 id**删 Angle 20 + TrackPipeline 4 + Track 2，清理后 `Track=0 Angle=0`。**保留** `LlmModel=1` / `ModelBinding=3`（页面手工配置，非实验数据）。
+- **导出**：`server/var/tmp/s3/s3-20261116/`（7 个文件：samples.csv/json、expand-*.json、config-snapshot.md、prompt-rules.txt、eval.md），`.gitignore` 覆盖不进版本库。
+- **边界**：未改业务代码/Schema/Migration/配置；未跑 `model:local`；未调微信；`git status --short` 空（本轮仅新增本报告 + 本条 DEVLOG），未 add/commit/push。
+- **结论**：**S4-5 B 档真实样本验证通过**；遗留两项待决策——① 科技句式模板化（P1，提示词微调）② 六维 conflict 口径（P1，评分口径决策）。
+
+## 2026-11-16（20:15）· S3 收尾修正 + 科技 SCENE 反模板微调
+
+- **修正 S3 报告两处记录矛盾**（未改任何历史验证数据）：
+  1. **Git 状态**：原 §13 写「`git status --short` → 空」，那是写入报告**之前**的瞬时状态。实际最终状态是 `M docs/DEVLOG.md` + `?? docs/restructure/S4-5-S3-REAL-SAMPLE-VALIDATION-REPORT.md`（HEAD 仍 `b2fbad3`，`git diff --check` clean，报告未被 Git 跟踪）。已改为如实记录，**未丢弃文件制造干净工作区**。
+  2. **科技句式统计**：原写「8/10（#1/3/4/5/6/7/8/9/10 中 8 条）」——列了 9 个编号却称 8 条且**误含 #5**。逐条重算后拆成两个独立指标：**「像 X」比喻结构 10/10**（原报告漏记，实际更严重）、**「不再……」表达 8/10**（命中 `#1/3/4/6/7/8/9/10`）；组合模板「像X…不再Y」仍 **8/10**（数字不变，编号更正）。`samples.csv`/`samples.json`/`eval.md` 均未改动，更正只写进报告 §8。
+- **微调 `SCENE_ANGLE_RULES`（`angles.ts:247`）**：保留原 6 条核心要求逐字不动，追加第 7–10 条反模板：⑦避免句式重复（明确禁止「像 X 一样，……不再 Y」与「不再……」默认结尾）⑧表达方式多样化（变化/结果/信号/意外发现/人物体验/适度比喻，六选一，不硬套）⑨反模板不是硬指标（不要求每条句式不同、不要求每条用比喻；不得强行制造冲突、不得加焦虑式表达、不得虚构夸张科技效果、不得偏离真实场景）⑩两条**应避免**反例（带 ✗ 标记）。`MOMENT_ANGLE_RULES` 与其他赛道零改动。
+- **测试**：`smoke:angles` 新增 **B10 共 21 条**断言（断言的是**实际拼装进 messages 的文本**，全程 Mock 不外呼）：反模板条目进入科技提示词 / 两条反例存在 / scene 六条核心仍在 / moment 核心未变且未混入反模板 / default 未混入 / 「不强制冲突」「不要求方法钩子」双向仍在 / **焦虑式否定只出现在两条 ✗ 反例里（`不再担心|不再害怕|不再焦虑` 共 2 行且全带 ✗）** / 7–9 条约束正文（含续行）无焦虑式与恐吓词。
+- **测试结果**：`typecheck` **0** · `smoke:angles` **ALL PASS（226 项 = 205 + 21）** · 原 B5–B9 全部保持通过。真实模型调用 **0 次**。
+- **⚠ 未决异常**：补测第一遍 `smoke:angles` 输出 `REAL-DB FINGERPRINT MISMATCH`，**立即重跑第二遍 MATCH**。已本地排除 `dev.db`（sha256 仍 `fea0f123…`、mtime 停在 2026-11-12，`prisma/` 近 2 小时无改动），故只能来自业务库 COUNT/CHECKSUM。是 CHECKSUM 抖动还是期间写入后被清理，**未查明**——按本轮「不连接正式业务库」边界未自行连库比对基线。建议授权跑一次只读 `smoke-isolated.ts fp` 与 S2 基线 `5d449bb7…` 比对定论。
+- **本轮数据访问**：我方对正式业务库 **0 次连接、0 次读写**；`smoke:angles` 由隔离 runner 执行，其自带的「零写入证明」在每次 run 前后各做 1 次只读 COUNT+CHECKSUM（本轮共 4 次），属 harness 内置检查，非业务数据读取。Smoke 库测试数据已清理。
+- **边界**：未动六维评分权重/conflict 逻辑/total 计算、未动 Schema/Migration、未动审核状态机与去重、未动其他赛道提示词、未重跑真实样本、未执行真实 LLM、未执行微信调用、未 commit/push。
+
+## 2026-11-16（21:45）· S5-1 推送安全与改写质量修复
+
+- **任务一 防重复推送**：`publisher.ts` 在 `pushOnce` **最前面**加 `hasPushTrace()` 判据（`mediaId`/`pushDate` 任一非空即视为曾送达，**不看 status**），命中直接返回 `reason:'already_pushed'` + `everPushed:true`，**完全不触达微信接口**。另加进程内 in-flight Map 把同一 `articleId` 的推送串行化，并发重复点击第二次拿 `reason:'pushing'`（单进程够用，多进程需数据库级占位——已登记为边界）。
+- **任务二 失败不覆盖推送事实**：catch 分支不再无条件 `status:'failed'`——只有 `!hasPushTrace(a)` 才降级；曾送达的保持原 status（pushed/updated），并 `logger.warn` 留痕。`mediaId`/`pushDate` 全路径不清空（本就是）。`PushResult` 新增 `everPushed`，前端标题区分「首次推送失败」/「曾经推送过、本次失败未清除记录」。
+- **任务三 改写后自动体检**：`revise.ts` 应用改写后对**刚保存的最终正文**跑 `lintArticle` + `recordLintRun(trigger:'revise')`，返回 `lint/lintRun/lintPersistError/message`；体检出 error 只提示「推送时会被门禁拦下」，**不回滚已保存的改写**；体检自身异常也只记 `lintPersistError`。`LintTrigger` 登记 `'revise'`（按 lint-store 注释的登记约定），前端 `lintTriggerText` 加「AI 改写」。推送门禁仍独立跑自己的最新体检。
+- **测试**：新增 `smoke:push`（隔离 runner 第 5 个 target）+ `scripts/smoke-push.ts` **33 项断言**，全程 Mock（假微信 token/draft/add + 假 OpenAI chat/completions，由 `WECHAT_API_BASE` 与 `LlmModel.baseUrl` 指过去）。覆盖：A1-A5 防重复（含**并发只建一份草稿**）、B1-B3 失败保事实（首推失败→failed+TaskRun errcode；曾推送文章被拒后 mediaId/pushDate/status 一字未改）、C1-C4 改写体检（trigger=revise、lint 针对改写后正文、error 不丢正文、saved:false 不伪造、推送仍跑最新 lint）。
+- **测试踩坑（三条，均已修）**：①夹具正文过不了 error 级门禁（sections 3-4 个 h2 / chars 1300-2300），error **不可被 relax 豁免**，必须真合格；②微信客户端对 `45009` 会退避重试（`ERR_RETRYABLE`），注入失败会被重试吃掉 → 改用 `40164`（`ERR_NO_RETRY`）；③`TaskRun` 字段是 `errorCode`(string)/`errorMessage`，不是 `errcode`。另：express/假上游会挂住事件循环，脚本结尾需显式 `process.exit`。
+- **回归（真实输出）**：typecheck 0 / vue-tsc ×2 0 / web build ✓ 17.25s / smoke:lint **152** / style **46** / angles **226** / bulk **73** / **smoke:push 33** / verify:smoke-iso **10/10**；每轮 `ISO-EMPTY 17/17` + `CLEANUP ok` + `REAL-DB FINGERPRINT MATCH`。
+- **⚠ 未决观察（本轮未查明，未连库）**：harness 每轮打印的业务库 18 表指纹为 **`4a85f6c05f461091…`**，与 S2 执行后记录的基线 **`5d449bb7…`** 不一致。各轮 run **内部**前后一致（MATCH），说明差异发生在**本轮之前**且是持久变化。按 §六「不执行真实业务库 SQL」未查询原因。可能来源包括：真实库模型配置变更、StylePrompt 人工修改、或 `ArticleLintRun` 迁移被部署等。**建议单独授权跑一次 `smoke-isolated.ts fp` + 逐表 diff 定位。**
+- **未做（按令）**：不改 Schema/Migration、不部署 `ArticleLintRun`、不实现 `updateDraft`、不动评分/审核/去重/生成主流程、无真实 LLM/微信调用、未 commit/push。
+- **Git**：新增 `server/scripts/smoke-push.ts`；修改 `publisher.ts`、`revise.ts`、`lint-store.ts`、`smoke-run.ts`、`smoke-isolated.ts`、`server/package.json`、`web/src/types.ts`、`ArticleEditView.vue`；另有前几轮未提交改动（`angles.ts`、`smoke-angles.ts`、S3 报告、DEVLOG）原样保留。
+
+## 2026-11-17（09:30）· S5-2-HF1：体检存档读路径缺表降级修复
+
+- **背景**：S5-2 静态审计发现 `S4-3-IMPLEMENTATION-REPORT.md` §9.7 的「缺表不会崩」只对**写**路径成立。`latestLintRun()`（`articles.ts:501`，改稿页每次打开预览都调）与 `listLintRuns()`（`articles.ts:578`）无 try/catch，缺表（P2021）时抛到 `asyncHandler` → **整个预览接口 500**，改稿主流程受损。
+- **改动（唯一代码文件 `server/src/services/lint-store.ts`）**：新增 `readFailureContext(articleId, e)` 统一日志字段（`articleId` / `code` / `tableMissing` / `err`，**不含连接串与密码**）；`latestLintRun` 包 try/catch → 失败 `logger.warn` + 返回 `null`；`listLintRuns` 同理 → 返回 `[]`。查询条件、`orderBy:{id:'desc'}`、`take` 夹取 `Math.min(Math.max(limit,1),100)`、返回字段**一字未改**。不伪造记录、不把失败表述成「体检通过」；`recordLintRun`（写）保持原样——写失败仍必须透出 `saved:false`。
+- **读降级 / 写不降级的理由**：存档面板与历史列表是辅助信息，缺表/库抖动时不该把「打开文章预览」拖成 500；写入失败属「可追溯性丢失」，必须让人看见。
+- **测试（新增 `server/scripts/test-lint-store-degrade.ts`，注册 `npm run test:lint-store`）**：41 项断言，**全程 Mock、零数据库**——把 `prisma.articleLintRun` 换成假委托（同一单例上的属性替换，`lint-store` 通过 `{ prisma }` 拿到同一对象），`logger.warn` 换成本地捕获器。覆盖：正常返回与字段映射、`createdAt` ISO、JSON 快照反序列化、**查询参数/排序/分页不变性**（断言委托收到的 args）、P2021、P2024、普通 Error、空结果不打 warn、limit 500→100 / 0→1 / -3→1 / 30→30、两条路径日志可区分且带文章 ID。
+- **真实输出**：`npm run typecheck` → 0 错误；`npm run test:lint-store` → `ALL PASS（41 项）`。
+- **边界**：未连接任何数据库、未执行 SQL/Prisma 命令、未跑 `smoke:*` 与 `verify:smoke-iso`（其指纹会读真实库）、未改 `.env`、未改 Schema/Migration、未 commit/push。**`ArticleLintRun` 迁移仍未部署**（S4-3 遗留）；部署顺序仍必须是「先 migrate deploy → 再启动新代码」，本次修复只是把「先起代码」的代价从 500 降到「无存档」。
+- **Git**：M `server/src/services/lint-store.ts`、M `server/package.json`（新增 1 行 `test:lint-store`）、新增 `server/scripts/test-lint-store-degrade.ts`、M `docs/DEVLOG.md`、M `CHANGELOG.md`。
+
+## 2026-11-17（09:35）· S5-2 最终验收通过 + S4-3 报告勘误
+
+- **结论 A**：S5-2 正式通过，可进入独立部署授权评估（**本轮未连库、未部署、未改 Schema/Migration/业务代码**）。
+- **验收核对（只读，8/8 通过）**：
+  1. Migration `20261116120000_add_article_lint_run/migration.sql` 仍只有 2 条语句：`CREATE TABLE`（11 列 + `ArticleLintRun_articleId_createdAt_idx`）+ `ADD CONSTRAINT ... FOREIGN KEY ... ON DELETE CASCADE ON UPDATE CASCADE`；全文无 DROP/TRUNCATE/DELETE/UPDATE。
+  2. `latestLintRun` 失败 → `null`（`lint-store.ts` catch 分支，无伪造记录）。
+  3. `listLintRuns` 失败 → `[]`。
+  4. `recordLintRun` 未改：仍 `logger.error` + `saved:false + error`，不伪造成功。
+  5. 两条读路径 catch 内各 1 条 `logger.warn`，消息分别含 `latestLintRun` / `listLintRuns`，字段含 `articleId/code/tableMissing/err`（无连接串）。
+  6. 正常路径 `where:{articleId}` / `orderBy:{id:'desc'}` / `take: Math.min(Math.max(limit,1),100)` / `toDetail` 映射一字未改（Mock 测试断言委托实收 args）。
+  7. 新测试**确实不连库**：`DATABASE_URL='mysql://probe:probe@127.0.0.1:1/does_not_exist' npm run test:lint-store` 仍 `ALL PASS（41 项）`——连接串不可达时通过，即证明全程无连接、无 SQL。
+  8. 无额外未说明的业务改动：本轮代码 diff 仅 `lint-store.ts`（两个 try/catch + `readFailureContext` + Prisma 类型导入）与 `package.json`（1 行脚本）；`articles.ts` 相对 HEAD 无改动。
+- **S4-3 报告勘误（原文不改写，就地追加）**：① 文首「勘误索引」；② §4.3 末尾（写/读路径能力区分）；③ §9 第 7 条（「不会崩」仅对写入成立）；④ §10 回滚说明（「降级而非崩溃」是 HF1 之后才成立）。共 +18 行。
+- **未变事实**：`ArticleLintRun` Migration **仍未部署**到真实业务库；本轮零数据库访问，业务库状态未因勘误或 HF1 改变。
+- **Git**：HEAD 仍 `b2fbad3`（未提交）；本轮新增 M `docs/restructure/S4-3-IMPLEMENTATION-REPORT.md`、M `docs/DEVLOG.md`。
+
+## 2026-11-17（09:50）· S5-3A 业务库部署前只读核查（结论 A）
+
+- **授权**：仅允许**只读**连接 `wechat_pipeline`（身份/表存在性/迁移状态/备份现状）；不授权写入、备份、部署、改 `.env`。全程未写库、未建备份、未停服务、未跑 smoke/verify、未做 Git 写操作。
+- **连接方式**：内存临时串（读 `.env` 的 `DATABASE_URL` 仅替换库名段 → `wechat_pipeline`，凭据复用），**未写任何文件、未打印连接串/密码**；连接前断言库名 = `wechat_pipeline`，不符合即中止。Prisma CLI 用 `DATABASE_URL=... npx prisma migrate status`（进程级覆盖），输出 `Datasource "db": MySQL database "wechat_pipeline" at "127.0.0.1:3306"` 证明覆盖生效。
+- **身份核验（实测）**：`DATABASE()=wechat_pipeline` / `CURRENT_USER()=wpc_app@127.0.0.1` / `VERSION()=8.0.30` / `@@port=3306` —— 四项全部符合预期。
+- **ArticleLintRun**：`information_schema.TABLES` 查询 **0 行 → 表不存在**（符合「迁移未部署」的既有判断，S5-2 的静态推断至此被真实库证实）。
+- **`_prisma_migrations`（4 行）**：`init` 一条历史 rolled-back（11-13 22:57 → 11-14 09:59，steps=0，非失败）；`init` 应用成功、`add_missing_enum_values` 成功、`add_angle_status_topic_review` 成功（各 steps=1）。**无 `finished_at IS NULL AND rolled_back_at IS NULL` 的未完成/失败记录**；不含 `20261116120000_add_article_lint_run`。
+- **`prisma migrate status`**：`4 migrations found`，仅 `20261116120000_add_article_lint_run` 待应用 —— 与预期完全一致；Prisma CLI 5.22.0。
+- **备份现状**：**项目内不存在任何 MySQL 业务库转储**（全库仅 `server/var/tmp/t1a-expected-mysql-ddl.sql`，是 DDL 期望文件而非备份；`dev.db.bak-*` 8 个是**已退役的 SQLite 归档**，与 MySQL 无关）。`T1-A-BACKUP-RESTORE-REVISED.md` 的 M1（mysqldump）仍标【未执行】，无文件级 SHA-256 记录（`var/tmp/s45/fp.*.txt` 是库状态指纹，不是备份件哈希）。`mysqldump Ver 8.0.30` 在 PATH 可用。
+- **结论 A**：满足进入 S5-3B 部署授权评估的条件。S5-3B 的两个硬前置：① 显式把目标库指向 `wechat_pipeline`（**`.env` 当前仍指 `_smoke`，直接 `migrate deploy` 会打错库**）；② 先 `mysqldump` 一致性备份（本轮禁止建备份，故未建）。
+- **未做（按令）**：不修 `.env`、不部署、不建备份、不 resolve、不改 Schema/Migration/代码、未调查 S5-1 指纹差异。
+
+## 2026-11-17（09:52）· S5-3B-1 业务库完整备份（成功）
+
+- **授权**：仅备份；不部署、不改 `.env`、不停服务、不跑 smoke/fp、无 Git 写操作。
+- **身份**：`wechat_pipeline` / `wpc_app@127.0.0.1` / `8.0.30` / `3306`（内存临时串，未写文件、未打印凭据）。
+- **盘点**：17 表全 **InnoDB**（非 InnoDB=0 → `--single-transaction` 安全）；数据 0.33 MB + 索引 0.61 MB ≈ 0.94 MB，`TABLE_ROWS` 约 67；存储过程/触发器/事件均 **0**；`gtid_mode=OFF`、`lctn=1`。
+- **备份**：`K:/WorkBuddy WorkSpace/backups/wechat-pipeline-cloud/wechat_pipeline_pre_s5-3b-1_20261117_095219.sql`，**84,663 字节**，`mysqldump` 退出码 **0**，耗时约 1s，stderr 为空。
+  - 参数：`--single-transaction --quick --routines --triggers --events --hex-blob --no-tablespaces --set-gtid-purged=OFF --default-character-set=utf8mb4`；**密码经 `MYSQL_PWD` 传入**（不在 argv/日志/报告中）。
+  - SHA-256：`0ddfe00f23d17c5b181e7d3a8e76a6bef391aecd39700a89358e1a2ca3ff4ff8`（备份目录在**项目之外**，目录内仅此 1 个文件，未覆盖任何既有文件）。
+- **校验**：`CREATE TABLE` **17** 个（与库内表数一致）；表清单含 `_prisma_migrations`（8 处引用）；`ArticleLintRun` **0 处**（与「表未创建」一致）；尾部 `Dump completed`；含数据的表 = `_prisma_migrations/llmmodel/setting/styleprompt/user/usersession`（INSERT 6 条）。**未做恢复演练 → 可恢复性未验证**。
+- **备份后复核（只读）**：`migrate status` = 4 migrations found、仅 `20261116120000_add_article_lint_run` 待应用；`ArticleLintRun` 仍不存在；`_prisma_migrations` 仍 4 行、无 `finished_at IS NULL AND rolled_back_at IS NULL` 记录；表总数仍 17 —— **与 S5-3A 完全一致**。
+- **踩坑（无副作用）**：首次尝试用 `read -r USR HOST PORT < <(node ...)` 取凭据，node 输出无尾换行导致 `read` 返回 1、`&&` 链中断，**未生成任何备份文件**；改为 `cut` 拆分后重跑成功。教训：进程替换喂 `read` 必须带换行。
+- **报告**：新增 `docs/restructure/S5-3B-1-BACKUP-REPORT.md`（未改任何历史验收报告）。
+- **Git**：未提交；新增 ?? 报告文件、M `docs/DEVLOG.md`。
+
+## 2026-11-17（09:58）· S5-3B-2 业务库 Migration 部署成功（`20261116120000_add_article_lint_run`）
+
+- **前置**：备份 `wechat_pipeline_pre_s5-3b-1_20261117_095219.sql` 存在、SHA-256 `0ddfe00f…4ff8` **MATCH**；Migration SQL 未变（2 条语句、无破坏性 DDL）。
+- **身份**：`wechat_pipeline` / `wpc_app@127.0.0.1` / `8.0.30` / `3306`；**未用 `.env` 默认目标**（其仍指 `_smoke`），用内存拼装的进程级 `DATABASE_URL` 注入单条命令（未打印/未落盘）；本轮**未用 `MYSQL_PWD`**（未调用 mysqldump）。Prisma CLI 无交互式密码输入，env 是唯一途径——已在报告中如实说明。
+- **服务**：部署前 API 与 scheduler **均未运行**（8787/8797 无 LISTEN、无本项目 node 进程）→ **未停止任何服务，部署后也未启动**。
+- **执行**：`2026-11-17 09:58:04 → 09:58:07`，`DATABASE_URL=<临时> npx prisma migrate deploy`，**exit 0**，仅应用 1 个迁移；输出 `Datasource … database "wechat_pipeline"`（确认非 smoke）+ `All migrations have been successfully applied.`；无权限错误、无 MDL 等待、无部分变更。
+- **结构验收**：表总数 17 → **18**；`ArticleLintRun` **11 列**与 schema 逐项一致（`id` PK auto_increment / `articleId` int NOT NULL MUL / `trigger` varchar(16) / `ok` tinyint(1) / `errorCount`·`warnCount` int NOT NULL DEFAULT 0 / 三 JSON NULL / `contentHash` varchar(64) DEFAULT '' / `createdAt` datetime(3) DEFAULT CURRENT_TIMESTAMP(3)）；索引 `ArticleLintRun_articleId_createdAt_idx(articleId,createdAt)` 非唯一；FK `ArticleLintRun_articleId_fkey → wechat_pipeline.article(id)`，**ON DELETE CASCADE / ON UPDATE CASCADE**；InnoDB / utf8mb4_unicode_ci；新表 **0 行**。
+- **迁移状态**：`migrate status` → **`Database schema is up to date!`**；目标记录**恰好 1 条**（finished 非空、rolled_back 为空、steps=1）；总 5 行（4+1）；无失败/未完成。
+- **数据未变更证明**：把备份 SQL 的逐表 `INSERT` 元组数与部署后 `COUNT(*)` 对比 —— **17 张原表行数逐表一致**（`llmmodel 4 / setting 16 / styleprompt 44 / user 1 / usersession 1`，其余 0），差异仅 `_prisma_migrations` 4→5（本次记账行）+ 新表 0 行。
+- **边界**：未修改 `.env`/Schema/Migration/代码；未跑 smoke/verify/fp；无 Git 写操作；未调用真实 LLM/微信；全程 `wpc_app`。
+- **报告**：新增 `docs/restructure/S5-3B-2-MIGRATION-DEPLOY-REPORT.md`；历史验收报告未改；CHANGELOG 未改（本轮无用户可见功能变更）。
+- **遗留**：`.env` 仍指 `_smoke`（下次本地启动/Prisma 命令务必显式指定业务库）；备份可恢复性仍未演练。
+
+## 2026-11-17（10:20）· S5-4 正式库应用层集成验证（结论 A，152 项断言全通过）
+
+- **授权**：连接并写入 `wechat_pipeline`（仅本轮测试数据），Mock LLM/微信，允许补必需测试与代码修复；禁止迁移/DROP/改 `.env`/真实外呼/Git 写。
+- **载体**：新增 `server/scripts/s5-4-integration.ts`（`npm run verify:s5-4`）。**唯一**允许写业务库的验证脚本，纪律写在文件头：库名硬校验 → 只碰 `s54-<stamp>` 数据 → 按主键精确清理 → 逐表行数比对 → 零真实外呼。
+- **环境（实测）**：`DATABASE()=wechat_pipeline` / `CURRENT_USER()=wpc_app@127.0.0.1` / `VERSION()=8.0.30` / `@@port=3306`；`migrate status` = `4 migrations found` + `Database schema is up to date!`；`_prisma_migrations` 5 行（目标迁移 finished、未回滚）；`ArticleLintRun` 存在。API/scheduler 执行前后**均未运行**，未停/起任何常驻服务；测试用**进程内** Express 随机端口（`127.0.0.1:5xxxx`），跑完关闭，8787/8797 全程空闲。
+- **连接方式**：读 `.env` 凭据 + 内存换库名 → 进程级 `DATABASE_URL`；拼好后**二次校验库名**；未改 `.env`、未打印/落盘连接串。
+- **断言分布（152 项，0 失败）**：环境与身份 6 / 夹具 2 / ArticleLintRun 读写 19 / 级联删除 5 / 预览+stale+降级 23 / 保存与改写体检 24 / 推送门禁 39 / 原有流程回归 24 / 清理 10。
+- **ArticleLintRun**：`recordLintRun` 真实写入 1 行（字段逐个核对，`contentHash=sha256(正文)`，三 JSON 列齐全）→ `latestLintRun` / `listLintRuns` 读回（stats/issues/rule 已反序列化）；同文 4 条记录**不覆盖**、倒序、`limit=2` 生效、`limit=0` 夹到 1；经 `DELETE /api/articles/:id` 删除后体检记录 **2→0**（CASCADE 实测生效）。**坑**：JSON 列按项目约定存**字符串**，`findUnique` 直接拿到的是 string，断言必须先 parse（`unpackJson` 才做这件事）。
+- **业务流程**：预览无存档/有存档/stale/重检复位全对；空壳正文（`<p>还没写。</p>`）不崩且如实报错；**降级复核**：把 `prisma.articleLintRun` 换成抛 P2021 的假委托后，预览仍 200 + `lintRun=null` + `lintRunStale=false` + 现算 lint 仍在，历史接口 200 + `[]`，恢复后正常。保存不合规正文 → 正文落库 + 体检报 error；改写（Mock LLM）→ 先保存再体检（`trigger=revise`，hash 对齐落库正文）；**存档失败 ≠ 体检失败**（`create` 抛错时仍返回 lint + `lintPersistError`，正文已保存）。
+- **推送门禁**：无历史也放行（门禁现算）；不合规拦下且零 `addDraft`、不写 mediaId、status 仍 draft；**旧「通过」不被采信**（改正文后仍被拦，历史里 check:ok 与 push:fail 并存）；`mediaId`/`pushDate` 任一存在即 `already_pushed`（两字段各测一遍，均零外呼、零 TaskRun）；并发两次 → 一次成功一次 `pushing`、`addDraft` 只 +1；首推失败（40164）→ `failed` + `TaskRun.errorCode=40164` + 无推送事实 → 修好后重试成功；封面文件缺失 → 推成并显式 `coverMissing=true`、素材上传零调用。
+  - **口径说明**：「已有推送痕迹 + 本次失败」这条分支**不可达**（`hasPushTrace()` 守卫在最前面，系统根本不会再外呼），本轮验证的是守卫优先级（有痕迹 + 凭据 invalid 仍 `already_pushed`），代码层第二道保险由 S5-1 `smoke:push` B2 覆盖，未在真实库硬造竞态。
+- **回归**：文章 CRUD、候选选题建稿 **400**、`approved` 终态再审核 **400**、建稿占题 `used=true`+占用者为本账号、同题重复建稿 **409**、未推送删稿归还 `used=false`、已推送删稿可删、同内容选题 **400**、`/plan/trigger count=2` 生成 2 篇且 `TaskRun(write)=success`、空池排产 `created=0`+「角度池已空」+零 used 泄漏、漫画产线 `lint=null/lintRun=null/历史[]`。
+- **静态与针对性测试（真实输出）**：`typecheck` **0**；`web build`（含 `vue-tsc --noEmit`）**✓ 28.20s**；`test:lint-store` **41/41**；`verify:s5-4` **152/152**。**按令未跑** `smoke:*` 与 `verify:smoke-iso`（其指纹会读真实库），本轮也未改业务代码，故不重复。
+- **⚠ 本轮唯一越界写入（已修复并如实记录）**：排产写稿会 `upsert` `Setting.style_variant_cursor`（变体轮换游标，键=赛道名，产品既定行为），首次让 `Setting` **16→17**；行内容全是 `S5-4验证赛道-*`，已严格校验「只含测试键」后删除（回到 16）。脚本已补**快照+恢复**（跑前记原值，跑后有则写回、无则删除）+ 断言「不留测试赛道键」。教训：**行数比对只能抓「新增行」，抓不到 UPDATE**；配置类写入必须显式快照恢复。
+- **清理**：Track 2 / TrackPipeline 1 / Account 2 / LlmModel 1 / ModelBinding 2 / Angle 3 / TopicReview 3 / Article 17 / ArticleLintRun 18 / TaskRun 4+2 / WechatToken 1 / 游标行 1，全部按主键精确删除；清理后 17 张表行数与基线**逐表相等**，按 `s54` 标识复查零遗留。
+- **Git**：HEAD 仍 `b2fbad3`，未 commit/push/reset/checkout/stash；工作区新增 `server/scripts/s5-4-integration.ts` + 本报告，修改 `server/package.json`（+`verify:s5-4`）、`docs/DEVLOG.md`、`CHANGELOG.md`；`server/src/**`、Schema、Migration、`.env`、web 源码**零改动**。
+- **遗留（P3，非阻塞）**：① 读降级与「本来没记录」在界面不可区分（需改 `lint-store` 返回契约才可修，已登记）；② `.env` 默认仍指 `_smoke`；③ 并发防重为进程内 Map（多进程需 DB 级占位，S5-1 已登记）。
+- **报告**：新增 `docs/restructure/S5-4-INTEGRATION-VALIDATION-REPORT.md`（含环境/体检/业务流程/门禁/回归/清理/Git/结论八节）。
+
+## 2026-11-17（11:05）· S5-UI-1 设计令牌收口 + 壳层 + 公共组件（回溯补录）
+
+> 该轮按任务约束**未写 DEVLOG**（当时禁止修改 DEVLOG/CHANGELOG），为保持进度台账连续，此处补录事实；详细内容见当轮对话报告。
+
+- **令牌**：`web/src/styles.css` 原「基础令牌 + 品牌扩展令牌」两段 `:root` 合并为一处；新增字号五档 `--wb-fs-page/module/body/aux/num`、补 `--wb-space-6`；圆角收敛两档（6/10，删零引用的 `--wb-radius-lg`）；删零引用的 `--wb-primary-hover` / `--wb-primary-rgb`；`html.dark` 只翻颜色类令牌（尺寸不随主题变）。主色 `#0a7c47` 未动。全仓校验：39 个 `--wb-*` 令牌，**未定义引用 0 / 定义未使用 0**。
+- **悬空令牌**：改稿页 6 处 `--wb-radius-md / text-2 / text-3 / surface-2` 映射到已有令牌（`radius-sm` / `text-secondary` / `text-muted` / `surface-muted`），仅 CSS 改动。
+- **壳层**：顶栏 `pageTitle/pageDesc` → 面包屑（首页/分组/父级/当前页），页面主标题唯一由 `PageHead` 的 h1 承担；侧栏底部系统状态块 → 右上角 `el-popover`（`Odometer` 按钮 + 异常红点，内容与接口不变）。**坑**：面包屑分组不能取「按角色过滤后的菜单」，否则非 admin 落到管理页会少一级 → 拆成 `MENU_GROUPS`（全量）+ `menuGroups`（过滤后）。
+- **新组件**：`PageHead / StatusTag / EmptyState / SaveBar / TaskProgress`；使用面 PageHead 10 页、StatusTag 8 处、EmptyState 12 处、SaveBar 2 处（文风面板底部 / 赛道产线展开区）、TaskProgress 1 处（任务流水）。
+- **状态词表**：`utils/format.ts` 按 kind 分表（article/angle/verdict/task/pipeline/usage）+ `statusMeta()` 单一入口；`TrackAnglesView` 本地三份词表删除；`task` 表按 `TaskStatus` 枚举补齐 `pending/running/success/failed/canceled`（原表缺 canceled，会显示英文原值）。
+- **验收**：`vue-tsc` 连续两次 0；`npm run build` ✓；headless Chrome 走查 11 张（浅/深/窄屏/浮层开合，CDP 真实点击）。局限：未连后端，数据态未真机确认。
+- **未做**：未改 `server/**`、Schema、Migration、API、`.env`、DB；未 commit/push。
+
+## 2026-11-17（11:40）· S5-UI-2-B 工作台待办队列（实现 + 验收通过）
+
+- **授权**：S5-UI-2-A 只读核查通过后实施。范围限 Dashboard 聚合 + 工作台 UI + 冒烟脚本；不建待办中心、不加业务模型。
+- **接口**：扩展现有 `GET /api/dashboard`，新增 `todos` 区块（不新建端点、不删改原字段）。**所有计数为 `number | null`**：0=确实没有，null=该块查询失败（前端显示「统计暂不可用」，禁止显示 0）。
+- **选题口径**：`{used:false, status in (candidate,needs_revision)}`（与 planner 的「有题但没审」同判据）；排除 used/approved/rejected；按 `groupBy(trackId,status)` 分赛道；最久等待用 `updatedAt`（needs_revision 的起点是「被打回」）；**admin=完整数据，member 恒 null 且不进 degraded**。
+- **文章口径**：一律走 `hasPushTrace()`（mediaId/pushDate 任一非空，内部 trim），**不用 status 推断**——`cover.ts` 会把 pushed 退回 draft，`revise/emphasis` 会改 updated。由于 SQL 的 `!= ''` 判不出纯空白串，改为取回 `draft+failed` 行在 JS 里分类（行数天然有限，撞 500 上限则整块降级，不用近似值）。三类互斥 + 漫画 `comicDraft` 单列。
+- **体检口径**：`groupBy(articleId,_max(id))` 两步取每篇最新一条，只统计 `ok=false` **且** `contentHash === htmlFingerprint(当前正文)`；`pipeline='comic'` 排除。**严禁调 `GET /:id/lint`**（该接口会 `recordLintRun` 写库）。断言验证工作台请求前后 `ArticleLintRun` 行数不变。
+- **任务口径**：`jobType in (write,comic_script,comic_panel)`（排除 push，避免与 pushFailed 重复），近 7 天，按 `jobType:accountId`（批次）/ `panel:articleId` 取组内最新一条，仍 failed 才算未恢复 → 重试成功后自动消失，不需要「已处理」字段。UI 文案用「次」不用「篇」。
+- **member 兜底**：`comic_panel` 行没有 accountId，member 过滤需 `OR(accountId∈我的账号, accountId=null 且 articleId∈我的文章)`，否则会漏掉自己漫画的失败。
+- **降级**：四块并行各自 `safe()`，一块挂只让它自己变 null 并登记 `todos.degraded`；空库断言四块全 0（不是 null）。**走查抓到 1 个真实缺陷**：降级时后端返回「字段全 null 的对象」，前端最初只判对象存在 → 漏显示「统计暂不可用」；改为判 `anglesBlock.total !== null`。
+- **测试**：新增 `server/scripts/smoke-dashboard.ts`（隔离库，注册 `smoke:dashboard`），**51 项断言**覆盖验收清单 1–18；输出 `CHILD EXIT=0 / CLEANUP ok / REAL-DB FINGERPRINT MATCH`。
+- **静态**：`server typecheck` 0；`web vue-tsc` ×2 0；`web build` ✓ 7.5s。
+- **视觉**：构建产物 + 临时 Mock 上游（`var/tmp/s5ui2/`，手写 JSON、不连库、跑完已停）截 5 个场景（常规浅/深、全 0、四块降级、member）。
+- **局限（已登记报告 §9）**：7 天窗口会漏掉更早未恢复的失败；扫描上限 500 撞上则降级；未推草稿不限时间会持续堆积；「待重推」跳列表是超集（列表无复合筛选）。
+- **Git**：HEAD 仍 `b2fbad3`，未 commit/push；S5-UI-1 等既有未提交内容原样保留。
+
+## 2026-11-17（12:10）· S5-UI-2-C-P0-FIX 单赛道待审选题跳转修复
+
+- **问题**（S5-UI-2-C 审计 P0-1）：`DashboardView.goAngles` 把 status 写死默认 `'candidate'`，而一键入口只传 trackId → 单赛道只有 `needs_revision` 时必落「共 0 条」。明细行因传自身真实 status，不受影响。
+- **修复**：新增 `web/src/utils/todo-nav.ts`（纯函数，无 Vue 依赖）——`initialAngleStatus`（candidate>0 优先 candidate，否则 needs_revision，两者皆 0 则 `undefined` 不构造筛选）+ `anglesQuery`（`used=unused` 恒带，status 为空不写键）+ `anglesTopTarget`（单赛道→该赛道选题库，多赛道/空→`/tracks`）。`goAngles` 去掉 `?? 'candidate'` 默认值。
+- **为什么抽 util**：判定是「数据→URL 参数」的纯映射，留在组件里只能靠点按钮验；抽出后 Node 脚本可直接断言，且防止后人再把默认值写死。
+- **断言**：`npm run test:todo-nav`（`node --experimental-strip-types`，无新依赖）**15 项全通过**，覆盖 P0 场景、优先候选、两者为 0、多赛道、明细透传、used 恒定。
+- **浏览器复测**（dist + 本地 Mock，跑完即停）：A 单赛道候选0/待改1 → `?used=unused&status=needs_revision`，目标页 1 行正是该条；B 候选2/待改1 → `status=candidate`；C 双赛道 → `/tracks`；D 明细行不变。
+- **静态**：`vue-tsc` exit 0；`build` ✓ 10.89s。
+- **未做**：审计 P1 三项按授权不动；未连真实库。详见 `docs/restructure/S5-UI-2-C-P0-FIX-REPORT.md`。
+
+## 2026-11-17（12:41）· S5-UI-2-D-1 多赛道待审核选题跳转承接
+
+- **问题**（S5-UI-2-C 审计 P1-1）：`anglesTopTarget` 多赛道分支只 push 裸 `/tracks`，把已拿到的 `byTrack` 分布信息丢掉；赛道页不读任何路由参数 → 用户还得逐个点进去找。
+- **参数**：多赛道落点带 `/tracks?pending=3,5`（id 取 `byTrack` 且 `candidate+needsRevision>0`，去重升序，>50 截断；无待审则不产生参数）。单赛道分支与明细跳转一字未改。
+- **承接**：`TracksView` 用 `parsePendingTrackIds` 读参（正整数过滤、支持数组形式、非法值静默丢弃、防超长）；页面级 info 提示条（列出赛道名 + 「只看全部赛道」= 去参数）+ 行内 warning-plain「待审核」小标签。无参 = 零变化。
+- **为什么不带数量**：`/api/tracks` 无待审计数字段（只有 angleUnused/angleTotal）；按「数量必须有可靠来源」只显示事实不显示数字，加字段属后端改动（未授权）。
+- **坑（窄屏）**：≤1024px 行内标签会被列宽挤压成半个色块（赛道列 `min-width` 未变 180，是表格列宽合计 ~1238px > 视口的老问题）→ 该断点隐藏标签，以顶部提示条为准。
+- **测试**：`npm run test:todo-nav` 15 → **27 项**（新增参数生成 6 项 + 解析 7 项）；浏览器 8 场景（多赛道/刷新/单标记/无效 id/清除/无参/单赛道/明细）全过；`vue-tsc` 0、`build` ✓ 8.18s。
+- **未做**：显示待审条数（需 `/api/tracks` 加字段）、窄屏行内标记、点标签直达待审筛选（不知赛道内分布，硬猜会重演 P0 空列表）。详见 `docs/restructure/S5-UI-2-D-1-IMPLEMENTATION-REPORT.md`。
+
+## 2026-11-17（13:03）· S5-UI-2-D-2 文章待办精确筛选：核查后停止，未实施
+
+- **结论**：**未改任何代码**。触发两条停止条件（任务书 §4.3 + §3）：
+  ①`GET /api/articles` 只支持 `status/accountId/angleId/pipeline/limit≤100/offset`，**无 `needs` 能力**；且 `mediaId`、`pushDate` 是 `VARCHAR NOT NULL`，判「从未推送」需 `TRIM(x)=''`，Prisma 表达不了；列表响应还**不返回 `pipeline`**，前端连漫画都分不出 → 前端过滤必然漏行+数字错，全量拉取被禁止。
+  ②**口径差异**：任务书 §3.B 的 `repush` 只含 `draft ∧ 有推送痕迹`，而 Dashboard 实际是 `count(status='updated') + draft ∧ hasPushTrace`（`updated` 由 revise/emphasis 从 pushed 转来，必有推送痕迹）。照任务书实现会让列表比卡片少一截——正是本轮要消除的不一致反过来重演。
+- **建议**（待授权，见报告 §5）：`/api/articles?needs=draft_unpushed|repush`，`needs` 与 `status` 互斥且优先，隐含 `pipeline='article'`；`total` 跟随同一 where；纯空白用 `equals:''` + 冒烟监测（或 raw SQL `TRIM` 求位级一致）。前端 +纯函数 + 两类跳转。
+- **待决策 D1**：`repush` 是否含 `status='updated'`（建议含，与现有数字对齐）。
+- 报告：`docs/restructure/S5-UI-2-D-2-IMPLEMENTATION-REPORT.md`。
+
+## 2026-11-17（13:13）· S5-UI-2-D-2 文章待办精确筛选闭环（实施）
+
+- **决策**：D1 repush 含 `updated`；D2 `equals:''` 不引 Raw SQL；D3 授权改 `routes/articles.ts`；D4 不加 `pipeline`；D5 needs 优先于 status。
+- **后端**：`GET /api/articles?needs=draft_unpushed|repush`。`needs` 走独立分支（`status`/`pipeline` 不参与），隐含 `pipeline='article'`；`draft_unpushed` = `draft ∧ mediaId='' ∧ pushDate=''`；`repush` = `OR(updated, draft ∧ (mediaId≠'' ∨ pushDate≠''))`；items 与 total 共用同一个 where；非法值按未传。
+- **前端**：`todo-nav.ts` 加 `articlesNeedsQuery`/`parseArticleNeeds`；Dashboard 两类入口改带 `needs`；ArticlesView 读 needs（提示条「当前筛选：…」+条件+清除、状态/产线下拉禁用、定向空态「没有未推送草稿/待重推文章」），failed/comic 入口不动。
+- **一致性**：隔离库冒烟断言 59/60 直接钉「接口 total === Dashboard 数字」：draftUnpushed 2=2、repush 4=4（新增 a9「两字段都有值」夹具后 repush 由 3→4，仅改期望值）。
+- **坑 1（Vue v-else 链）**：提示条插在 `StateError v-if` 与 `el-card v-else` 之间 → v-else 找不到相邻 v-if，**整张表被 Vue 丢弃**，页面只剩标题；`vue-tsc`/build 都不报，只有真渲染才暴露。改用 `v-if="!error"`。
+- **坑 2（SMOKE_NO_AUTH 时序）**：member 归属断言必须在**旁路关闭期间**发请求；第一版先把 env 恢复再 fetch，结果以 admin 身份执行（total=2 而非 1）。改为在 try 内完成登录+请求。
+- **验证**：`smoke:dashboard` 67/67（CHILD EXIT=0 / CLEANUP ok / FINGERPRINT MATCH）；`test:todo-nav` 34/34；`server typecheck` 0；`vue-tsc` 0；`build` ✓ 8.63s；浏览器 8 场景（含空态与深色）。
+- **纯空白监测**：隔离库 0 条「非空但 trim 为空」，D2 的 `equals:''` 与 hasPushTrace 在本库等价。
+
+## 2026-11-17（14:17）· S5-UI-2-D-3-B 执行异常详情抽屉（实施）
+
+- **依据** D-3-A 方案 A：失败原因本来就在 `todos.runs.recent[i].errorMessage` 里，卡片上也已渲染（只是被单行省略号截断），所以问题不是「数据缺失」，而是「点击跳走」。改法=就地展开，不跳页、不请求。
+- **改动**：仅 `web/src/views/DashboardView.vue`。`goRun()`（`/plan` 裸跳）删除 → `openRun(row)` 打开 `el-drawer`（520px / 92vw）。字段：类型 / 状态（`TaskProgress status="failed"`，该集合本身就是 failed，不造假）/ 任务 ID / 账号 / 时间 / errorCode / **errorMessage 原文**。
+- **文本**：`pre-wrap` + `overflow-wrap:anywhere` + `max-height:44vh` 内部滚动 + `user-select:text`；没有省略号。
+- **降级**：comic_panel 无原因 → 专用文案 + 去文章看分镜；其它空原因 → 「该任务没有记录文字失败原因」+ errorCode；`>=900` 字 → 截断提示；write/comic_script 有原因 → 注明「不含失败选题标题」。
+- **复制**：项目无既有剪贴板工具 → `navigator.clipboard.writeText`，成功/失败都给明确 `ElMessage`，失败不假装成功；空原因不渲染按钮。
+- **出口**：有 articleId → 去文章（先关抽屉再 push）；无 → 去创作计划（不承诺能定位）。
+- **脚注**：`unresolved - recent.length > 0` 时显示「当前仅展示最近 N 条异常，另有 M 条未在此处展开」，N/M 动态算；降级时 `?? 0` 不显示。
+- **实测**（dist + Mock）：13 项场景全过——点击后 `location.pathname` 仍 `/`；1005 字原因可滚动无横溢；剪贴板读回与原文逐字一致（1005=1005）；关闭按钮与 ESC 均隐藏且 `body` 解锁；500px 视口抽屉 460px 不出屏；深色可读。
+- **回归**：选题去审核 `/tracks?pending=3,5`、未推送草稿 `/articles?needs=draft_unpushed`、体检去文章 `/articles`、任务流水 Tab 均不变。
+- **未做**：`TODO_RECENT` 保持 3（只加脚注）；comic_panel 原因写入、errorMessage 带选题标题属写库侧，需另行授权。
+
+## 2026-11-17（16:49）· S5-UI-3-1 文章工作台信息层与反馈一致性（实施）
+
+- **依据**：S5-UI-3-0 审计报告 §10 A 档 6 项，聚焦列表信息层 + 反馈口径，不重写两页。
+- **纯函数落点**：新增 `web/src/utils/article-push.ts`（无 Vue/API 依赖）——`hasPushTrace`（逐字对齐后端 `article-delete.ts` 的 trim 判据）/ `pushFact`（事实与 status 分开，5 档文案）/ `batchDeleteImpact`（判据换推送痕迹）/ `pushFailView`（推送失败 6 档分类）。列表页与改稿页**共同调用** pushFailView / 共用口径，杜绝两页逻辑分叉。
+- **列表**：状态列后加「推送事实」列（tag + 可选日期 + tooltip hint）；批量删除 impact 从 `status==='pushed'` 改用推送痕迹；推送失败弹窗标题不再把 already_pushed/pushing/lint_failed 显示成「无 errcode」。
+- **改稿页**：标题/摘要旁加派生规则说明（h1+【话】前缀 / 首段前 54 字，与 render/index.ts 一致）；强调补全与 AI 改写各自成区（轻边框小标题，两步操作/AI 参数一字未动）；页头迁 PageHead、保存条迁 SaveBar（新增 saveState/saveError，saving>error>dirty>saved，失败绝不显示已保存；保留 dirty/Ctrl+S/离页保护/保存 API/自动体检落痕）。
+- **验证**：`typecheck` 0；`build` ✓ 19.54s；新增 `test:article-push` 26/26；`test:todo-nav` 34/34；浏览器（真实 dist+Mock）列表 6 类数据全对、深色/500px 窄屏无溢出、改稿页组件迁移到位、保存三态（saved→dirty→error，失败态不冒充已保存）、控制台 0 error。
+- **坑（走查）**：Mock 的兜底 404 用默认 code=200，导致「保存失败」无法模拟 → 给夹具加 `mode=failsave` 的 PUT /content 返回 500；改稿页需轮询等 `.src-editor` 出现再操作，否则打在空 DOM 上。两者均属 var/tmp 夹具，非业务代码。
+- **边界**：无业务逻辑/API/Schema/DB/配置变更；未连 MySQL、未调 LLM/微信、未推送；HEAD 保持 `b2fbad3`、工作区既有 57 项未提交改动未动、未 Git 写操作。详见 `docs/restructure/S5-UI-3-1-IMPLEMENTATION-REPORT.md`。
+- **遗留**：产线标识（pipeline 未回传）、体检段落定位（无 blockIndex）按任务书延期；窄屏推送事实列随表格响应式收起（既有行为）。**等待验收，不自动进入下一阶段。**
+
+## 2026-11-17（17:23）· S5-UI-3-3 产线标识与窄屏推送事实（实施）
+- **授权**：基于已验收的 S5-UI-3-2 评估报告，人工授权实施 A/B 两项；范围严格控制，以实际代码为准（任务书所写 `server/src/routes/articles.ts` 实际为 `server/src/api/routes/articles.ts`）。
+- **A 产线标识**：后端 `GET /api/articles` items 映射补 `pipeline: r.pipeline`（select 本就含该字段，1 行）；前端标题列仅 `pipeline==='comic'` 显示 `StatusTag kind="pipeline"`，普通文章/字段缺失不显示；文案沿用 `/api/pipelines` 词表，未新增映射/组件/DB 字段，筛选/分页/权限/漫画逻辑一律未动。
+- **B 窄屏推送事实**：复核成因=剩余列宽超容器+固定操作列遮挡（非 CSS 隐藏/EP 自动收起）。改法（全在 ArticlesView.vue 局部）：窄屏(≤900px)把 selection 与推送事实列设为 `fixed="left"`（治遮挡，非 z-index 掩盖）、推送事实紧凑(宽度 132→108、日期进 tooltip `pushFactTip`)、ID/字数列加 `col-optional`；全局 CSS 与 `hasPushTrace`/`pushFact` 未动。
+- **验收口径纠正**：上轮 `pushCellVisible`(DOM 存在)/`docOverflow`(页面无溢出)均不能证明可见。本轮走查用 `getBoundingClientRect` 交集：500px 下推送事实单元格与视口/表格容器交集=自身完整宽度(52/76px)、与固定操作列重叠=0（7 行全对，含漫画/普通、有/无痕迹）；hover 日期进 tooltip 正常；桌面 10 列齐全、漫画标签正确；深色对比度正常；控制台 0 error。证据 `var/tmp/s5ui2c/walk-3-3.mjs` + `93-result.json` + 截图 90~93。
+- **验证**：server typecheck 0；web typecheck 0；build ✓12.77s；test:article-push 26/26；test:todo-nav 34/34；pipeline/漫画标签契约断言通过。执行前确认两断言脚本无连库痕迹，全程未连 MySQL/未调 LLM 微信/未推送/未装依赖/未改 package.json。
+- **边界**：无业务逻辑/API 语义/Schema/Migration/DB/配置变更；HEAD 保持 `b2fbad3`、工作区既有 59 项未提交改动全部未动、未 Git 写操作；Mock/vite/Chrome 已停、端口已释放。详见 `docs/restructure/S5-UI-3-3-IMPLEMENTATION-REPORT.md`。
+- **结论**：建议关闭 S5-UI-3-3。遗留（标题摘要独立编辑、lint 段落定位、push_failed 筛选）属需后端配合的独立事项，不在本轮范围。**等待人工验收，不自动进入 S5-UI-4。**
+
+## 2026-11-17（19:11）· S5-UI-4-1-A 文风配置与写作规范修复（实施）
+- **授权**：基于已验收的 S5-UI-4-0 审计 S1/S2(P1/P2)，修复写作规范 Tab 错挂与 key 错位；任务书在「不修改提示词内容或」处截断，按 A/B/C + D 边界保守实施，未扩范围。
+- **链路核对（以实际后端为准）**：`s:{赛道}` 是后端合法 key（`SPEC_PREFIX`/`defaultFor`/WRITING-PIPELINE §2 一致）；`v:global:spec` 不合法（dim 仅 title/structure/length）；`allDefaults().specs` 的 key 是裸赛道名；`currentEditorKey` 的 spec 分支原为死代码。
+- **修复（仅 StylePromptsView.vue 一个业务文件）**：写作规范 Tab 从全局库移到赛道面板；新增 `SPEC_PREFIX='s:'` 供 `skey()` 复用；`currentEditorKey` spec 分支变可达；`restoreKey` 对 `s:` 按裸赛道名查 `d.specs`；`trackDirty` 纳入 `skey`；删除赛道确认文案补写作规范；key 注释补全。未改后端/Schema/DB/生成算法/提示词内容。
+- **验证**：web typecheck 0；浏览器走查（vite5200 + 派生 Mock8788 + CDP，控制台 0 error）：赛道面板 6 Tab 含写作规范、星座内容=`s:星座`、dirty 显示 `s:星座`、**保存 URL=`PUT /api/style-prompts/s%3A%E6%98%9F%E5%BA%A7`(解码 s:星座)**、恢复默认准确填回出厂规范且无「没有默认值」误报、切育儿显示各自规范不混用、深色/500px 均正常。证据 `var/tmp/s5ui2c/walk-4-1e.mjs` + `B41E-result.json` + 截图 B41E-01~07。
+- **边界**：未连库/未调 LLM 微信/未推送/未装依赖/未改 package.json；HEAD 保持 `b2fbad3`、工作区既有 62 项未提交改动未动、无 Git 写操作；派生 Mock 与走查脚本在 var/tmp（不进版本库），服务与端口已释放。详见 `docs/restructure/S5-UI-4-1-A-IMPLEMENTATION-REPORT.md`。
+- **结论**：建议关闭 S5-UI-4-1-A。遗留 E-3（删除赛道未保存提示，P3）等不在本轮范围。**等待人工验收，不自动进入 S5-UI-4-1-B。**
+
+## 2026-11-17（20:18）· S5-UI-4-1-B 选题库窄屏体验优化（实施）
+- **授权**：基于已验收的 S5-UI-4-0 审计 A-1（500px 审核列 left≈815/评分列 left≈965 不可见），局部 UI 修复；确认 S5-UI-4-1-A 已关闭且未触碰其文件。
+- **方案**：仅改 `web/src/views/TrackAnglesView.vue`——窄屏(≤1100px)把 selection/审核/评分固定左侧(审核 150→96、评分 96→72)，低优先级列(ID/主题/用途/消费态状态/关联文章/来源)`v-if`移除，选题内容 min-width 300→140 作滚动主列，操作仍 fixed right；桌面端全回落原值。未改全局 CSS、未碰业务逻辑/评分规则。
+- **验证（DOM 几何，非截图观感）**：1440/1024/768/500/500深色五组，审核/评分与视口及表格容器交集=自身满宽(窄屏 96/72)、与操作列重叠=0，docOverflow=false，控制台 0 error；桌面保持 10 列。覆盖候选待审/已通过R1/未评分等多状态评分。typecheck 0、build ✓19.52s、article-push 26/26、todo-nav 34/34。证据 `var/tmp/s5ui2c/walk-4-1b.mjs` + `C41B-result.json` + 截图 C41B-*。
+- **取舍**：窄屏标题右侧被 fixed 操作列覆盖 76px（fixed 列预期行为，tooltip 看全文，同 S5-UI-3-3）；低优先级列窄屏隐藏但筛选能力仍在筛选条。
+- **边界**：未改后端/API/Schema/Migration/.env，未连库、未调 LLM 微信、未推送、未装依赖、未改 package.json；HEAD 保持 `b2fbad3`、工作区既有 63 项未提交改动未动（含既有 server 改动）、无 Git 写操作；服务与端口已释放。详见 `docs/restructure/S5-UI-4-1-B-IMPLEMENTATION-REPORT.md`。
+- **结论**：建议关闭 S5-UI-4-1-B。**等待人工验收，不自动进入 S5-UI-4-1-C。**
+
+## 2026-11-17（20:43）· S5-UI-4-1-C 模型就绪状态准确性修正（实施）
+- **授权**：基于 S5-UI-4-0 审计 C-1（前端 bindState 只判绑定/启用/Key，缺能力/协议校验，显示就绪却不可用）；确认 A/B 已关闭且未回退其文件。
+- **后端真源**：`tryResolveForRole`(llm.ts:953-983) 校验序=绑定→存在→启用→能力→协议kind→协议白名单→协议已实现→有Key；`roleAcceptsModel`/`isProtocolImplemented`/`ROLE_SPEC` 在 model-registry.ts。`GET /models/resolve/:role` 已存在并返回 usable/reason（前端 resolveRole()/RoleResolveResult 已封装）——未新增接口。
+- **改动（仅 ModelsView.vue）**：新增 resolutions 状态；load 用 Promise.allSettled 并行拉各角色 resolve；bindState 优先用后端 usable/reason（reason→短文案，可用性由 usable 定），失败降级回落本地基础判断；状态 tag 加 tooltip 显示完整 reason。未改绑定/启用/测试/生成行为。
+- **一致性证据（任务第8条）**：用脚本直接 import 后端 roleAcceptsModel/isProtocolImplemented 按同序算出各用例 expected（非手写）；Mock resolve 取该 expected；浏览器实测前端 tag 文案 7/7 + 补充 1/1 与真源一致，tooltip 逐字等于 reason。覆盖就绪/未绑定/已停用/未填Key/绑定失效/能力不匹配/协议不匹配。浅色/深色/500px 均正常，Console 0 error。证据 `server/var/tmp/model-case-expected.json`、`var/tmp/s5ui2c/C41C-result.json`+`C41C-cap-result.json`+截图 C41C-*。
+- **验证**：typecheck 0、build ✓14.99s。`smoke:models` 未跑（脚本含 deleteMany+备份恢复属写库，超出本轮不连库边界），模型逻辑改由真源+Mock 走查覆盖。
+- **边界**：未改后端/API/Schema/Migration/.env，未连库、未调真实 LLM 微信、未推送、未装依赖、未改 package.json；HEAD 保持 `b2fbad3`、工作区既有 64 项未提交改动未动、无 Git 写操作；服务与端口已释放。详见 `docs/restructure/S5-UI-4-1-C-IMPLEMENTATION-REPORT.md`。
+- **结论**：建议关闭 S5-UI-4-1-C。**等待人工验收，不进入 S5 后续阶段。**
+
+## 2026-11-17（21:02）· S5-UI-5 剩余核心页面体验审计（只读）
+- **性质**：只读审计五条链路（创作计划/选题审核/账号管理/文风模型端到端/文章到草稿箱）；不重复 S5-UI-0~4-1 已关闭事项。未改任何业务代码/CSS/配置/后端/Schema/Migration/.env，未连库、未调 LLM 微信、未推送、未 Git 写操作。
+- **结论**：1 个 P1、4 个 P2、2 个 P3，无 P0。**P1（创作计划 A1）**：出稿全部失败仍弹绿色「已生成 N 篇草稿」并跳 `/articles/0`（404）——后端 `planner.ts` 失败项 `id:0` 仍入 created、`plans.ts` 以 `length>0` 判 ok；已用专用 Mock + 真实浏览器完整复现（toast/矛盾确认框/404 StateError，`var/tmp/s5ui2c/W5P1-result.json`），需后端配合修。
+- **P2**：A2 计划页未渲染后端 warnings/backlog（触发前预警落空）；C1 账号 credStatus=ok 仅格式合规却显示"就绪"（观察项）；E-1 后端 lint hits 片段前端类型丢弃未展示；E-2 无账号文章错误指向 UI 做不到的动作。**P3**：B1 确认弹窗 markdown 星号字面显示、D-1 模型配置引导偏弱、E-3 已推送按钮无前置提示。
+- **专项核对（均符合预期）**：Secret 掩码/AES-GCM、AppID 明文、无默认账号概念、全链路"只推草稿箱不群发"表达准确（articles 实测 hasDraftOnly=true/hasNoMass=true/hasMassSent=false）。
+- **验证分级**：P1 为浏览器实测闭环；多视口 1440/1024/500+深色见 `W5-result.json`；A2 有值渲染、E-1 浏览器观感、C1 角色视野等因 Mock/业务数据限制未实测，报告如实标注。Console 4 条 Uncaught 定位为 Mock 缺端点，非产品缺陷。
+- **边界**：未把已修问题（选题库窄屏/模型就绪/写作规范/文章工作台）重复列项；E-1 与延期的 blockIndex 跳转明确区分。HEAD 保持 `b2fbad3`、工作区既有 65 项未提交改动未动；服务与端口已释放。详见 `docs/restructure/S5-UI-5-CORE-FLOW-AUDIT.md`。
+- **结论**：等待人工审查；不自动实施修复、不进入 S5-UI-6。是否因 P1 阻塞 S5 收尾由人工裁定。
+
+## 2026-11-17（21:33）· S5-UI-5-P1 出稿失败反馈闭环修复（实施）
+- **授权**：仅修 S5-UI-5 审计 P1（出稿全失败仍报成功并跳 /articles/0）；不实施 P2/P3。先重读实际代码确认根因（planner 失败项 id:0 入 created、plans 以 length>0 判 ok、PlanView 取 created[0] 跳转）。
+- **后端**：planner.ts 的 TriggerResult.created 收窄为真实 id>0 成功项，新增 failed/skipped；5 处 push 分离（2 真实成功留 created、3 失败改 failed 去 id:0）；TaskRun 的 status/errorCode/errorMessage 改用 failed（格式不变，Dashboard 兼容）；4 处 return 带新字段。**releaseReservedAngles 补偿调用 4 处逐字未动**（契约断言验证）。plans.ts 的 ok 按 succeeded>0、返回 failed/skipped、message 四态区分。
+- **前端**：types.ts 加可选 failed/skipped（兼容旧响应）；PlanView 四态反馈——全成功 green toast+跳真实 id、部分成功显示成功/失败数+失败明细且只跳真实成功、全失败无 toast+「建稿失败」+真实原因+只有「知道了」不跳、全跳过「未生成草稿」+跳过数；骨架草稿/漫画插图提示保留在全成功分支。
+- **验证**：server/web typecheck 0、web build ✓24.05s、结果语义契约断言全过；浏览器四态独立会话验证（mock-p1fix.mjs 四账号 + 请求体日志证明 accountId 901-904 正确）：全成功→/articles/9001、部分成功→/articles/9003 且显示失败原因、全失败→无 toast+停 /plan、全跳过→未生成草稿+停 /plan，Console 均 0 error。证据 `var/tmp/s5ui2c/P1FIX-*.json`/截图。
+- **边界**：无 Schema/Migration/.env 改动、未连库（写库 smoke 脚本检查有副作用故未跑）、未调真实 LLM 微信、未推送、未装依赖、未改 package.json；HEAD 保持 `b2fbad3`、工作区既有 66 项未提交改动未动、无 Git 写操作；服务与端口已释放。详见 `docs/restructure/S5-UI-5-P1-IMPLEMENTATION-REPORT.md`。
+- **结论**：等待人工验收，不实施 P2/P3，不进入后续阶段。
+
+## 2026-11-18（10:24）· S5-UI-5-P2-1 创作计划 warnings/backlog 展示（实施）
+- **授权**：仅补 S5-UI-5 审计 A2（后端已返回 warnings/backlog 但计划页未展示）；不改后端/排产/失败补偿/P1 四态，不实施 P2-2/2-3/2-4。先核对后端真源：warnings:string[] 三类自带原因（角度不足/库存告急/角色未就绪）；backlog:{date,account,got,miss}[] 为近 N 天（不含今天）历史欠账，非本批失败。
+- **改动（仅 PlanView.vue）**：加 planWarnings/planBacklog computed（Array.isArray 守卫，null/非数组不渲染不伪装 0）、warningsExpanded 折叠；模板在表格下加 warnings 区（el-alert warning 逐条原文、默认 2 条+展开全部 N 条、空数组不渲染）+ backlog 区（el-alert info，明确「近 3 天欠账（非本次排产）」+日期/账号/已出/缺）；复用 el-alert 与 wb 令牌，无新公共组件。types.ts 未改（字段已齐）。
+- **验证**：web typecheck 0、build ✓32.16s、P1 回归+P2-1 契约断言全过；浏览器六态（空/zero/有warnings/有backlog/backlog=null/两者共存）+1440/1024/500+深色@500 全过，展开交互实测，Console 0 error，docOverflow=false。证据 `var/tmp/s5ui2c/walk-p21.mjs`+`P21-result.json`+截图 P21-*。P1 四态本轮未重跑（靠静态契约+已有 P1 证据）。
+- **边界**：无后端/API/Schema/Migration/.env 改动、未连库、未调 LLM 微信、未推送、未装依赖、未改 package.json；HEAD 保持 `b2fbad3`、工作区既有 69 项未提交改动未动、无 Git 写操作；服务与端口已释放。详见 `docs/restructure/S5-UI-5-P2-1-IMPLEMENTATION-REPORT.md`。
+- **结论**：等待人工验收，不实施 P2-2/P2-3/P2-4。
+
+## 2026-11-18（10:37）· S5-UI-5-P2-2 账号凭据状态措辞修正（实施）
+- **授权**：仅修 S5-UI-5 审计 C1（credStatus=ok 显示为「就绪」暗示已认证）；不改后端校验/加密/保存/微信调用，不实施 P2-3/P2-4。先核对后端真源：credStatus 只做格式校验（ok=格式合规），OAAccount 无任何 verified/testedAt 真实验证字段，系统确无「真实接口验证状态」。
+- **改动（仅前端文案层）**：format.ts `CRED_TEXT.ok` 就绪→格式合规（invalid→格式错误、missing→未填写），新增 `credHint()` tooltip（ok 明确"尚未代表接口验证成功，请点测试连通"）；AccountsView PageHead desc→「凭据格式合规 N 个（不代表接口已验证）」+状态 tag 加 tooltip + 变量 readyCount→credOkCount；DashboardView label「就绪账号」→「格式合规账号」+空态；PlanView/EmptyState 空态「需凭据就绪且启用」→「需凭据格式合规且启用」（EmptyState 仅注释）。
+- **全局一致性**：全前端 grep 凭据相关「就绪」零残留；ModelsView 模型角色「就绪」、ArticleEditView 漫画产物「已就绪」未误改（静态契约验证）。
+- **验证**：web typecheck 0、build ✓7.96s、静态契约 11/11；浏览器四态（格式合规/未填写/待填写/格式错误）+ tooltip 实测+桌面/500px/深浅色全过，Console 0 error，docOverflow=false。「已验证」字样仅出现在 PageHead「不代表接口已验证」（准确表述）非误导。证据 `var/tmp/s5ui2c/walk-p22.mjs`+`P22-result.json`+截图 P22-*。
+- **边界**：无后端/API/Schema/Migration/.env 改动、未连库、未调微信、未测真实凭据、未推送、未装依赖、未改 package.json；HEAD 保持 `b2fbad3`、工作区既有 70 项未提交改动未动、无 Git 写操作；服务与端口已释放。详见 `docs/restructure/S5-UI-5-P2-2-IMPLEMENTATION-REPORT.md`。
+- **结论**：等待人工验收，不实施 P2-3/P2-4。ok 标签仍为绿色 success（仅文案+tooltip 澄清，未改颜色，报告已标注为可选后续）。
+
+## 2026-11-18（10:52）· S5-UI-5-P2-3 文章体检命中片段展示（实施）
+- **授权**：仅补 S5-UI-5 审计 E-1（后端 lint hits 被前端丢弃）；不改 lint 规则/阈值/算法/存档/门禁/保存推送，不实施 P2-4。先核后端真源：LintIssue.hits?: string[]（最多 MAX_HITS=3，hitSnippets 取命中前后各 24 字上下文），一条 issue 可带多条；确认 hits 经 GET /articles/:id/lint 的 res.json 原样到前端 rendered.lint。
+- **原丢弃点**：types.ts 的 ArticleLintIssue 未声明 hits；ArticleEditView 模板只渲染 it.message。
+- **改动（仅前端）**：types.ts 加 hits?: string[]；ArticleEditView 加 lintHits() 安全过滤（Array.isArray+字符串校验+slice(0,3)）、HIT_TRUNCATE_AT=48+hitShort() 截断、expandedHits/toggleHits 展开收起；模板每条问题下渲染 .lint-hits（逐条 .lint-hit、:title 全文、多条/超长显示展开全部/收起）+ 局部样式（左边框+底色区分、word-break 防溢出）。
+- **验证**：web typecheck 0、build ✓7.58s、静态契约 9/9 且禁止范围零改动；浏览器八场景（1命中/3命中/多问题各命中/hits空/null/缺失/字段不全/超长）+1440/500px+深浅色全过：空/null/缺失不渲染不报错、字段不全只显合法串无 undefined、超长截断且展开全文（与 title 一致）、docOverflow=false、Console 0 error。证据 `var/tmp/s5ui2c/walk-p23.mjs`+`P23-result.json`+截图 P23-*。
+- **边界**：无后端/API/Schema/Migration/.env 改动、未连库、未调 LLM 微信、未推送、未装依赖、未改 package.json；HEAD 保持 `b2fbad3`、工作区既有 71 项未提交改动未动、无 Git 写操作；服务与端口已释放。详见 `docs/restructure/S5-UI-5-P2-3-IMPLEMENTATION-REPORT.md`。
+- **结论**：等待人工验收，不实施 P2-4。未做段落一键定位（属已延期独立事项）。
+
+## 2026-11-18（11:07）· S5-UI-5-P2-4 无账号文章错误提示修正（实施）
+- **授权**：仅修无账号一类错误引导；不改后端/错误码/认证/推送/lint门禁/防重/推送事实，不实施 P3。核后端真源：pushOnce 在 a.accountId 空时返回 {ok:false,reason:'no_account',message:'请先指定 accountId'}，HTTP 路由 200 返回 PushResult；no_account 与 cred_not_ok/wechat errcode 等有明确独立码，可可靠区分。
+- **权限/路由核查**：账号管理真实路由 /accounts（router/index.ts:48，无 roles 守卫）；后端 credentialsRouter 全路由 requirePermission('oa_account:manage')，admin/member 有、guest 无；前端 useAuth().userRole 可判。
+- **改动（仅前端 3 文件）**：article-push.ts 的 pushFailView 加 no_account 分支（标题「尚未配置可用于推送的公众号账号」、warning、非微信报错）+ 纯函数 noAccountGuide(role)（admin/member→去账号管理引导含"测试连通/不会群发"，guest→联系管理员）；ArticlesView/ArticleEditView 推送失败分支加 reason==='no_account' 特判：有权限 confirm「去账号管理」跳 /accounts，guest alert「知道了」不跳；其他错误走原 pushFailView。
+- **验证**：web typecheck 0、build ✓7.62s、test:article-push 26/26、静态契约 9/9；浏览器六错误场景（no_account admin/guest、cred缺失/格式错/停用、微信40164、unknown）+ 点击入口跳 /accounts + 成功 toast + 桌面/500px/深浅色全过，Console 0 error，docOverflow=false。证据 `var/tmp/s5ui2c/walk-p24.mjs`+`P24-result.json`+截图 P24-*。
+- **边界**：无后端/API/Schema/Migration/.env 改动、未连库、未调 LLM 微信、未真实推送、未装依赖、未改 package.json；HEAD 保持 `b2fbad3`、工作区既有 72 项未提交改动未动（server/publisher.ts 等为既有改动，mtime 前一日，本轮未碰）、无 Git 写操作；服务与端口已释放。详见 `docs/restructure/S5-UI-5-P2-4-IMPLEMENTATION-REPORT.md`。
+- **结论**：等待人工验收，不实施 P3。cred_not_ok 文案未顺带优化（本轮授权仅无账号一类）。
+
+## 2026-11-18（11:24）· S5-UI-5-FINAL 核心流程阶段关闭审计（只读）
+- **性质**：只读关闭审计，核对原始审计 1 P1 + 4 P2 闭环、跨任务回归、P3 暂缓；未改任何业务代码/后端/Schema/.env，未连库、未调 LLM 微信、未推送、未 Git 写操作。
+- **闭环核对**：5/5 实施报告齐全（P1/P2-1/P2-2/P2-3/P2-4），结论与验证一致、均有"等待人工验收"声明、证据文件真实存在于 var/tmp/s5ui2c；原始 P0 无，未解决 P0/P1/P2 无。
+- **跨任务回归（只读六项全过）**：P1 四态无 /articles/0 跳转、补偿 4 处保留；P2-1 空值降级与 P1 trigger 共存；P2-2 未误改模型角色/漫画「就绪」；P2-3 未改服务端 lint 判定（lint.ts 不在 diff）；P2-4 其他错误分类保留；PlanView/ArticleEditView 多轮改动无互相覆盖。**无明显回归、无修复间冲突。**
+- **P3 暂缓登记**：B1（确认弹窗 markdown 星号）、D-1（模型配置引导偏弱）、E-3（已推送按钮无前置提示）——维持 P3、本轮不实施、不影响 P1/P2 验收。
+- **结论**：建议关闭 S5-UI-5；遗留风险均为已声明的边界/验证覆盖取舍（P1 finally 补偿不进 errorMessage、各轮写库 smoke 未跑、P1 浏览器四态未后续重跑靠静态契约等），交人工验收裁定。HEAD 保持 `b2fbad3`、工作区既有 73 项未提交改动未动、无 Git 写操作。详见 `docs/restructure/S5-UI-5-FINAL-CLOSURE-AUDIT.md`。
+- 等待人工验收，不扩展 P3，不进入下一阶段。
+
+## 2026-11-18（11:42）· S5-UI-6-0 剩余页面 UI/UX 收尾审计（只读）
+- **性质**：S5-UI-1~5 完成后的收尾只读审计；未改业务代码/后端/Schema/.env，未连库、未调 LLM 微信、未推送、未跑写库 smoke、未 Git 写操作。
+- **页面清单**：13 页与 13 路由一一对应（含 2 重定向），无孤立组件/路由；公共组件 PageHead/StateError 11/13（缺 Login 合理、Users 异常）。原始 UI-UX-AUDIT 四横切问题中标题重复/状态分散/令牌分裂已解决，响应式隐藏列为已接受取舍，AI 披露部分未闭环。
+- **四流程**：A 初始化/B 选题生产/C 文章生产连贯无新 P0/P1/P2；D 日常管理发现新问题。
+- **本轮新发现（源码交叉确认，浏览器未实测）**：①**P1** member 无法保存自己的自动化模式——SchedulerView:74 提交 {...cfg} 含全局字段，后端 scheduler.ts:90-94 只要含 enabled/pushEnabled 就拒绝非 admin，P4 每客户模式对 member 不可用；②**P2** dry-run 横幅用全局 pushEnabled 判断（SchedulerView:220），后端实际按每账号 auto_draft_push 决策（scheduler.ts:289/333），横幅说"不会推"实际会推草稿箱。
+- **历史遗留 P2（S5-UI-4-0 已登记未闭环，不重复为新发现）**：B-1 出稿前无 impact/AI 披露确认；T1 赛道产线改脏后刷新无 dirty 拦截。
+- **P3 暂缓**：UsersView 公共组件未接入、Dashboard 最近动态不可下钻、硬编码字号/色；S5-UI-5 的 B1/D-1/E-3 维持暂缓。
+- **建议顺序**：第1批修 P1（member payload 按角色）、第2批修 P2（dry-run 按实际 mode）；第3批视授权处理 B-1/T1；暂缓全部 P3 与非必要重构。
+- **结论**：S5-UI-1~5 改造基本达成第一版可日常使用目标，剩余问题集中在自动调度一页+两项历史 P2，均为局部小批修复，不影响 S5-UI-5 关闭。HEAD 保持 `b2fbad3`、工作区既有 74 项未提交改动未动、无 Git 写操作。详见 `docs/restructure/S5-UI-6-0-REMAINING-UI-AUDIT.md`。
+- 等待人工验收，不进入 S5-UI-6-1。
+
+## 2026-11-18（12:41）· S5-UI-6-1 member 自动化模式保存修复（实施）
+- **授权**：仅修 S5-UI-6-0 审计 P1（member 保存自己自动化模式被后端拒）；只改前端 SchedulerView，不改后端权限/执行逻辑、dry-run 横幅、推送/微信、B-1/T1/P3。
+- **后端真源**：scheduler.ts:90-94 对 body 含 enabled/pushEnabled 的非 admin 一律拒（不论值变化）；automationMode/writeTime 写当前 User 行（:96-105），member 有合法能力——后端无需改。
+- **根因**：SchedulerView saveCfg 原提交 {...cfg, automationMode, writeTime}，cfg 含全局字段 → member 必被拒。
+- **改动（仅 SchedulerView.vue）**：引入 useAuth/isAdmin；saveCfg 按角色构造 payload（admin 含全局 cfg，member/guest 仅 {automationMode,writeTime}）；全局开关 :disabled="!isAdmin" + hint 注明权限；保留成功/失败真实提示与 loadStatus 刷新。
+- **验证**：web typecheck 0、build ✓41.65s、静态契约 8/8；浏览器三角色+失败：admin payload 含全局字段且开关可编辑、member payload 仅个人字段（核心证据）且开关禁用、失败显示真实「请求失败（HTTP 500）」不伪成功、guest 不提权，500px/深色正常、Console 0 error。证据 `var/tmp/s5ui2c/walk-p61.mjs`+`P61-result.json`+截图 P61-*。
+- **边界/风险**：全程 Mock 角色会话，未建真实 member 会话/未连库，不宣称真实端到端通过；member 保存后 modeAfter 仍显"纯手动"为 Mock GET 未持久化所致（夹具限制）；userRole 默认 guest 极端时序风险（报告已记）。
+- **保护**：无后端/Schema/.env 改动、未调 LLM 微信、未推送；HEAD 保持 `b2fbad3`、工作区既有 75 项未提交改动未动、无 Git 写操作；服务与端口已释放。详见 `docs/restructure/S5-UI-6-1-IMPLEMENTATION-REPORT.md`。
+- 等待人工验收，不进入 S5-UI-6-2，不改 dry-run 横幅。
+
+## 2026-11-18（13:26）· S5-UI-6-2 dry-run 横幅真源修复（停止/核查）
+- **结果**：按任务第一节指令**停止，未改任何代码**。真源核查发现现有 API 无法提供判断四态所需的账号级 automationMode 聚合。
+- **后端真源**：scheduler.ts 的推送决策=全局开关∧ready账号集∧每账号owner的automationMode(194-216)∧到点∧产线开关∧当日配额；push 仅对 mode==='auto_draft_push' 的账号(289/333-335)；pushEnabled 只是无主账号兜底(34-35/214)。该聚合 Map 只在 tick 内部算、无 API 暴露。
+- **现有 API 不足**：GET /scheduler 只有 config/我自己mode/lastTick；GET /credentials 无 ownerUserId/mode；dashboard 无聚合；lastTick 是上次结果非本次预测。my 对 admin 跨 owner 场景(ownership.ts:37)会误判，lastTick 偷换"本次"语义——二者均不采用，避免制造新错误信号。
+- **最小建议（本轮不实施）**：后端在 GET /scheduler 增推送意图聚合（none/partial/all/unknown，口径同 targets），或账号列表暴露 automationMode/ownerUserId；前端据真源渲染 A/B/C/D 四态。待人工决定是否授权后端改动。
+- **边界/验证**：无代码改动，dry-run 旧判断 cfg.enabled&&!cfg.pushEnabled 保持原样（问题仍在待真源）；四态 Mock/多视口验证未开展（无对象可验，不伪造通过）；基线仍为 6-1 交付态。
+- **保护**：HEAD 保持 `b2fbad3`、工作区既有 76 项未提交改动未动、无 Git 写操作；未连库、未调 LLM 微信、未推送。详见 `docs/restructure/S5-UI-6-2-IMPLEMENTATION-REPORT.md`。
+- 停止在 S5-UI-6-2，等待人工决策，不进入 S5-UI-6-FINAL。
+
+## 2026-11-18（14:25）· S5-UI-6-2 补后端真源 + dry-run 横幅四态（实施）
+- **前情**：13:26 曾按"禁止改后端"指令停止（缺账号级 mode 聚合）。本轮重新授权：允许在 `GET /scheduler` 增 `pushIntent`，必须复用 `resolveAutomationForAccounts()` 与 targets 筛选口径。
+- **后端真源（2 文件）**：`services/scheduler.ts` 把「就绪账号」抽成唯一常量 `READY_ACCOUNT_WHERE={enabled:true,credStatus:'ok'}`（tick 的 `listReadyAccounts` 与新增 `listReadyAccountRefs(ownerWhere)` 共用，防口径漂移）；新增纯函数 `classifyPushIntent(modes)` + `PushIntentStatus/PushIntent`（none/partial/all/unknown，**不掺**到点/产线/配额等运行时条件，否则横幅天天变）。路由 `GET /scheduler` 用 `listReadyAccountRefs(accountOwnerWhere(principal))` → `resolveAutomationForAccounts` → `classifyPushIntent` 返回 `pushIntent`，只读、不改状态、不触发排产。
+- **前端（2 文件）**：`types.ts` 加 `PushIntentStatus/PushIntent` + `SchedulerStatus.pushIntent?`（**可选**：字段缺失宁可不显示也不猜）；`SchedulerView.vue` 删掉 `cfg.enabled && !cfg.pushEnabled` 与旧「当前为 dry-run」文案，改 `pushBanner` computed 只读 `status.pushIntent.status` 渲染四态（none=info 不会推 / partial=warning 部分会推 / all=warning 都会推+不群发 / unknown=info 无法判断请检查账号配置），渲染条件 `cfg.enabled && pushBanner`，样式类 `dry-run`→`push-intent`。
+- **验证**：server typecheck 0、web typecheck 0、build ✓14.00s、`classifyPushIntent` 单测 8/8（真实 import 服务模块，纯函数不发 SQL）、静态契约 26/26（含构建产物 chunk 内新文案存在/旧文案消失、禁止范围零改动）、`test:article-push` 26/26；浏览器 11 场景（四态 + 无字段 + 全局关闭 + member + guest403 + 500/1440 × 深浅色）全过，Console 0 error。**夹具关键设计**：`none` 用例把 pushEnabled 设 true、其余设 false（全局信号与真实意图相反），直接证明横幅不再依赖 pushEnabled；member 保存 payload 仍只有个人字段、admin 仍含全局字段（6-1 未回退）、PUT 500 显示真实错误不伪成功。证据 `var/tmp/s5ui2c/{mock-p62,walk-p62,p62-contract,p62-unit}.mjs` + `P62-*.json/png`。
+- **未验证/遗留**：未连真实库跑 `GET /scheduler` 端到端（`pushIntent` 真实取值只做了单测+源码核对）；口径只反映配置意图不含配额/到点；500px 卡内 `.el-card__body` 424>410 的横向溢出为**既有**问题（横幅缺席时溢出量相同），登记 P3 不动。
+- **边界**：无 Schema/Migration/.env/package.json 改动、未装依赖、未连库、未调 LLM 微信、未推送；HEAD 保持 `b2fbad3`、无 Git 写操作；Mock 服务与 Chrome 已退出、端口已释放。详见 `docs/restructure/S5-UI-6-2-IMPLEMENTATION-REPORT.md`。
+- 等待人工验收，不进入 S5-UI-6-FINAL。
+
+## 2026-11-18（14:47）· S5-UI-6-FINAL 收尾审计（只读）
+- **性质**：只读关闭审计，核 S5-UI-6-0/6-1/6-2 闭环；未改业务代码/后端/Schema/.env，未连库、未跑写库 smoke、未调 LLM/微信、未推送、未启动服务与浏览器、无 Git 写操作。本轮仅新增报告 + 本条目。
+- **6-2 十一项核验 11/11**：`READY_ACCOUNT_WHERE`（scheduler.ts:167）确为读口径唯一（另 2 处 `credStatus:'ok'` 在 credentials.ts 是写库非筛选）；`listReadyAccounts`(:172) 与 `listReadyAccountRefs`(:181) 共用；路由 :70→:72→:74 走 `resolveAutomationForAccounts`，无自行重判 mode；`accountOwnerWhere` 在位（admin `{}` / member 仅自己，ownership.ts:37-40）；`classifyPushIntent`(:205-210) 四态与报告一致且未掺到点/产线/配额（路由未 import isPipelineEnabled/getPipelineQuota/parseHm）；旧 `!cfg.pushEnabled` 判断与 UI 文案零残留；`pushIntent?` 可选、缺字段不渲染；`enabled=false` 不显示（v-if :269）；partial/all 文案内联"仅草稿箱不群发"，none 态由页面常驻安全边界 alert(:203) 兜底。
+- **跨回归 6/6**：6-1 四项（admin payload 含全局四字段、member 仅两字段、非 admin 开关禁用、PUT 500 不伪成功）经代码 + 14:24 浏览器证据确认未被 6-2 覆盖；6-0 的 P1/P2 均已闭环。
+- **新问题**：S5-UI-6 范围 P0/P1/P2 **0 个**。定向检查全无：无新权限绕过（中间件未动）、无数据范围错误（pushIntent 只回粗粒度 status、不含 id/名/数）、无推送语义误表达、无"会推"与安全边界冲突、无 masssend 调用（仅 4 处禁止性注释）、未破坏 S5-UI-5 推送语义与 P1 的 /articles/0（publisher.ts 11-16、articles.ts 11-17、article-push.ts 11-11、PlanView 10:41 均早于 6-2 窗口 14:10-14:30）。
+- **新增 P3（不阻塞，未实施）**：①横幅「本次」可被读成"立即发生"，实为配置意图（不含到点/配额）；②`services/scheduler.ts:16` 头部注释仍称"默认 dry-run 不真推：scheduler_push_enabled 默认 false"，P4 后该键已降级为无主账号兜底，属文档口径漂移。
+- **证据分级**：代码确认 / 静态验证（本轮 typecheck 0+0、契约 26/26、纯函数单测 8/8、grep、mtime 比对）/ 已有浏览器证据（6-2 于 14:24 的 11 场景，源码 14:18 < dist 14:20 < 证据 14:24，时间链一致）/ **本轮新增浏览器证据：无**。**明确保留：未执行真实数据库 GET /scheduler E2E**，`pushIntent` 的计算只经纯函数单测 + 源码核对；member/admin 真实多账号下的取值差异、真实会话权限链均未验证。另记 6-1 证据局限：P61 中 guest PUT 由 Mock 返回成功，真实后端应 403（错误路径已由 500 用例验证）。
+- **历史遗留（非 6 范围，未动）**：B-1、T1（S5-UI-4-0 P2）、500px `.el-card__body` 横向溢出（既有，横幅缺席时溢出量相同）、S5-UI-5 的 B1/D-1/E-3（P3 暂缓）。
+- **结论**：**可正式关闭 S5-UI-6**。HEAD 保持 `b2fbad3`、分支 `feature/open-source-readiness`、工作区 80 项未提交改动（本轮前 79 + 本报告）原样保留、无 Git 写操作、端口无监听。详见 `docs/restructure/S5-UI-6-FINAL-CLOSURE-AUDIT.md`。
+- 不进入下一阶段，不擅自实施任何新修复（含 P3 措辞与真实库 E2E，均需单独授权）。

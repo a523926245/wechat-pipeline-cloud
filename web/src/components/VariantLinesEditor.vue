@@ -16,6 +16,7 @@ import { ArrowDown, ArrowUp, Delete, Plus } from '@element-plus/icons-vue';
 import { ElInput } from 'element-plus';
 import { computed, nextTick, ref, watch } from 'vue';
 
+import EmptyState from './EmptyState.vue';
 import {
   blockTitle,
   joinVariantBlocks,
@@ -196,7 +197,7 @@ const isCard = computed(() => props.dim === 'structure');
       </div>
     </div>
 
-    <el-empty v-if="rows.length === 0" :image-size="46" :description="emptyText" />
+    <EmptyState v-if="rows.length === 0" :image-size="46" :description="emptyText" />
 
     <div class="variant-lines__foot">
       <el-button size="small" :icon="Plus" :disabled="disabled" @click="rows.length === 0 ? addFirst() : addAt(rows.length - 1)">

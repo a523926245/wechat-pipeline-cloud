@@ -11,6 +11,7 @@ import { Refresh } from '@element-plus/icons-vue';
 
 import { errMsg } from '../api/http.ts';
 import { getContentPrefixes, updateContentPrefixes } from '../api/index.ts';
+import PageHead from '../components/PageHead.vue';
 import StateError from '../components/StateError.vue';
 import type { ContentPrefixItem } from '../types.ts';
 
@@ -59,15 +60,11 @@ onMounted(load);
 
 <template>
   <div class="wb-page" v-loading="loading" element-loading-text="正在加载标题前缀…">
-    <header class="wb-page-head">
-      <div>
-        <h2>标题前缀</h2>
-        <p class="wb-page-desc">文章与漫画的标题前缀（建稿/渲染时幂等添加）</p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead title="标题前缀" desc="文章与漫画的标题前缀（建稿/渲染时幂等添加）">
+      <template #actions>
         <el-button :icon="Refresh" @click="load">刷新</el-button>
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="error" :message="error" @retry="load" />
 
