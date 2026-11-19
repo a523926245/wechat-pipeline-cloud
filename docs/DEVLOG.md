@@ -2117,3 +2117,29 @@ T1 拆 T1-A 基线迁移 / T1-B TrackContract / T1-C PromptVersion / T1-D Genera
 - **已消除风险**：S6-0 P1-②「只提交已跟踪文件导致 build 失败」——9 个新增前端依赖文件已与 17 个引用方视图同批入库。
 - **遗留未动**：`.env` 指向 smoke 库（S6-2）、CHANGELOG 缺 10 阶段 / README 状态行 / 报告索引（S6-4）、浏览器证据入库、历史 P3/P4、真实库 `GET /scheduler` E2E。
 - 报告：`docs/restructure/S6-1B-COMMIT-EXECUTION-REPORT.md`。等待下一步授权（S6-2 或 S6-3）。
+
+## 2026-11-18（17:35）· S6-2A 正式业务库配置与运行时连接身份只读审计（只读）
+- **性质**：纯只读审计（17:19→17:35）。未改 `.env` 或任何文件；未启停 8787/5173；未执行任何 Prisma 命令（Migration / `db push` / `migrate dev` / `reset` / `resolve`）；未跑任何写库 Smoke / Fingerprint；未调 LLM / 微信；无 Git 写操作；未改业务数据。
+- **Git 基线**：HEAD `e46941e33f5dc941658daf56ad7215999d647986`，分支 `feature/open-source-readiness`，审计前工作区干净。
+- **运行时 DB 身份**：由服务日志与库数据双证，运行服务连接正式库 `wechat_pipeline`；正式库 18 表、`_prisma_migrations` 4/4 applied、`ArticleLintRun` 已就位。三库命名确认：`wechat_pipeline`（正式） / `wechat_pipeline_shadow`（历史遗留影子库，**本审计时尚未被引用**） / `wechat_pipeline_smoke`（Smoke 隔离库）；MySQL 8.0.30、账号 `wpc_app`。
+- **发现两个独立但相关的 P0**：① **本审计时** `SHADOW_DATABASE_URL` 与 `DATABASE_URL` **同时指向正式业务库 `wechat_pipeline`**（两键 rawLen 均 78、库名相同），属严重连接配置错误——使正式库同时承担「开发库 + Shadow 辅助库」双重角色（**后于 S6-2B-1 修正，见下条**）；② `package.json` 的 `prisma:migrate` = `prisma migrate dev`，其**主要目标是 `DATABASE_URL` 指向的库**（把未应用迁移应用到该库，发现 Schema Drift 或 Migration History Conflict 时**可能要求重置该库**），Shadow Database 仅为辅助工作区（重放迁移历史检测 Drift、生成新迁移、评估数据丢失风险），并非主要操作目标。**不能把①描述成「清空 Shadow 就必然清空业务库」**，但②并未因两 URL 分离而解除。
+- **结论**：`DATABASE_URL` 已正确指向正式库，但审计发现上述 2 个 P0；正式库 Migration 部署只允许 `prisma migrate deploy`。临时凭据 `var/tmp/s62a/my.cnf` 已删除、工作区恢复干净。报告 `docs/restructure/S6-2A-RUNTIME-DB-IDENTITY-AUDIT.md`。等待授权进入 S6-2B-1。
+
+## 2026-11-18（19:45）· S6-2B-1 数据库连接配置修正后只读核验（只读）
+- **性质**：纯只读核验（18:16→19:45）。本轮**未改 `.env`**——配置修正是用户在本轮之前完成的（`.env` mtime 2026-11-18 18:15:47、696 字节，上次核验 689 字节 / 15:34:28）。未建删库表、未执行任何 Prisma 命令、未跑测试或写库脚本、未启停服务、未调 LLM / 微信、无 Git 写操作。
+- **Git 基线**：HEAD `e46941e`，工作区仅有 S6-2A 报告未跟踪，其余干净。
+- **修正后配置（核验确认）**：`DATABASE_URL`→正式库 `wechat_pipeline`、`SHADOW_DATABASE_URL`→独立影子库 `wechat_pipeline_shadow`，**两者已分离**；两库均连接成功（MySQL 8.0.30）；`wpc_app` 对 shadow 库 18 项权限全齐。
+- **Shadow 库数据证据口径**：15 张历史表中 **6 张经 `COUNT(*)` 精确核验为 0 行**，**另外 9 张仅取 `information_schema.TABLE_ROWS` 估算值为 0**——估算不等于确认，当前无证据证明这 9 张一定为空，不能断言整个 Shadow 库不存在数据损失风险；使用前提是先对 9 张精确计数或由用户明确确认可丢弃，确认前不应执行会重置 Shadow 库的操作。缺失 `_prisma_migrations` 与 Shadow Database 用途相符，但仅凭缺失不能推断该库历史上从未承载业务数据或证明其历史用途。
+- **正式库数据核验口径**：正式库共 18 张表、4 条已应用迁移（Migration 表共 5 行 = 4 applied + 1 条历史回滚记录）；**已核验的 12 张关键表行数与 S6-2A 基线逐项一致**，Migration 记录数量及状态一致；**本次未进行 18 张表全部数据内容的逐行比对，不能据此证明数据库完全没有发生过写入或数据内容变化**。
+- **结论**：配置修正核验通过，S6-2A 第 1 个 P0（两 URL 同指正式库）已解除；**第 2 个 P0（`prisma:migrate` = `migrate dev`）仍未解除**——`migrate dev` 的主要目标是 `DATABASE_URL`（此时为正式库），Shadow 仅为辅助工作区，两 URL 分离并不意味着在正式库上执行 `migrate dev` 已安全，须在 S6-4 补真正的命令级护栏；正式库 Migration 部署只允许 `prisma migrate deploy`。报告 `docs/restructure/S6-2B-1-DB-CONFIG-VERIFY.md`。随后进入 S6-3。
+
+## 2026-11-18（20:30）· S6-3 系统真实运行验证与交付回归（核心链路 PASS）
+- **性质**：真实运行验证。实际启动后端 8787（pid 26732→18228，watch 重启）与前端 5173（Vite 5.4.21），用真实 admin 会话请求真实接口，headless Chrome 访问真实前端读真实正式库。**全程无 Mock、无夹具、无伪造数据。** 验证后两服务均已停止，端口释放，临时凭据/cookie/Chrome profile 全部删除。
+- **运行时 DB 身份（本轮最强证据）**：不只读 `.env`，而是从 MySQL 侧反向观测——`information_schema.PROCESSLIST` 中 `wpc_app` 的 **9 个连接池连接 DB 全部为 `wechat_pipeline`**。另有 `/api/health` 200 返回 `db:"up", driver:"mysql", autoPublish:false` 双向印证。
+- **pushIntent 首次真实验证**（S6-0 / S5-UI-6-2 遗留项就此关闭）：`GET /api/scheduler` 200，返回 `pushIntent:{"status":"unknown"}`。与源码 `classifyPushIntent` 的 `modes.length===0 → 'unknown'` 一致；正式库 `account` 表 **0 行**、就绪账号 0 → 语义正确，非缺陷。**未造账号、未改 automationMode/enabled/pushEnabled**，故 none/partial/all 三态如实标 NOT VERIFIED。
+- **后端接口**：未登录 10 个接口仅 `/api/health` 200、其余 9 个全 401（无越权）；admin 会话下 dashboard/scheduler/articles/tracks/models/style-prompts/users/credentials 全 200。`/api/angles` 400 是缺 `trackId` 校验正确，`/api/accounts` 404 是端点不存在（账号管理在 `/api/credentials`），均非缺陷。
+- **前端走查**：9 页面 + 1 窄屏抽查（500px），**0 白屏 / 0 console error / 0 API 500 / 0 横向溢出**。写作规范页读到真实 44 行 styleprompt 数据（创作总纲 400 字 9 行，上次保存 2026/11/15 21:39:16）。Dashboard 空态与库中 account=0/angle=0/article=0 完全对应。Scheduler 页因 `config.enabled=false`，`v-if="cfg.enabled && pushBanner"` 使横幅不显示——**正确行为**，仅验证到该分支。
+- **数据安全**：17 张业务表**16 张行数完全不变**，唯一变化 `usersession 2→3` 为登录正常副作用（任务书 §六 允许并已单独记录）。表数 18、`_prisma_migrations` 5 条（4 applied + 1 历史回滚）前后一致。**零 DDL / 零业务写入 / 未调 LLM / 未调微信 / 未推送 / 未跑任何 Prisma 命令 / 未改 .env / 无 Git 写操作。**
+- **未验证（如实标注，拒绝伪造）**：member 角色权限（正式库只有 1 个 admin，禁造账号）；pushIntent 的 none/partial/all（account 表 0 行）；`enabled=true` 时四态横幅真实渲染（需改业务配置，禁止；此前仅 S5-UI-6-2 Mock 验证）；待办有数据时的数字与跳转（空库）。
+- **新发现 P3**：`.env` 的 `ADMIN_PASSWORD` 与库中实际口令不一致（不参与鉴权，真实口令在 `user.passwordHash`），建议 S6-4 在 `.env.example` 说明或移除。**P4**：前后端账号管理命名不一致（前端 `/accounts`、后端 `/api/credentials`），工作正常。
+- **结论：S6-3 核心真实运行链路 PASS，可关闭 S6-3**；**但不代表所有角色、业务数据状态及推送意图分支均完成真实 E2E**——member 角色、pushIntent 的 none/partial/all、有真实业务数据时的待办与完整业务状态均未验证，保留为后续事项（建议并入 S6-5）。未验证项均源于"正式库是空壳"这一客观条件，且拒绝伪造数据。报告 `docs/restructure/S6-3-SYSTEM-RUNTIME-VERIFICATION.md`，证据在 `var/tmp/s63/`（10 张截图 + S63-result.json + db-before/after.txt）。未进入 S6-4。
