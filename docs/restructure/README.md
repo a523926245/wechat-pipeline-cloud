@@ -2,7 +2,7 @@
 
 > **⚡ 最新（2026-11-13）：后续实施以 [`RESTRUCTURE-2.0-CONVERGED-PLAN.md`](./RESTRUCTURE-2.0-CONVERGED-PLAN.md)（2.0 重构方案·基于现有成果的精简修订版）为唯一依据**——T1-A REV 系列（含 REV4.1）已被其取代归档；T0 已验收保留不重做。
 
-**建立日期**：2026-11-12 | **状态**：**实施进行中**——S1（MySQL 切换 + T0 最小适配）、S2（SQLite 遗留清理）已完成并验收；S3（抽象裁剪，裁决冻结）、S4（业务与内容质量，S4-1～S4-5 已实施）已完成；**S5（UI/UX）进行中**：S5-UI-1（设计令牌/壳层/公共组件）与 S5-UI-2（工作台待办队列）已实施，后续页面改造逐轮授权（分阶段授权，见总纲 §六）
+**建立日期**：2026-11-12 | **状态**：**收尾进行中**——S1（MySQL 切换 + T0 最小适配）、S2（SQLite 遗留清理）、S3（抽象裁剪，裁决冻结）、S4（业务与内容质量，S4-1～S4-5）、**S5（UI/UX，S5-UI-1～6 全部关闭）均已完成**；**S6（回归与收尾）进行中**：S6-0～S6-3 已出报告，详见下方「实施期关键报告索引」（分阶段授权，见总纲 §六）
 **效力顺序**：`RESTRUCTURE-2.0-CONVERGED-PLAN.md`（当前最高）→ `00-FINAL-EXECUTION-CHARTER.md` → 本文决策表 → 其余文档。文档间若有冲突，以最新总纲为准并在本文登记。
 
 ## AI 阅读规则（接手 agent 必读）
@@ -29,6 +29,16 @@
 | 07 | `TARGET-UI-ARCHITECTURE.md` | 目标导航、交互规范、视觉方向、低保真 | 07（TARGET-UI-UX） |
 | 08 | `UI-UX-AUDIT.md` | 现有后台 UI/UX 诊断（静态分析） | 08（CURRENT-UI-DIAGNOSIS） |
 | 09 | `09-PRE-IMPLEMENTATION-CHECK.md` | **实施前检查报告**（第二步产出，只读检查） | — |
+
+## 实施期关键报告索引（S6 收尾）
+
+| 报告 | 内容 | 结论 |
+|---|---|---|
+| `S6-0-PRE-DELIVERY-AUDIT.md` | 交付前整体只读审计（分级口径 + 遗留清单 + S6 建议顺序） | 只读，列出交付缺口 |
+| `S6-1A-PRE-COMMIT-CHECK.md` / `S6-1B-COMMIT-EXECUTION-REPORT.md` | 整体入库前检查 / 提交执行 | 已完成整体入库并提交 |
+| `S6-2A-RUNTIME-DB-IDENTITY-AUDIT.md` | 正式业务库配置与运行时连接身份只读审计 | 发现两 URL 同指正式库（后修）与 migrate dev 命令级风险 |
+| `S6-2B-1-DB-CONFIG-VERIFY.md` | 数据库连接配置修正后只读核验 | 两 URL 同指问题已解除；migrate dev 护栏转 S6-4 |
+| `S6-3-SYSTEM-RUNTIME-VERIFICATION.md` | 系统真实运行验证与交付回归（真实 admin 会话 + 正式库只读） | 核心链路 PASS，可关闭 S6-3 |
 
 > 历史文档（保留不删，已被上表取代）：`docs/AUDIT-REPORT.md`、`docs/RESTRUCTURE-CHECKLIST.md`（V1）、`docs/RESTRUCTURE-PLAN-V1.md`（原始方案）、`docs/SECOND-OPINION.md`（实测数据）、`docs/FORM-ARCHITECTURE.md` / `TRACK-FORM-RESEARCH.md`（形态设计稿与调研）。
 

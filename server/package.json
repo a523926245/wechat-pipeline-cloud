@@ -11,7 +11,7 @@
     "start": "node --experimental-strip-types src/index.ts",
     "typecheck": "tsc --noEmit",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev",
+    "prisma:migrate": "node --experimental-strip-types scripts/migrate-guard.ts",
     "prisma:deploy": "prisma migrate deploy",
     "scheduler": "node --experimental-strip-types src/cli/scheduler.ts",
     "scheduler:once": "node --experimental-strip-types src/cli/scheduler.ts --once",

@@ -2,6 +2,92 @@
 
 面向使用者的变更记录（按新增 / 变更 / 修复分类）。详细背景与验收见 `docs/DEVLOG.md`（进度台账唯一真源）。
 
+## 2026-11-19 · S6-4：交付安全护栏与文档收口（当前阶段）
+
+### 新增
+- **Migration 命令级护栏（主目标 + Shadow 双重校验）**：`npm run prisma:migrate` 不再裸调
+  `prisma migrate dev`，改为经 `scripts/migrate-guard.ts` 守卫：
+  - **主目标**：`DATABASE_URL` 必须与显式配置 `MIGRATE_DEV_DATABASE_URL` 身份（host+port+db）
+    全等；正式库 `wechat_pipeline` / Shadow / Smoke 保留库一律拒绝。
+  - **Shadow**：因 `migrate dev` 会重置 Shadow 并重放迁移历史，`SHADOW_DATABASE_URL`
+    （Prisma 实际使用值）必须与显式配置 `MIGRATE_DEV_SHADOW_DATABASE_URL` 身份全等，且不得为
+    保留库、不得与主目标同库——避免误配 Shadow 指向正式库造成删库。
+  - 独立开发库与独立开发 Shadow 均须**显式配置**，任一缺失 / 解析失败 / 不匹配即 fail-closed。
+  - 结构化 URL 解析（WHATWG URL，host 小写 / 默认端口 3306 / db 解码），`--schema path` 与
+    `--schema=path` 绕过入口、`--force-reset` 等危险参数与危险子命令均被拦截，输出脱敏。
+  - 自检 `--self-test` 32/32 通过（假 URL、零连库，含 5 项 MySQL 库名大小写规范化用例）。
+  - **残余风险**：护栏只覆盖 npm script 入口，直接执行 `npx prisma migrate dev` 或直调 Prisma
+    CLI 仍可绕过；数据库账号权限分离 / shell 层封堵尚未实施。
+- S6 收尾报告索引：S6-0 / S6-1A / S6-1B / S6-2A / S6-2B-1 / S6-3 纳入 `docs/restructure/README.md`。
+
+### 变更
+- **部署迁移指引纠偏**：`deploy/README.md` 与 `deploy/install.sh` 删除"无 migrations、手工建
+  `0_init`、`migrate resolve --applied`、正式库 `migrate dev`、`ALLOW_DB_PUSH` db push 旁路"等
+  过期指引；统一为"仓库已有 4 个迁移，正式库只用 `npm run prisma:deploy`（`migrate deploy`）"。
+- `docs/restructure/README.md` 状态更新为"S5 全部完成、S6 收尾进行中"。
+
+### 修复
+- 部署文档中会误导操作者在正式库建坏基线 / 绕过迁移历史的过期步骤（见上"变更"）。
+
+### S6 前序阶段收口（无使用者可见功能变更，仅记录结论）
+- **S6-0**：交付前整体只读审计，列出配置 / 文档 / 部署遗留清单与 S6 建议顺序。
+- **S6-1A / S6-1B**：整体入库前检查与提交执行，全部成果已入库并推送（回退锚点）。
+- **S6-2A / S6-2B-1**：正式库连接身份只读审计与配置修正核验——两 URL 同指正式库的问题已解除；
+  `prisma:migrate` = `migrate dev` 的命令级风险转由本阶段（S6-4）护栏解决。
+- **S6-3**：真实运行链路验证（真实 admin 会话 + 正式库只读）核心链路 PASS；member 角色、
+  pushIntent 各分支等待后续数据条件的场景如实标注未验证，不伪造。
+
+### 说明
+- 残留风险：护栏只保护 npm script 入口，直接执行 `npx prisma migrate dev` 仍可绕过；
+  彻底封堵需数据库账号权限分离，属后续独立决策。
+
+## 2026-11-18 · S5-UI-6：剩余页面与横幅真源修正（阶段关闭）
+
+### 修复
+- **member 保存按钮**：修正 member 角色下的保存行为（S5-UI-6-1）。
+- **dry-run 横幅**：改为读取后端真源，不再本地臆测（S5-UI-6-2）。
+- S5-UI-6-0 审计发现的 P1/P2 各 1 项均已闭环。
+
+### 验收
+- S5-UI-6-2 核验 11/11；S5-UI-6-1 回归 4/4；新增 P0/P1/P2 = 0，阶段正式关闭。
+
+## 2026-11-18 · S5-UI-5：核心生成流程反馈修正（阶段关闭）
+
+### 修复
+- **创作计划出稿结果反馈**：全失败不再误弹绿色"已生成 N 篇草稿"并跳 `/articles/0`（404）；
+  按全成功 / 部分成功 / 全失败 / 全跳过四态如实反馈（原 P1）。
+- 计划页渲染后端 `warnings` / `backlog`；`credStatus=ok` 不再误称"就绪"（格式合规 ≠ 可用）；
+  体检 `hits` 回填前端不再丢失；无账号推送错误改为界面可执行的指引。
+
+### 验收
+- P1 + 4 项 P2 全部闭环；typecheck / build / 契约断言 / 真实浏览器四态通过，阶段关闭。
+
+## 2026-11-17 · S5-UI-4：文风配置、选题窄屏与模型就绪状态
+
+### 修复
+- **文风配置写作规范**：写作规范 Tab 从全局库错挂位置移回赛道面板，保存 key 修正为 `s:{赛道}`
+  （原走后端不认的 `v:global:spec`），恢复默认准确定位当前赛道、赛道间不混用。
+- **选题库窄屏体验**：≤1100px 下审核状态 / 总评分 / 操作列固定左侧可见，低优先级列移除，
+  桌面端布局不变。
+- **模型就绪状态**：前端改为直接展示后端 `GET /models/resolve/:role` 的 `usable`/`reason` 真源，
+  不再本地复刻判断（原缺能力/协议匹配校验，会把不可用的生图模型显示成写作"就绪"）。
+
+### 验收
+- 各子项 typecheck / build / 浏览器走查（桌面 + 500px + 深浅色）通过，控制台 0 error。
+
+## 2026-11-17 · S5-UI-3：文章工作台信息层与推送事实一致性
+
+### 新增
+- 文章列表新增**推送事实**列；批量删除影响判断改用推送痕迹（不再依赖当前 status）；
+  推送失败反馈收敛到共用映射。
+- 文章标题列仅漫画显示轻量产线标签；500px 窄屏下推送事实真实可见、不被固定操作列遮挡。
+
+### 变更
+- 标题/摘要派生说明、强调补全与 AI 改写分区；页头迁 `PageHead`、保存条迁 `SaveBar`。
+
+### 验收
+- typecheck / build / 两组断言（26 + 34 项）/ 浏览器走查通过，无业务/API/Schema 变更。
+
 ## 2026-11-17 · S5-UI-2-B：工作台待办队列
 
 ### 新增

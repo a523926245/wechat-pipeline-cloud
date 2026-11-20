@@ -11,7 +11,6 @@
 #   sudo bash deploy/install.sh --skip-build      # 前端 dist 已就绪
 #   sudo bash deploy/install.sh --skip-nginx      # 只装后端
 #   sudo bash deploy/install.sh --skip-systemd    # 不用 systemd（如容器内跑）
-#   ALLOW_DB_PUSH=1 sudo -E bash deploy/install.sh   # 允许 db push（不建迁移基线）
 #
 set -Eeuo pipefail
 
@@ -153,29 +152,17 @@ cmd "cd $APP_DIR/server && npm run prisma:generate"
 # ─────────────────────────────────────────────────────────────
 step "7/10  数据库结构"
 # ─────────────────────────────────────────────────────────────
-# 仓库里**没有 prisma/migrations**，`npm run prisma:deploy` 必然失败。
-# 这里默认停下来让你自己选，避免脚本替你做不可逆的决定。
+# 仓库已包含 prisma/migrations（4 个版本化迁移）。正式库结构变更只走
+# `prisma migrate deploy`：它只应用已提交的迁移，不会因 Drift / 迁移历史冲突要求重置正式库。
+# 不再提供 db push / 手工建 0_init 旁路——它们会绕过迁移历史、无法回滚。
 if [[ -d "$APP_DIR/server/prisma/migrations" ]] && \
    [[ -n "$(ls -A "$APP_DIR/server/prisma/migrations" 2>/dev/null)" ]]; then
-  info "检测到迁移目录，执行 prisma migrate deploy"
+  info "检测到迁移目录，执行 prisma migrate deploy（正式库唯一允许的迁移方式）"
   cmd "cd $APP_DIR/server && npm run prisma:deploy"
   ( cd "$APP_DIR/server" && npm run prisma:deploy )
-elif [[ "${ALLOW_DB_PUSH:-0}" == "1" ]]; then
-  info "ALLOW_DB_PUSH=1 → db push（**不产生迁移文件**，后续无法回滚）"
-  cmd "cd $APP_DIR/server && npx prisma db push"
-  ( cd "$APP_DIR/server" && npx prisma db push )
 else
-  echo "⚠️  没有迁移基线，`prisma migrate deploy` 会失败。请二选一："
-  echo
-  echo "  【推荐】建基线迁移（可回滚、可复现）："
-  cmd "cd $APP_DIR/server"
-  cmd "mkdir -p prisma/migrations/0_init"
-  cmd "npx prisma migrate diff --from-empty --to-schema-datasource prisma/schema.prisma --script > prisma/migrations/0_init/migration.sql"
-  cmd "npx prisma migrate deploy"
-  echo
-  echo "  【不推荐】直接 push（省事但不可逆）："
-  cmd "ALLOW_DB_PUSH=1 bash $0"
-  echo
+  echo "错误：部署包缺少 $APP_DIR/server/prisma/migrations（应含已提交的迁移文件）。"
+  echo "请检查同步步骤是否遗漏 prisma/migrations 目录，修复后重跑；不要改用 db push 绕过。"
   exit 1
 fi
 
