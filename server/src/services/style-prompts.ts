@@ -21,6 +21,7 @@
  */
 
 import { prisma } from '../db.ts';
+import { BadRequestError } from '../errors.ts';
 import { logger } from '../logger.ts';
 import { DEFAULT_TRACK_RULES, ruleFor, type TrackRule } from './track-rules.ts';
 
@@ -2251,7 +2252,64 @@ export async function pickVariants(track: string): Promise<PickedVariants> {
   };
 }
 
-export async function upsertStylePrompt(key: string, prompt: string): Promise<StylePromptRow> {
+/**
+ * 从配置 key 解析出它归属的赛道名；全局 / 兜底 / 非赛道级 key 返回 null。
+ * 这里必须与 kindOf / 各 key 生成函数保持同一套约定，避免"能存但写稿读不到"。
+ */
+function trackNameFromKey(key: string): string | null {
+  if (key === GLOBAL_KEY) return null;
+  if (key === sysKey(SYS_DEFAULT_TRACK)) return null; // sys:default 是系统兜底，非赛道
+  const pv = parseVariantKey(key);
+  if (pv) return pv.track === GLOBAL_KEY ? null : pv.track; // v:global:{dim} 是全局变体兜底
+  if (key.startsWith(SYS_PREFIX)) return key.slice(SYS_PREFIX.length) || null;
+  if (key.startsWith(SPEC_PREFIX)) return key.slice(SPEC_PREFIX.length) || null;
+  if (key.startsWith(RULE_PREFIX)) return key.slice(RULE_PREFIX.length) || null;
+  // 其余裸 key（kind=track）即赛道文体本身；排除带冒号的未知形态，避免误判
+  return key.includes(':') ? null : key;
+}
+
+/** 隔离冒烟库：其 Track 表按设计为空，冒烟脚本会建临时赛道 key，需跳过存在性校验。 */
+function isIsolatedSmokeDb(): boolean {
+  try {
+    const raw = process.env.DATABASE_URL ?? '';
+    return decodeURIComponent(new URL(raw).pathname.replace(/^\//, '')) === 'wechat_pipeline_smoke';
+  } catch {
+    return false;
+  }
+}
+
+export interface UpsertStylePromptOptions {
+  /** 新建赛道级 key 时是否要求赛道管理里存在同名 Track。默认 true；内部初始化可显式关闭。 */
+  requireTrack?: boolean;
+}
+
+/**
+ * 新建 / 更新一条文风配置。
+ *
+ * 赛道存在性校验只针对【新建】的赛道级 key：存量 key（含历史孤儿配置）更新一律放行，
+ * 保证"改 prompt 不因 Track 缺失被锁死"。global / sys:default / v:global:{dim} 不校验。
+ * 隔离冒烟库自动豁免（其 Track 表按设计为空，冒烟脚本建临时赛道 key）。
+ */
+export async function upsertStylePrompt(
+  key: string,
+  prompt: string,
+  options: UpsertStylePromptOptions = {},
+): Promise<StylePromptRow> {
+  const requireTrack = options.requireTrack !== false;
+  if (requireTrack && !isIsolatedSmokeDb()) {
+    const trackName = trackNameFromKey(key);
+    if (trackName) {
+      const existing = await prisma.stylePrompt.findUnique({ where: { key }, select: { key: true } });
+      if (!existing) {
+        const track = await prisma.track.findFirst({ where: { name: trackName }, select: { id: true } });
+        if (!track) {
+          throw new BadRequestError(
+            `赛道「${trackName}」在赛道管理中不存在，无法新建其文风配置。请先在赛道管理创建同名赛道。`,
+          );
+        }
+      }
+    }
+  }
   const row = await prisma.stylePrompt.upsert({
     where: { key },
     create: { key, kind: kindOf(key), prompt },

@@ -970,7 +970,7 @@ export interface EmphasisApplyResult {
 /** 文风配置项。key：'global' | '{赛道名}' | 'v:global:{dim}' | 'v:{赛道}:{dim}'。 */
 export interface StylePromptItem {
   key: string;
-  kind: 'global' | 'track' | 'variant';
+  kind: 'global' | 'track' | 'variant' | 'system' | 'spec' | 'rule';
   prompt: string;
   updatedAt: string;
 }

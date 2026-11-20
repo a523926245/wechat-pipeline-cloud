@@ -411,8 +411,9 @@ const createRules: FormRules = {
     {
       validator: (_rule, value: string, cb) => {
         const name = (value ?? '').trim();
-        if (!name) return cb(new Error('请选择或输入赛道名'));
-        if (name === K_GLOBAL || name.startsWith('v:')) return cb(new Error('不能用 global 或 v: 开头的名字'));
+        if (!name) return cb(new Error('请选择赛道'));
+        // 赛道名必须来自真实 Track（赛道管理），不允许自由输入不存在的赛道
+        if (!tracks.value.some((t) => t.name === name)) return cb(new Error('赛道管理中不存在该赛道，请先在赛道管理创建'));
         if (trackNames.value.includes(name)) return cb(new Error('该赛道已有文风配置'));
         cb();
       },
@@ -432,6 +433,11 @@ async function submitCreate() {
   const ok = await f.validate().then(() => true).catch(() => false);
   if (!ok) return;
   const name = createForm.name.trim();
+  // 双重确认：提交时赛道必须仍存在于真实 Track 列表（防止加载后赛道被删等竞态）
+  if (!tracks.value.some((t) => t.name === name)) {
+    ElMessage.error('赛道管理中不存在该赛道，请先在赛道管理创建');
+    return;
+  }
   saving.value = `new:${name}`;
   try {
     // 有出厂文体就带出来，没有就建空行等填写；变体库不建（空即回落全局）
@@ -845,17 +851,19 @@ onBeforeUnmount(() => {
           <el-select
             v-model="createForm.name"
             filterable
-            allow-create
-            default-first-option
-            placeholder="选赛道管理里的赛道，或直接输入新名字"
+            placeholder="请选择赛道管理中尚未配置的赛道"
             style="width: 100%"
+            :disabled="unconfigured.length === 0"
           >
             <el-option v-for="t in unconfigured" :key="t.id" :label="t.name" :value="t.name">
               <span>{{ t.name }}</span>
               <span class="opt-hint">{{ t.enabled ? '赛道管理中' : '已停用' }}</span>
             </el-option>
           </el-select>
-          <div class="form-tip">名字要与「赛道管理」里的赛道名一致，写稿才能读到这份配置。</div>
+          <div v-if="unconfigured.length === 0" class="form-tip">
+            赛道管理中还没有可配置的赛道（或都已配置）。请先到「赛道管理」创建赛道，再回来新增文风。
+          </div>
+          <div v-else class="form-tip">只能选择「赛道管理」中已有的赛道；写稿按此名字读取配置。</div>
         </el-form-item>
       </el-form>
       <template #footer>
