@@ -159,7 +159,7 @@ async function cleanDb(): Promise<void> {
   await prisma.angle.deleteMany({
     where: { track: { name: { in: [T1, T2] } } },
   });
-  await prisma.account.deleteMany({
+  await prisma.oAAccount.deleteMany({
     where: { OR: [{ name: ACC_A }, { name: ACC_B }, { name: ACC_C }] },
   });
   await prisma.wechatToken.deleteMany({});
@@ -233,23 +233,23 @@ async function main(): Promise<void> {
     check('--reset-checkpoint 后全量重跑幂等', n4 === n3, `${n3} → ${n4}`);
 
     // 8. Account 不产生孤儿：按 (trackId, name) 兜底
-    const accCount = await prisma.account.count({
+    const accCount = await prisma.oAAccount.count({
       where: { OR: [{ name: ACC_A }, { name: ACC_B }, { name: ACC_C }] },
     });
     check('账号恰好 3 个，无孤儿占位行', accCount === 3, `count=${accCount}`);
 
     // 9. 占位 → 真实升级：C 应拿到真实 appid
-    const accC = await prisma.account.findFirst({ where: { name: ACC_C } });
+    const accC = await prisma.oAAccount.findFirst({ where: { name: ACC_C } });
     check('占位账号升级为真实 appid', accC?.appid === APPID_C && accC?.credStatus === 'ok',
       `appid=${accC?.appid} status=${accC?.credStatus}`);
 
     // 10. 真实值绝不回退：把 A 的 appid 改成另一个真实值，再跑迁移，源里是占位串也不该覆盖
-    await prisma.account.update({
+    await prisma.oAAccount.update({
       where: { id: accC!.id },
       data: { appid: 'wxsmokemanualedit99' },
     });
     runCli(['--source', source, '--apply'], env);
-    const accC2 = await prisma.account.findFirst({ where: { name: ACC_C } });
+    const accC2 = await prisma.oAAccount.findFirst({ where: { name: ACC_C } });
     check(
       '库内真实 appid 不被源覆盖（真实绝不回退）',
       accC2?.appid === 'wxsmokemanualedit99',
@@ -257,7 +257,7 @@ async function main(): Promise<void> {
     );
 
     // 11. 未配凭据的 B 走占位，且不启用
-    const accB = await prisma.account.findFirst({ where: { name: ACC_B } });
+    const accB = await prisma.oAAccount.findFirst({ where: { name: ACC_B } });
     check(
       '无凭据账号落为占位且不启用',
       Boolean(accB?.appid.startsWith('placeholder-')) && accB?.enabled === false,
@@ -275,7 +275,7 @@ async function main(): Promise<void> {
 
     // 13. 明文密钥不落库：库里不是明文，且能解密回原文
     // （AES-GCM 每次 IV 随机，密文不可复现，所以不能比对密文相等）
-    const accA = await prisma.account.findFirst({ where: { name: ACC_A } });
+    const accA = await prisma.oAAccount.findFirst({ where: { name: ACC_A } });
     const raw = accA?.secretEnc ? Buffer.from(accA.secretEnc) : null;
     const notPlain =
       raw != null && Buffer.compare(raw, Buffer.from(SECRET_OK, 'utf8')) !== 0;

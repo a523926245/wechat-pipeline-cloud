@@ -21,24 +21,31 @@ import type { FormInstance, FormRules } from "element-plus";
 import { computed, nextTick, onMounted, reactive, ref } from "vue";
 
 import RowActions, { type RowAction } from "../components/RowActions.vue";
+import BatchBar from "../components/BatchBar.vue";
+import EmptyState from "../components/EmptyState.vue";
+import PageHead from "../components/PageHead.vue";
 import { errMsg } from "../api/http.ts";
 import {
   bindRole,
+  bulkDeleteModels,
   createModel,
   deleteModel,
   getBindings,
   getModelMeta,
   listModels,
+  resolveRole,
   testModel,
   unbindRole,
   updateModel,
 } from "../api/index.ts";
 import StateError from "../components/StateError.vue";
+import { useBatchDelete } from "../composables/useBatchDelete.ts";
 import type {
   BindingMap,
   LlmModelPayload,
   LlmModelView,
   ModelMeta,
+  RoleResolveResult,
   RoleSpecDto,
 } from "../types.ts";
 import {
@@ -119,6 +126,12 @@ const UNBIND = "__unbind__";
 const meta = ref<ModelMeta | null>(null);
 const models = ref<LlmModelView[]>([]);
 const bindings = ref<BindingMap>({});
+/**
+ * 角色可用性真源（S5-UI-4-1-C）：后端 GET /models/resolve/:role 的结果。
+ * 就绪状态以后端 usable/reason 为准，避免前端重复实现能力/协议判断导致误报。
+ * 接口失败的角色不写入此表，bindState 会回落到本地基础判断（降级不崩）。
+ */
+const resolutions = ref<Record<string, RoleResolveResult>>({});
 const loading = ref(false);
 const error = ref("");
 const testingId = ref<number | null>(null);
@@ -157,6 +170,8 @@ const dialog = reactive({
   visible: false,
   saving: false,
   editingId: 0,
+  /** 编辑态展示当前已存 Key 掩码，让用户确认「留空=不修改」不是「Key 丢了」 */
+  keyMask: "",
   form: {
     name: "",
     vendor: "custom",
@@ -223,6 +238,15 @@ async function load() {
       meta.value = metaRes;
       setModelLabels(metaRes);
     }
+    // 就绪状态以每个角色的后端解析结果为准（单一真源）。
+    // 逐个 allSettled：某个 resolve 失败只让该角色走本地降级，不影响其它角色。
+    const roleKeys = roles.value.map((r) => r.role);
+    const settled = await Promise.allSettled(roleKeys.map((role) => resolveRole(role)));
+    const next: Record<string, RoleResolveResult> = {};
+    settled.forEach((res, i) => {
+      if (res.status === "fulfilled") next[roleKeys[i]] = res.value;
+    });
+    resolutions.value = next;
   } catch (e) {
     error.value = errMsg(e, "模型列表加载失败");
   } finally {
@@ -251,6 +275,7 @@ function emptyForm(): ModelForm {
 
 function openCreate() {
   dialog.editingId = 0;
+  dialog.keyMask = "";
   dialog.form = emptyForm();
   advOpen.value = [];
   dialog.visible = true;
@@ -261,6 +286,7 @@ function openEdit(row: LlmModelView) {
   const p = (row.paramsJson ?? {}) as Record<string, unknown>;
   const hasAdv = Boolean(p.size || p.temperature || p.maxTokens);
   dialog.editingId = row.id;
+  dialog.keyMask = row.apiKeyMask || "";
   advOpen.value = hasAdv ? ["adv"] : [];
   dialog.form = {
     name: row.name,
@@ -330,8 +356,9 @@ async function save() {
     paramsJson.size = form.size;
     paramsJson.ratio = form.ratio;
   } else {
-    if (form.temperature !== null) paramsJson.temperature = form.temperature;
-    if (form.maxTokens !== null) paramsJson.maxTokens = form.maxTokens;
+    // 显式传 null = 删除该参数（后端 paramsJson 合并语义）；不传会把旧值一直留着
+    paramsJson.temperature = form.temperature;
+    paramsJson.maxTokens = form.maxTokens;
   }
 
   const payload: LlmModelPayload & { apiKey?: string } = {
@@ -344,8 +371,8 @@ async function save() {
     paramsJson,
     enabled: form.enabled,
   };
-  // 编辑时留空表示不改动 Key
-  if (form.apiKey) payload.apiKey = form.apiKey;
+  // 编辑时留空/纯空白表示不改动 Key（trim 后非空才发——防误存空格/换行覆盖旧 Key）
+  if (form.apiKey.trim()) payload.apiKey = form.apiKey.trim();
 
   dialog.saving = true;
   try {
@@ -364,6 +391,33 @@ async function save() {
     dialog.saving = false;
   }
 }
+
+/**
+ * 批量删除：与单条删除同一套语义（先解绑角色再删模型，避免悬空外键）。
+ * 提示要点明「绑着角色的模型删了会让对应环节失去模型」——这是删完之后才发现的坑。
+ */
+const modelTableRef = ref<{ clearSelection: () => void } | null>(null);
+
+const batch = useBatchDelete<LlmModelView>({
+  idOf: (row) => row.id,
+  api: bulkDeleteModels,
+  tableRef: modelTableRef,
+  impact: (rows) => {
+    const bound = rows.filter((r) => (r.boundRoles ?? []).length > 0);
+    const parts: string[] = [];
+    parts.push(`将删除 ${rows.length} 个模型配置，删除后不可恢复。`);
+    if (bound.length > 0) {
+      const roles = [...new Set(bound.flatMap((r) => r.boundRoles ?? []))];
+      parts.push(
+        `其中 ${bound.length} 个模型正被角色绑定（${roles.join('、')}），绑定会一并解除，` +
+          '这些环节之后需要重新指定模型才能工作。',
+      );
+    }
+    return parts.join('\n');
+  },
+  title: '批量删除模型',
+  reload: load,
+});
 
 async function remove(row: LlmModelView) {
   try {
@@ -456,17 +510,41 @@ function boundValue(role: string): string | undefined {
 }
 
 /**
- * 角色就绪状态。照「绑定 → 存在 → 启用 → 有 Key」的顺序逐环降级，
- * 任何一环不过都要给出可读原因，而不是笼统显示「未绑定」。
+ * 角色就绪状态（S5-UI-4-1-C）：优先以后端 GET /models/resolve/:role 的
+ * usable/reason 为准——这才是实际生成时 tryResolveForRole 的真源，
+ * 前端不再自行复刻能力/协议判断（此前只判绑定/启用/Key，会误报「就绪」）。
+ *
+ * reason → 短文案只是把后端提示压成 tag 文字；是否可用完全由 usable 决定。
+ * 接口未返回该角色（失败降级）时，回落到本地基础判断，保证页面不崩。
  */
-function bindState(role: string): { type: TagType; text: string } {
+function bindState(role: string): { type: TagType; text: string; tip: string } {
+  const resolved = resolutions.value[role];
+  if (resolved) {
+    if (resolved.usable) return { type: "success", text: "就绪", tip: "后端解析可用，可用于该角色" };
+    const reason = resolved.reason ?? "";
+    let text = "不可用";
+    if (reason.includes("尚未给")) text = "未绑定";
+    else if (reason.includes("已不存在")) text = "绑定已失效";
+    else if (reason.includes("已被停用")) text = "模型已停用";
+    else if (reason.includes("能力")) text = "能力不匹配";
+    else if (reason.includes("尚未实现")) text = "协议未实现";
+    else if (reason.includes("协议")) text = "协议不匹配";
+    else if (reason.includes("API Key")) text = "未填 API Key";
+    else text = "不可用";
+    const type: TagType =
+      text === "未绑定" ? "info"
+      : text === "未填 API Key" ? "warning"
+      : "danger";
+    return { type, text, tip: reason || "该角色当前不可用" };
+  }
+  // 降级：resolve 接口未返回时的本地基础判断（不覆盖能力/协议，仅基础环）
   const b = bindings.value[role];
-  if (!b || b.modelId == null) return { type: "info", text: "未绑定" };
+  if (!b || b.modelId == null) return { type: "info", text: "未绑定", tip: "尚未绑定模型" };
   const m = boundModel(role);
-  if (!m) return { type: "danger", text: "绑定已失效" };
-  if (!m.enabled) return { type: "danger", text: "模型已停用" };
-  if (!m.apiKeyMask) return { type: "warning", text: "未填 API Key" };
-  return { type: "success", text: "就绪" };
+  if (!m) return { type: "danger", text: "绑定已失效", tip: "绑定的模型已不存在" };
+  if (!m.enabled) return { type: "danger", text: "模型已停用", tip: "模型已被停用" };
+  if (!m.apiKeyMask) return { type: "warning", text: "未填 API Key", tip: "模型未配置 API Key" };
+  return { type: "success", text: "就绪", tip: "已绑定且基础条件满足（后端解析状态暂不可用）" };
 }
 
 async function onBindChange(role: string, raw: unknown) {
@@ -540,21 +618,17 @@ function onModelCommand(cmd: string, row: LlmModelView) {
 
 <template>
   <div class="wb-page" v-loading="loading" element-loading-text="正在加载模型…">
-    <header class="wb-page-head">
-      <div>
-        <h2>模型配置</h2>
-        <p class="wb-page-desc">
-          共 {{ models.length }} 个模型 · 启用 {{ enabledCount }} 个 · Key
-          加密落库只回掩码
-        </p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead
+      title="模型配置"
+      :desc="`共 ${models.length} 个模型 · 启用 ${enabledCount} 个 · Key 加密落库只回掩码`"
+    >
+      <template #actions>
         <el-button :icon="Refresh" @click="load">刷新</el-button>
         <el-button :icon="Plus" type="primary" @click="openCreate"
           >新增模型</el-button
         >
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="error" :message="error" @retry="load" />
 
@@ -573,7 +647,7 @@ function onModelCommand(cmd: string, row: LlmModelView) {
     <el-card shadow="never">
       <template #header>角色绑定</template>
 
-      <el-empty
+      <EmptyState
         v-if="models.length === 0"
         description="还没有模型，先新增一个再来绑定"
         :image-size="64"
@@ -592,13 +666,18 @@ function onModelCommand(cmd: string, row: LlmModelView) {
               <label class="bind-label" :for="`bind-${role.role}`">{{
                 role.label
               }}</label>
-              <el-tag
-                :type="bindState(role.role).type"
-                size="small"
-                effect="light"
+              <el-tooltip
+                :content="bindState(role.role).tip"
+                placement="top"
               >
-                {{ bindState(role.role).text }}
-              </el-tag>
+                <el-tag
+                  :type="bindState(role.role).type"
+                  size="small"
+                  effect="light"
+                >
+                  {{ bindState(role.role).text }}
+                </el-tag>
+              </el-tooltip>
             </div>
             <el-select
               :id="`bind-${role.role}`"
@@ -632,10 +711,26 @@ function onModelCommand(cmd: string, row: LlmModelView) {
     <el-card shadow="never">
       <template #header>模型列表</template>
 
+      <!-- 批量操作条：有勾选时才出现 -->
+      <BatchBar
+        :count="batch.count.value"
+        :loading="batch.deleting.value"
+        @delete="batch.runBatchDelete()"
+        @clear="batch.clearSelection()"
+      />
+
       <!-- 宽度约定：数字/状态列固定 width；文本列用 min-width + show-overflow-tooltip——
            min-width 列会按比例分摊表格剩余宽度（自适应撑满），只有挤不下时才出省略号。
            不显示 ID：模型按名称识别，省一列给更有信息量的调用参数。 -->
-      <el-table :data="models" size="default">
+      <el-table
+        ref="modelTableRef"
+        :data="models"
+        size="default"
+        row-key="id"
+        @selection-change="batch.onSelectionChange"
+      >
+        <!-- reserve-selection：翻页后仍保留勾选（配合 row-key） -->
+        <el-table-column type="selection" width="46" reserve-selection />
         <el-table-column
           prop="name"
           label="名称"
@@ -719,7 +814,7 @@ function onModelCommand(cmd: string, row: LlmModelView) {
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty description="还没有配置模型" :image-size="60">
+          <EmptyState description="还没有配置模型" :image-size="60">
             <el-button
               type="primary"
               :icon="Plus"
@@ -727,7 +822,7 @@ function onModelCommand(cmd: string, row: LlmModelView) {
               @click="openCreate"
               >新增模型</el-button
             >
-          </el-empty>
+          </EmptyState>
         </template>
       </el-table>
     </el-card>
@@ -831,8 +926,13 @@ function onModelCommand(cmd: string, row: LlmModelView) {
             v-model="dialog.form.apiKey"
             type="password"
             show-password
+            autocomplete="new-password"
             :placeholder="dialog.editingId ? '留空表示不修改' : 'sk-...'"
           />
+          <!-- 当前掩码可见：确认「留空=不修改」而不是 Key 丢了；autocomplete 防浏览器自动填充误覆盖 -->
+          <div v-if="dialog.editingId && dialog.keyMask" class="wb-muted key-mask-hint">
+            当前已存 Key：<span class="wb-mono">{{ dialog.keyMask }}</span>，留空表示不修改
+          </div>
         </el-form-item>
 
         <el-form-item label="启用">

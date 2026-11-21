@@ -37,6 +37,13 @@ export class UnauthorizedError extends AppError {
   }
 }
 
+/** 已登录但无权限（RBAC 硬拦，见 api/permissions.ts）。 */
+export class ForbiddenError extends AppError {
+  constructor(message = '无权执行此操作') {
+    super(message, { status: 403, code: 'forbidden' });
+  }
+}
+
 /** 微信接口错误。errcode 决定是否重试，见 constants.ts。 */
 export class WechatApiError extends AppError {
   public readonly errcode: number;

@@ -6,9 +6,11 @@ import { useRouter } from 'vue-router';
 
 import { errMsg } from '../api/http.ts';
 import { getPlan, triggerPlan } from '../api/index.ts';
+import EmptyState from '../components/EmptyState.vue';
+import PageHead from '../components/PageHead.vue';
 import StateError from '../components/StateError.vue';
+import StatusTag from '../components/StatusTag.vue';
 import RowActions, { type RowAction } from '../components/RowActions.vue';
-import { pipelineTagType, pipelineText } from '../utils/format.ts';
 import type { PlanResult, PlanTask } from '../types.ts';
 
 const router = useRouter();
@@ -38,6 +40,24 @@ const totalPending = computed(() =>
   (plan.value?.tasks ?? []).reduce((s, t) => s + Math.max(0, t.need), 0),
 );
 
+/**
+ * 后端排产预警与历史欠账（S5-UI-5-P2-1）：只展示接口真实返回的数组，
+ * 空/null/不可用一律不渲染，不自行推断或补 0。
+ * - warnings: string[]，每条已自带具体原因（角度不足/库存告急/角色未就绪）。
+ * - backlog: {date,account,got,miss}[]，近 N 天未写满配额的「历史欠账」，
+ *   不是当前批次失败；date 为历史日期，got 当日已出、miss 当日缺口。
+ */
+const planWarnings = computed<string[]>(() =>
+  Array.isArray(plan.value?.warnings) ? plan.value!.warnings : [],
+);
+const planBacklog = computed<Array<{ date: string; account: string; got: number; miss: number }>>(() =>
+  Array.isArray(plan.value?.backlog) ? plan.value!.backlog : [],
+);
+const warningsExpanded = ref(false);
+const shownWarnings = computed(() =>
+  warningsExpanded.value ? planWarnings.value : planWarnings.value.slice(0, 2),
+);
+
 /** 近作避让标题拼接（模板里不便写类型标注，故提到 script）。 */
 function avoidTitles(list: { date: string; title: string }[]): string {
   return (list ?? []).map((a) => a.title).join('、');
@@ -56,41 +76,70 @@ async function trigger(row: { accountId: number; account: string; need: number; 
   const isComic = row.pipeline === 'comic';
   try {
     const res = await triggerPlan(row.accountId, Math.max(1, row.need || 1), row.pipeline);
-    if (res.ok) {
+    // 结果语义（S5-UI-5-P1）：只用真实创建的文章（res.created 均为 id>0）决定能否跳转。
+    // failed / skipped 来自后端；旧响应缺省时按 [] / 0 处理，保持兼容。
+    const succeeded = res.created ?? [];
+    const failed = res.failed ?? [];
+    const skipped = res.skipped ?? 0;
+    const first = succeeded[0]; // 真实成功文章，id 必然 > 0
+    const failedLines = failed.map((f, i) => `  ${i + 1}. ${f.note ?? f.title ?? '失败'}`).join('\n');
+
+    if (!res.ok && failed.length === 0) {
+      // 全部跳过（配额满 / 无可消费选题）：与失败明确区分，无绿色成功、无跳转。
+      ElMessageBox.alert(
+        `本批未创建草稿${skipped > 0 ? `，跳过 ${skipped} 条` : ''}。\n${res.reason ?? res.message}`,
+        '未生成草稿',
+        { type: 'warning', confirmButtonText: '知道了' },
+      );
+    } else if (!res.ok) {
+      // 全部失败：明确失败结果 + 真实原因 + 可执行下一步，绝不跳 /articles/0。
+      ElMessageBox.alert(
+        h('p', { style: 'white-space: pre-line; margin: 0' },
+          `本批 ${failed.length} 篇建稿失败，未生成任何草稿：\n${failedLines}\n\n` +
+          (isComic
+            ? '请确认「漫画脚本」模型已就绪，再到选题库检查该选题是否已归还。'
+            : '请确认「写作」模型已绑定并就绪，或到选题库检查该选题是否已归还后重试。')),
+        '建稿失败',
+        { type: 'error', confirmButtonText: '知道了' },
+      );
+    } else if (failed.length > 0) {
+      // 部分成功：成功数与失败数都显示，失败项不隐藏；只跳真实成功文章。
+      const skeleton = succeeded.filter((c) => !c.modelUsed).length;
+      const body =
+        `已生成 ${succeeded.length} 篇草稿，${failed.length} 篇失败。\n` +
+        `失败明细：\n${failedLines}` +
+        (skeleton > 0 ? `\n\n其中 ${skeleton} 篇未使用模型（骨架草稿），可打开编辑。` : '') +
+        '\n\n是否打开第一篇成功草稿？';
+      try {
+        await ElMessageBox.confirm(body, '部分草稿生成成功', {
+          type: 'warning', confirmButtonText: '去改稿', cancelButtonText: '稍后',
+        });
+        if (first) await router.push(`/articles/${first.id}`);
+      } catch { /* 用户选择稍后 */ }
+    } else {
+      // 全部成功：保留骨架草稿 / 漫画插图的既有提示。
       ElMessage.success(res.message);
-      const first = res.created[0];
       if (first) {
-        // 文章：modelUsed 为空 = 写作服务回退骨架草稿（未绑模型 / 缺 Key / 调用失败）；
-        // 漫画：note 里带脚本失败信息（漫画不设 modelUsed）。
-        const problemNotes = (res.created ?? [])
-          .filter((c) => (isComic ? c.note && c.note.includes('失败') : !c.modelUsed))
-          .map((c) => `《${c.title ?? `ID ${c.id}`}》：${c.note ?? '未使用模型，已生成骨架草稿'}`);
-        const hasProblem = problemNotes.length > 0;
+        const skeletonNotes = succeeded
+          .filter((c) => !c.modelUsed)
+          .map((c) => `《${c.title ?? `ID ${c.id}`}》：未使用模型，已生成骨架草稿`);
+        const hasSkeleton = skeletonNotes.length > 0;
         const title = isComic ? '漫画已开始生成' : '已生成草稿';
-        // 漫画：脚本落地后**插图已在后台自动逐格开跑**（不用再去文章页手动点生成），
-        // 所以这里的文案是「去看进度」而不是「去生成」。
-        const message = hasProblem
+        const message = hasSkeleton
           ? h('p', { style: 'white-space: pre-line; margin: 0' },
-              `${problemNotes.join('\n')}\n\n${isComic ? '请到「模型配置」绑定「漫画脚本」角色后重试。' : '请到「模型配置」添加模型并绑定「写作」角色后重新出稿；骨架草稿仍可打开编辑。'}`)
+              `${skeletonNotes.join('\n')}\n\n${isComic ? '请到「模型配置」绑定「漫画脚本」角色后重试。' : '请到「模型配置」添加模型并绑定「写作」角色后重新出稿；骨架草稿仍可打开编辑。'}`)
           : isComic
             ? '脚本已生成，分镜插图正在后台自动生成（每格约 30~40 秒，可离开本页）。'
             : '是否立即打开第一篇进行改稿？';
         try {
-          await ElMessageBox.confirm(message, hasProblem ? (isComic ? '漫画脚本生成异常' : '已生成骨架草稿（模型未参与写作）') : title, {
-            type: hasProblem ? 'warning' : 'success',
+          await ElMessageBox.confirm(message, hasSkeleton ? (isComic ? '漫画脚本生成异常' : '已生成骨架草稿（模型未参与写作）') : title, {
+            type: hasSkeleton ? 'warning' : 'success',
             confirmButtonText: isComic ? '去看插图进度' : '去改稿',
             cancelButtonText: '稍后',
           });
           await router.push(`/articles/${first.id}`);
-        } catch {
-          /* 用户选择稍后 */
-        }
+        } catch { /* 用户选择稍后 */ }
       }
-    } else {
-      ElMessageBox.alert(res.reason ?? res.message, '未生成草稿', {
-        type: 'warning',
-        confirmButtonText: '知道了',
-      });
     }
     await loadPlan();
   } catch (e) {
@@ -118,18 +167,11 @@ function onPlanCommand(cmd: string, row: PlanTask) {
 
 <template>
   <div class="wb-page" v-loading="loading" element-loading-text="正在计算今日排产…">
-    <header class="wb-page-head">
-      <div>
-        <h2>创作计划</h2>
-        <p class="wb-page-desc">
-          {{ plan?.date ?? '' }}<template v-if="totalPending"> · 今日待补 {{ totalPending }} 篇</template>
-          · 调度设定请到「自动调度」
-        </p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead :desc="`${plan?.date ?? ''}${totalPending ? ` · 今日待补 ${totalPending} 篇` : ''} · 调度设定请到「自动调度」`" title="创作计划">
+      <template #actions>
         <el-button :icon="Refresh" @click="loadPlan">刷新</el-button>
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="planError" :message="planError" label="创作计划加载失败" @retry="loadPlan" />
 
@@ -146,9 +188,7 @@ function onPlanCommand(cmd: string, row: PlanTask) {
         <el-table-column prop="track" label="赛道" width="110" class-name="col-optional" show-overflow-tooltip />
         <el-table-column label="产线" width="84">
           <template #default="{ row }">
-            <el-tag :type="pipelineTagType(row.pipeline)" size="small">
-              {{ pipelineText(row.pipeline) }}
-            </el-tag>
+            <StatusTag kind="pipeline" :value="row.pipeline" />
           </template>
         </el-table-column>
         <el-table-column prop="alreadyToday" label="已出" width="70" />
@@ -183,7 +223,49 @@ function onPlanCommand(cmd: string, row: PlanTask) {
           </template>
         </el-table-column>
       </el-table>
-      <el-empty v-else description="暂无可排产账号（需凭据就绪且启用）" :image-size="60" />
+      <EmptyState v-else description="暂无可排产账号（需凭据格式合规且启用）" :image-size="60" />
+
+      <!-- 排产预警（S5-UI-5-P2-1）：后端真实返回的提醒，逐条展示具体原因；空数组不渲染 -->
+      <div v-if="planWarnings.length" class="plan-notices">
+        <el-alert
+          v-for="(w, i) in shownWarnings"
+          :key="`warn-${i}`"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="plan-warning"
+        >
+          <template #title><span class="notice-text">{{ w }}</span></template>
+        </el-alert>
+        <el-button
+          v-if="planWarnings.length > 2"
+          link
+          type="primary"
+          size="small"
+          class="notice-toggle"
+          @click="warningsExpanded = !warningsExpanded"
+        >
+          {{ warningsExpanded ? '收起提醒' : `展开全部 ${planWarnings.length} 条提醒` }}
+        </el-button>
+      </div>
+
+      <!-- 历史欠账：近 N 天未写满配额的账号/日期，不是当前批次失败 -->
+      <el-alert
+        v-if="planBacklog.length"
+        type="info"
+        :closable="false"
+        show-icon
+        class="plan-backlog"
+      >
+        <template #title>
+          <div class="backlog-line">
+            <span class="backlog-label">近 3 天欠账（非本次排产）：</span>
+            <span v-for="(b, i) in planBacklog" :key="`bl-${i}`" class="backlog-item">
+              {{ b.date }} · {{ b.account }} 已出 {{ b.got }}、缺 {{ b.miss }}<span v-if="i < planBacklog.length - 1">；</span>
+            </span>
+          </div>
+        </template>
+      </el-alert>
 
       <!-- 未排产原因：原独立卡片「近期欠账与未排产」的保留部分，降级为一行轻提示 -->
       <p v-if="plan?.skipped?.length" class="wb-muted skipped-line">
@@ -196,6 +278,52 @@ function onPlanCommand(cmd: string, row: PlanTask) {
 </template>
 
 <style scoped>
+/* 排产预警与历史欠账（S5-UI-5-P2-1） */
+.plan-notices {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wb-space-1);
+  margin-top: var(--wb-space-3);
+}
+
+.plan-warning :deep(.el-alert__title) {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.notice-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.notice-toggle {
+  align-self: flex-start;
+  padding: 0;
+}
+
+.plan-backlog {
+  margin-top: var(--wb-space-2);
+}
+
+.plan-backlog :deep(.el-alert__title) {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.backlog-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+
+.backlog-label {
+  font-weight: 600;
+}
+
+.backlog-item {
+  white-space: nowrap;
+}
+
 /* 未排产账号轻提示 */
 .skipped-line {
   margin: var(--wb-space-3) 0 0;

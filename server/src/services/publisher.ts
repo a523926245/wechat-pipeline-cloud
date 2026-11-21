@@ -8,7 +8,8 @@
  *   - 只写草稿箱：`WechatClient.addDraft`，**绝不调用 masssend / 群发接口**
  *   - 账号必须 `credStatus === 'ok'`，否则不发起任何外网调用
  *   - 封面仅在文件真实存在时上传；文件缺失时**显式返回 coverMissing**，绝不静默
- *   - 失败时把文章置 `failed` 并优雅返回，不抛到调用方导致崩溃
+ *   - 失败时优雅返回，不抛到调用方导致崩溃：**从未送达过**的文章才置 `failed`，
+ *     曾送达过（mediaId/pushDate 非空）的保持原 status，推送事实不被失败抹掉（S5-1）
  *
  * TODO（本轮不接）：`WechatClient.updateDraft` 目前零调用方。换封面后若要「原地更新旧草稿」
  * 而非「再建一篇新草稿」，必须先 `getDraft` 比对再写——`updateDraft` 内部走 normalizeArticle
@@ -18,6 +19,7 @@
 
 import { existsSync } from 'node:fs';
 
+import { Prisma } from '@prisma/client';
 import { prisma } from '../db.ts';
 import { NotFoundError, WechatApiError } from '../errors.ts';
 import { WechatClient } from './wechat.ts';
@@ -26,9 +28,20 @@ import { packJson } from '../db-json.ts';
 import { todayKey } from '../lib/day.ts';
 import { logger } from '../logger.ts';
 import { lintArticle, lintSummary, type LintReport } from './lint.ts';
+import { recordLintRun, type LintRunBrief } from './lint-store.ts';
+import { hasPushTrace } from './article-delete.ts';
+import { loadTrackRule } from './style-prompts.ts';
 import { ensureComicAssetsReady } from './render/comic.ts';
 
-export type PushReason = 'no_account' | 'cred_not_ok' | 'empty_content' | 'lint_failed';
+export type PushReason =
+  | 'no_account'
+  | 'cred_not_ok'
+  | 'empty_content'
+  | 'lint_failed'
+  /** 已有推送痕迹（mediaId 或 pushDate 非空），按业务规则禁止再建一份微信草稿。 */
+  | 'already_pushed'
+  /** 同一篇文章的推送正在进行中（并发重复点击），本次不调用微信接口。 */
+  | 'pushing';
 
 export interface PushResult {
   ok: boolean;
@@ -41,19 +54,85 @@ export interface PushResult {
   errcode?: number | null;
   detail?: unknown;
   reason?: PushReason;
+  /**
+   * 本次操作前是否已有推送痕迹（mediaId / pushDate 任一非空）。
+   * 前端据此区分「从未送达、本次推送失败」与「曾经送达、后续操作失败」。
+   */
+  everPushed?: boolean;
   /** 配了封面但磁盘上找不到文件：已推无封面草稿。显式暴露，避免静默失败。 */
   coverMissing?: boolean;
   /** 成稿体检报告（仅文章产线）。未通过时 reason='lint_failed'。 */
   lint?: LintReport;
+  /** 本次推送门禁体检的落库记录（S4-3）；落库失败时为 null 且带 lintPersistError。 */
+  lintRun?: LintRunBrief | null;
+  /** 体检结果未能存档的原因（显式暴露，不允许「检查成功但没留痕」看起来像一切正常）。 */
+  lintPersistError?: string;
 }
+
+/**
+ * 同一篇文章的推送去重（S5-1）：只靠前端按钮禁用挡不住并发重复点击，
+ * 这里在进程内把同一 articleId 的推送串行化——第二次调用直接拒绝，绝不重复调微信 addDraft。
+ *
+ * 作用域是**单进程**（本项目为单机单服务，够用）；多进程部署下需另加数据库级占位，本轮不做。
+ */
+const inFlightPushes = new Map<number, Promise<PushResult>>();
 
 /**
  * 推送单篇文章到草稿箱。
  * 网络/微信错误不会抛出，全部收敛为 `ok:false` 的结果对象，便于调度器批量处理。
  */
 export async function pushArticleToDraft(articleId: number): Promise<PushResult> {
-  const a = await prisma.article.findUnique({ where: { id: articleId } });
+  const running = inFlightPushes.get(articleId);
+  if (running) {
+    // 不 await：让调用方立刻拿到「正在推送中」，避免排队产生第二份草稿。
+    return {
+      ok: false,
+      id: articleId,
+      reason: 'pushing',
+      message: '该文章的推送正在进行中，请稍候再试；本次未调用微信接口',
+    };
+  }
+  const task = (async () => {
+    try {
+      return await pushOnce(articleId);
+    } finally {
+      inFlightPushes.delete(articleId);
+    }
+  })();
+  inFlightPushes.set(articleId, task);
+  return task;
+}
+
+async function pushOnce(articleId: number): Promise<PushResult> {
+  // 带出 track.name：星座赛道要跑星座专属体检（像不像星座文章、教科书腔、跨星座复读）。
+  // 赛道名进体检而不是进代码分支，是为了让「星座规则」只存在于 style_dna.json 一处。
+  const a = await prisma.article.findUnique({
+    where: { id: articleId },
+    include: { track: { select: { name: true } } },
+  });
   if (!a) throw new NotFoundError(`文章 ${articleId} 不存在`);
+
+  // ── 推送事实防重复（S5-1）──
+  // 判据是 mediaId / pushDate 任一非空（hasPushTrace），**不是 status**：
+  // status 会被改稿/改写/换封面/重推失败改写（draft / updated / failed），
+  // 但「这篇曾经送到过微信」是抹不掉的事实，绝不能再建第二份草稿。
+  // 放在最前面：与账号、凭据、体检都无关，是纯粹的业务事实判断。
+  const everPushed = hasPushTrace(a);
+  if (everPushed) {
+    logger.warn({ articleId, mediaId: a.mediaId, pushDate: a.pushDate }, '拒绝重复推送：该文章已有推送痕迹');
+    return {
+      ok: false,
+      id: a.id,
+      reason: 'already_pushed',
+      everPushed: true,
+      mediaId: a.mediaId,
+      pushDate: a.pushDate,
+      message:
+        `文章「${a.title}」已在 ${a.pushDate || '此前'} 推送到微信草稿箱` +
+        `（mediaId ${a.mediaId || '无'}），不能重复创建草稿。` +
+        '如需更新公众号里的那一篇，请到公众号后台编辑；本系统暂不支持原地更新草稿',
+    };
+  }
 
   if (!a.accountId) {
     return {
@@ -64,7 +143,7 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
     };
   }
 
-  const account = await prisma.account.findUnique({ where: { id: a.accountId } });
+  const account = await prisma.oAAccount.findUnique({ where: { id: a.accountId } });
   if (!account) throw new NotFoundError(`账号 ${a.accountId} 不存在`);
 
   if (account.credStatus !== 'ok') {
@@ -106,8 +185,28 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
 
   // ── 成稿体检门禁（仅文章产线；漫画正文是图片序列，结构规则不同）──
   // 放在凭据校验之后：先确认「能推」，再判断「值不值得推」，免得白跑一次体检。
+  let gateLintRun: LintRunBrief | null = null;
+  let gateLintPersistError: string | undefined;
   if (a.pipeline !== 'comic' && a.contentHtml.trim()) {
-    const lint = lintArticle(a.contentHtml);
+    // 赛道专项检查按 `r:{赛道}` 配置走（不再是代码里的赛道名分支）。
+    // checks 与 relax 取自同一条规则：漏传 relax 会让配置页配的 warn 豁免在推送门禁失效。
+    const trackName = a.track?.name ?? '';
+    const rule = await loadTrackRule(trackName);
+    const lint = lintArticle(a.contentHtml, undefined, trackName, rule.checks, rule.relax);
+    // 门禁结论一律留痕（通过与否都记）：这是「这篇到底在什么状态下被推/被拦」的唯一书面证据。
+    const rec = await recordLintRun({
+      articleId: a.id,
+      trigger: 'push',
+      report: lint,
+      contentHtml: a.contentHtml,
+      rule: { checks: rule.checks, relax: rule.relax },
+    });
+    gateLintRun = rec.run ?? null;
+    gateLintPersistError = rec.error;
+    if (!rec.saved) {
+      // 体检本身已完成、结论有效；只是没存下来。既不拦推送（不改变业务门禁），也不装作存成功。
+      logger.warn({ articleId: a.id, err: rec.error }, '体检结果落库失败：本次门禁结论未能留痕');
+    }
     if (!lint.ok) {
       logger.warn(
         { articleId: a.id, errors: lint.errors.map((e) => e.code) },
@@ -119,6 +218,8 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
         account: account.name,
         reason: 'lint_failed',
         lint,
+        lintRun: gateLintRun,
+        ...(gateLintPersistError ? { lintPersistError: gateLintPersistError } : {}),
         message: `未通过成稿体检（${lintSummary(lint)}）：${lint.errors.map((e) => e.message).join('；')}`,
       };
     }
@@ -189,7 +290,10 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
       id: updated.id,
       mediaId,
       pushDate,
+      everPushed: false,
       ...(coverMissing ? { coverMissing: true } : {}),
+      ...(gateLintRun ? { lintRun: gateLintRun } : {}),
+      ...(gateLintPersistError ? { lintPersistError: gateLintPersistError } : {}),
       message: coverMissing
         ? '已推送到草稿箱（未群发），但封面文件缺失，推的是无封面草稿'
         : '已推送到草稿箱（未群发）。可在公众号后台草稿箱查看',
@@ -207,9 +311,22 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
       message = e.message;
     }
 
-    await prisma.article
-      .update({ where: { id: articleId }, data: { status: 'failed' } })
-      .catch(() => undefined);
+    // ── 推送事实不得被失败覆盖（S5-1）──
+    // mediaId / pushDate 本方法在任何路径下都不清空，这里是第二道保险：
+    // 只有「从未送达过微信」的文章才降级成 failed；曾经送达过的保持原 status
+    // （pushed / updated），否则一次重推失败就把「已送达」这件事从界面上抹掉了。
+    // 失败本身不丢：TaskRun 记 errcode + errMessage，前端也能拿到 everPushed 区分两种失败。
+    const everPushedNow = hasPushTrace(a);
+    if (!everPushedNow) {
+      await prisma.article
+        .update({ where: { id: articleId }, data: { status: 'failed' } })
+        .catch(() => undefined);
+    } else {
+      logger.warn(
+        { articleId, status: a.status, mediaId: a.mediaId, pushDate: a.pushDate, errcode },
+        '推送失败但保留推送事实（status 不降级为 failed）',
+      );
+    }
 
     await recordPushRun({
       runDate,
@@ -221,7 +338,17 @@ export async function pushArticleToDraft(articleId: number): Promise<PushResult>
       errMessage: message,
     });
 
-    return { ok: false, id: a.id, account: account.name, errcode, message, detail };
+    return {
+      ok: false,
+      id: a.id,
+      account: account.name,
+      errcode,
+      message: everPushedNow
+        ? `${message}（该文章此前已成功推送过，本次失败未清除原有推送记录，status 保持「${a.status}」）`
+        : message,
+      detail,
+      everPushed: everPushedNow,
+    };
   }
 }
 
@@ -252,8 +379,8 @@ async function recordPushRun(info: PushRunInfo): Promise<void> {
         articleId: info.articleId,
         runDate: info.runDate,
         attempt: 1,
-        paramsJson: packJson({ articleId: info.articleId }),
-        resultJson: info.ok ? packJson({ mediaId: info.mediaId }) : null,
+        paramsJson: packJson({ articleId: info.articleId }) ?? Prisma.DbNull,
+        resultJson: info.ok ? packJson({ mediaId: info.mediaId }) ?? Prisma.DbNull : Prisma.DbNull,
         errorCode: info.errcode != null ? String(info.errcode) : '',
         errorMessage: info.errMessage ?? '',
         finishedAt: new Date(),

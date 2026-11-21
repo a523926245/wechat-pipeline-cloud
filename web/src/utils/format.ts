@@ -4,29 +4,105 @@ import type { ModelMeta } from '../types.ts';
 
 export type TagType = 'success' | 'warning' | 'danger' | 'info' | 'primary';
 
-const STATUS_TEXT: Record<string, string> = {
-  draft: '草稿',
-  pushed: '已推送',
-  failed: '失败',
-  updated: '已更新',
-  ok: '成功',
-  success: '成功',
-  error: '失败',
-  running: '运行中',
-  skipped: '跳过',
+/**
+ * 状态词表（S5-UI-1 收口）：全站唯一真源。
+ *
+ * 为什么要分 kind：文章状态、选题审核态、任务状态是**三套不同的语义**，
+ * 以前合在一张表里，靠 key 不撞车来「碰巧」区分。现在按业务维度分开，
+ * 页面用 <StatusTag kind="..." :value="..." /> 取用，不允许各自复制一份词表。
+ *
+ * 口径纪律：文字与颜色一一对应；未知值原样显示（不猜、不归并成含糊状态）。
+ */
+export type StatusKind = 'article' | 'angle' | 'verdict' | 'task' | 'pipeline' | 'usage';
+
+export interface StatusMeta {
+  text: string;
+  type: TagType;
+}
+
+/** 文章状态（ArticleStatus 枚举：draft / updated / pushed / failed）。 */
+export const ARTICLE_STATUS_META: Record<string, StatusMeta> = {
+  draft: { text: '草稿', type: 'info' },
+  updated: { text: '已更新', type: 'warning' },
+  pushed: { text: '已推送', type: 'success' },
+  failed: { text: '失败', type: 'danger' },
 };
 
-const STATUS_TAG: Record<string, TagType> = {
-  draft: 'info',
-  pushed: 'success',
-  failed: 'danger',
-  updated: 'warning',
-  ok: 'success',
-  success: 'success',
-  error: 'danger',
-  running: 'primary',
-  skipped: 'info',
+/** 选题审核态（AngleStatus 枚举：candidate / needs_revision / approved / rejected）。 */
+export const ANGLE_STATUS_META: Record<string, StatusMeta> = {
+  candidate: { text: '候选待审', type: 'info' },
+  needs_revision: { text: '待修改', type: 'warning' },
+  approved: { text: '已通过', type: 'success' },
+  rejected: { text: '已拒绝', type: 'danger' },
 };
+
+/**
+ * 审核动作（TopicReview.verdict）。
+ * 与 AngleStatus 是两个概念：verdict 是「这一轮做了什么」（通过 / 要求修改 / 拒绝），
+ * AngleStatus 是「现在是什么状态」（已通过 / 待修改 / 已拒绝）。
+ * 文字口径保持不同，不合并——合并会把「历史动作」说出来当成「当前状态」。
+ */
+export const REVIEW_VERDICT_META: Record<string, StatusMeta> = {
+  approved: { text: '通过', type: 'success' },
+  needs_revision: { text: '要求修改', type: 'warning' },
+  rejected: { text: '拒绝', type: 'danger' },
+};
+
+/** 任务状态（TaskStatus 枚举：pending / running / success / failed / canceled，另兼容历史 ok / error / skipped）。 */
+export const TASK_STATUS_META: Record<string, StatusMeta> = {
+  pending: { text: '排队中', type: 'info' },
+  queued: { text: '排队中', type: 'info' },
+  running: { text: '运行中', type: 'primary' },
+  success: { text: '成功', type: 'success' },
+  ok: { text: '成功', type: 'success' },
+  failed: { text: '失败', type: 'danger' },
+  error: { text: '失败', type: 'danger' },
+  canceled: { text: '已取消', type: 'info' },
+  skipped: { text: '跳过', type: 'info' },
+};
+
+/** 选题消费态（Angle.used 布尔 → 两个展示值；与审核态是两个维度，不合并）。 */
+export const USAGE_STATUS_META: Record<string, StatusMeta> = {
+  used: { text: '已用', type: 'info' },
+  unused: { text: '未用', type: 'success' },
+};
+
+/**
+ * 取状态文案与配色。
+ * 产线文案由后端 GET /api/pipelines 下发（pipelineText），这里委托给它，避免两处维护。
+ */
+export function statusMeta(kind: StatusKind, value: string | null | undefined): StatusMeta {
+  const v = String(value ?? '');
+  if (kind === 'pipeline') return { text: pipelineText(v), type: pipelineTagType(v) };
+  const table: Record<string, StatusMeta> =
+    kind === 'article'
+      ? ARTICLE_STATUS_META
+      : kind === 'angle'
+        ? ANGLE_STATUS_META
+        : kind === 'verdict'
+          ? REVIEW_VERDICT_META
+          : kind === 'task'
+            ? TASK_STATUS_META
+            : USAGE_STATUS_META;
+  return table[v] ?? { text: v || '—', type: 'info' };
+}
+
+/** 选题审核态文案（筛选下拉等只需要文字的地方用）。 */
+export function angleStatusText(status: string): string {
+  return statusMeta('angle', status).text;
+}
+
+/**
+ * 旧签名：文章状态取文案 / 配色。
+ * 仅为尚未迁移的历史调用（ArticleEditView）保留，新代码请用 statusMeta 或 <StatusTag>。
+ */
+export function statusText(status: string): string {
+  return statusMeta('article', status).text;
+}
+
+export function statusTag(status: string): TagType {
+  return statusMeta('article', status).type;
+}
 
 /** 凭据状态 → Element 标签类型。 */
 const CRED_TAG: Record<string, TagType> = {
@@ -36,20 +112,25 @@ const CRED_TAG: Record<string, TagType> = {
   missing: 'warning',
 };
 
+/**
+ * 凭据状态文案（S5-UI-5-P2-2）：后端 credStatus 只做「格式校验」，
+ * 系统没有真实验证状态字段——ok 仅代表 AppID/Secret 格式合规，
+ * 绝不能写成「就绪 / 已验证 / 可用」暗示微信接口认证成功。
+ */
 const CRED_TEXT: Record<string, string> = {
-  ok: '就绪',
+  ok: '格式合规',
   placeholder: '待填写',
-  invalid: '无效',
-  missing: '缺失',
+  invalid: '格式错误',
+  missing: '未填写',
 };
 
-export function statusText(status: string): string {
-  return STATUS_TEXT[status] ?? status;
-}
-
-export function statusTag(status: string): TagType {
-  return STATUS_TAG[status] ?? 'info';
-}
+/** 状态标签的辅助说明（tooltip）；ok 明确点出「不代表接口验证成功」。 */
+const CRED_HINT: Record<string, string> = {
+  ok: 'AppID / AppSecret 格式符合要求；尚未代表微信公众号接口验证成功，请点「测试连通」确认。',
+  placeholder: '当前是占位示例值，需填入真实 AppID / AppSecret 才能启用。',
+  invalid: 'AppID / AppSecret 格式不合规，请检查后重新填写。',
+  missing: '尚未填写 AppID / AppSecret，补齐后才会启用。',
+};
 
 export function credTag(status: string): TagType {
   return CRED_TAG[status] ?? 'info';
@@ -57,6 +138,11 @@ export function credTag(status: string): TagType {
 
 export function credText(status: string): string {
   return CRED_TEXT[status] ?? status;
+}
+
+/** 凭据状态的完整含义（用于 tooltip / 说明）。 */
+export function credHint(status: string): string {
+  return CRED_HINT[status] ?? '凭据状态未知';
 }
 
 /**

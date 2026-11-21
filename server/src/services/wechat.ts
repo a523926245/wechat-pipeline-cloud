@@ -85,7 +85,7 @@ export class WechatClient {
 
   /** 由账号 ID 构造客户端；凭据从库里解密取出，缺失则直接报错。 */
   static async fromAccountId(accountId: number): Promise<WechatClient> {
-    const a = await prisma.account.findUnique({ where: { id: accountId } });
+    const a = await prisma.oAAccount.findUnique({ where: { id: accountId } });
     if (!a) throw new CredentialError(`账号 ${accountId} 不存在`);
     const secret = decryptSecret(a.secretEnc);
     if (!secret) throw new CredentialError(`账号 ${a.name} 缺少可用凭据，无法创建微信客户端`);

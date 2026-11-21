@@ -106,12 +106,78 @@ export interface AngleItem {
   usedBy: string;
   usedDate: string | null;
   source: string;
+  /** 审核态（S4-1）：candidate / needs_revision / approved / rejected。 */
+  status: AngleStatus;
+  /** 已完成审核轮数（0=从未审核）。 */
+  reviewRound: number;
+  /** 六维评分（未评分为 null——不得视为高质量）。 */
+  scores: AngleScores | null;
+  /** 总分（0-30，六维等权合计）；未评分为 null。 */
+  scoreTotal: number | null;
+  /** 评分模型给出的参考建议（不是审核结论）。 */
+  scoreSuggestion: string;
+  /** 评分失败/缺失原因；null=已评分。 */
+  scoreError: string | null;
+  /** 待重新评分标记（R1）：approved 编辑退回后 true，重新评分成功后清除；带标记不可审核通过。 */
+  rescoreRequired?: boolean;
+  /** 去重命中明细（S4-2 metaJson.dedupHits）：L2 历史文章标题提示为主，列表/审核展示用。 */
+  dedupHits?: AngleDupHit[];
   /** 引用了该选题的文章数，删除前据此给用户强提示 */
   articleCount: number;
   /** 含 IP 外角色（奶奶/婆婆/老师…）：漫画线画不出来，需要退回文章专用。 */
   offIp?: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+/** 选题审核态（D1：status 只管审核态，used 只管消费态）。 */
+export type AngleStatus = 'candidate' | 'needs_revision' | 'approved' | 'rejected';
+/** 人工审核结论（评分不替代人工审核，此枚举只来自人工操作）。 */
+export type AngleReviewVerdict = 'approved' | 'needs_revision' | 'rejected';
+
+/**
+ * 去重命中明细（S4-2）。L0 完全重复 / L1 高度相似 → 拦截保存；
+ * L2 历史文章标题相似 → 只提示不拦截。
+ */
+export interface AngleDupHit {
+  level: 'L0' | 'L1' | 'L2';
+  /** angle=现有选题（L0/L1）；article=历史文章标题（L2）。 */
+  sourceType: 'angle' | 'article';
+  targetId: number;
+  /** 命中的选题内容或历史文章标题。 */
+  targetText: string;
+  /** 相似度 0~1（L0 固定 1）。 */
+  score: number;
+  trackId: number | null;
+  trackName: string;
+  reason: string;
+}
+
+/** 六维评分（0-5 整数/维，总分=等权合计 0-30；无权重、无阈值）。 */
+export interface AngleScores {
+  fit: number;
+  scene: number;
+  conflict: number;
+  method: number;
+  safety: number;
+  novelty: number;
+  total: number;
+}
+
+/** TopicReview 审核事件（一候选多轮全留）。 */
+export interface TopicReviewRecord {
+  id: number;
+  angleId: number;
+  round: number;
+  scores: AngleScores | null;
+  riskHits: string[];
+  /** 审核时刻的去重命中快照（S4-2 TopicReview.dupHits）。 */
+  dupHits?: AngleDupHit[];
+  verdict: AngleReviewVerdict;
+  reason: string;
+  model: string;
+  reviewedBy: string;
+  createdAt: string;
 }
 
 export type AngleUsedFilter = 'unused' | 'used' | 'all';
@@ -121,11 +187,15 @@ export type AngleScopeFilter = 'article' | 'comic' | 'shared';
 export interface AngleListQuery {
   trackId: number;
   used?: AngleUsedFilter;
+  /** 审核态过滤；'all' 不下发。 */
+  status?: AngleStatus | 'all';
   /** 角度切片过滤：article / comic / shared */
   scope?: AngleScopeFilter;
   /** 只看含 IP 外角色的选题。 */
   offIp?: boolean;
   keyword?: string;
+  /** score=按总分降序（未评分排最后）。 */
+  sort?: 'seq' | 'score';
   limit?: number;
   offset?: number;
 }
@@ -196,6 +266,8 @@ export interface TrackExpandResult {
   requested: number;
   added: number;
   skippedDuplicate: number;
+  /** 六维评分成功的条数（S4-1；评分失败按未评分，不自动批准）。 */
+  scored: number;
   generated: number;
   /** 本批产出的角度切片 */
   scope: AngleScopeFilter;
@@ -334,6 +406,14 @@ export interface ReviseApplyResult {
   title: string;
   digest: string;
   contentWechat: string;
+  /** 改写后对**最终正文**的成稿体检结果；体检本身出错时为 null（正文仍已保存）。 */
+  lint?: ArticleLint | null;
+  /** 体检留痕（S4-3）；落库失败为 null 且带 lintPersistError。 */
+  lintRun?: ArticleLintRun | null;
+  /** 体检结果未能存档的原因（显式暴露，不伪装成已留存）。 */
+  lintPersistError?: string;
+  /** 面向使用者的一句话结论（含体检是否有问题）。 */
+  message?: string;
 }
 
 // ── 封面生图 ──
@@ -397,24 +477,55 @@ export interface TriggerResult {
   accountId: number;
   account: string;
   need: number;
+  /** 只含真实创建成功的文章（id>0）；失败项在 failed，不再混入这里。 */
   created: { id: number; title?: string; angleId?: number | null; modelUsed?: string | null; note?: string | null }[];
+  /** 本批失败项（无文章 id），仅用于反馈；兼容旧响应缺省为 []。 */
+  failed?: { title?: string; angleId?: number | null; note?: string | null }[];
+  /** 本批跳过条数；兼容旧响应缺省为 0。 */
+  skipped?: number;
   reason?: string | null;
   message: string;
 }
 
 // ── 调度 ──
 
+/** 每客户自动化模式（P4）：manual=纯手动 / auto_draft=自动写稿 / auto_draft_push=自动写稿+推草稿箱。
+ *  群发红线 AUTO_PUBLISH 与本开关解耦，永不自动。 */
+export type AutomationMode = 'manual' | 'auto_draft' | 'auto_draft_push';
+
 export interface SchedulerConfig {
+  /** 全局总开关（仅管理员可改）。 */
   enabled: boolean;
+  /** 无主账号兜底写稿时间。每用户看 my.writeTime。 */
   writeTime: string;
+  /** 无主账号兜底是否推草稿箱。每用户看 my.automationMode。 */
   pushEnabled: boolean;
+}
+
+/** 我的每客户自动化配置。 */
+export interface MyAutomation {
+  automationMode: AutomationMode;
+  writeTime: string;
+}
+
+/** 推送意图：本次排产到底会不会推到公众号草稿箱。
+ *  真源在后端（按每账号 owner 的 automationMode 聚合），前端只消费、不自行推断。 */
+export type PushIntentStatus = 'none' | 'partial' | 'all' | 'unknown';
+
+export interface PushIntent {
+  /** none=不会推 / partial=部分账号会推 / all=全部就绪账号都会推 / unknown=无就绪账号，无法判断 */
+  status: PushIntentStatus;
 }
 
 export interface SchedulerStatus {
   running: boolean;
   intervalMs: number;
   config: SchedulerConfig;
+  my: MyAutomation;
+  modeOptions?: Array<{ value: AutomationMode; label: string }>;
   lastTick: TickResult | null;
+  /** 推送意图（服务端真源）。缺省=旧后端，前端不显示横幅而不是猜一个结论。 */
+  pushIntent?: PushIntent;
 }
 
 export interface TickWritten {
@@ -519,6 +630,110 @@ export interface DashboardData {
     createdAt: string;
   }>;
   warnings: string[];
+  degraded: string[];
+  /**
+   * 待办队列（S5-UI-2）。后端总是返回该字段；声明为可选只是为了让
+   * 「前端已更新、后端还没上」的过渡期不炸——缺失时不渲染待办卡，不伪造数字。
+   */
+  todos?: TodoBlock;
+}
+
+/**
+ * 工作台待办（S5-UI-2）。
+ *
+ * 口径约定（与 server/src/services/dashboard.ts 一一对应）：
+ *   - 数字类型是 `number | null`：0 = 查询成功且确实没有；null = 该块查询失败，
+ *     UI 必须显示「统计暂不可用」，**不得显示成 0**。
+ *   - `angles` 为 null 有两种语义：member 权限（正常）或 admin 的该块查询失败（降级）。
+ *     区分方式：看 `degraded` 里是否含 'angles'。
+ */
+export type TodoScope = 'all' | 'own';
+
+export interface TodoAngleItem {
+  id: number;
+  trackId: number;
+  track: string;
+  status: string;
+  theme: string;
+  content: string;
+  /** 六维总分（未评分为 null，不视为高质量）。 */
+  scoreTotal: number | null;
+  updatedAt: string;
+}
+
+export interface TodoAnglesBlock {
+  total: number | null;
+  candidate: number | null;
+  needsRevision: number | null;
+  /** 等最久的候选等了几天（按 updatedAt 算）。 */
+  oldestWaitingDays: number | null;
+  byTrack: Array<{ trackId: number; track: string; candidate: number; needsRevision: number }>;
+  recent: TodoAngleItem[];
+}
+
+export type TodoArticleReason = 'draft_unpushed' | 'repush' | 'push_failed';
+
+export interface TodoArticleItem {
+  id: number;
+  title: string;
+  status: string;
+  pipeline: string;
+  account: string | null;
+  reason: TodoArticleReason;
+  updatedAt: string;
+}
+
+export interface TodoArticlesBlock {
+  draftUnpushed: number | null;
+  repush: number | null;
+  pushFailed: number | null;
+  /** 漫画待推草稿：独立口径，不与上面三项相加。 */
+  comicDraft: number | null;
+  oldestDraftDays: number | null;
+  recent: TodoArticleItem[];
+}
+
+export interface TodoLintItem {
+  articleId: number;
+  title: string;
+  trigger: string;
+  errorCount: number;
+  warnCount: number;
+  checkedAt: string;
+  stale: boolean;
+}
+
+export interface TodoLintBlock {
+  /** 最新一次体检不通过、且记录与当前正文一致的篇数。 */
+  failed: number | null;
+  recent: TodoLintItem[];
+}
+
+export interface TodoRunItem {
+  id: number;
+  jobType: string;
+  accountId: number | null;
+  account: string | null;
+  articleId: number | null;
+  errorCode: string;
+  errorMessage: string;
+  createdAt: string;
+}
+
+export interface TodoRunsBlock {
+  windowDays: number;
+  /** 窗口内「同键最新一条仍失败」的次数（write/comic_script 是批次，按「次」不看「篇」）。 */
+  unresolved: number | null;
+  recent: TodoRunItem[];
+}
+
+export interface TodoBlock {
+  scope: TodoScope;
+  angles: TodoAnglesBlock | null;
+  articles: TodoArticlesBlock;
+  lint: TodoLintBlock;
+  runs: TodoRunsBlock;
+  /** 查询失败的块名（angles / articles / lint / runs）。权限限制不会出现在这里。 */
   degraded: string[];
 }
 
@@ -651,6 +866,31 @@ export interface ArticleRenderResult {
   message?: string;
   /** 成稿体检（文章产线才有；漫画为 null）。未通过时推送会被门禁拦下。 */
   lint?: ArticleLint | null;
+  /** 最近一次落库的体检记录（S4-3）；从未检查过为 null。 */
+  lintRun?: ArticleLintRun | null;
+  /** 存档结论所对应的正文已不是当前正文（改过稿/换过版），需重新检查才可信。 */
+  lintRunStale?: boolean;
+  /** 当前正文指纹（与 lintRun.contentHash 比对判断存档是否过期）。 */
+  contentHash?: string;
+  /** 本次体检结果未能存档的原因（存在即表示「检查成功但没留痕」，必须展示）。 */
+  lintPersistError?: string;
+}
+
+/** 单次成稿体检记录：一次检查一行，历史保留（S4-3 落库）。 */
+export interface ArticleLintRun {
+  id: number;
+  /** check=改稿页手动重新检查 / save=保存正文 / push=推送门禁 / revise=AI 改写后自动复检 */
+  trigger: 'check' | 'save' | 'push' | 'revise';
+  ok: boolean;
+  errorCount: number;
+  warnCount: number;
+  /** 被检查正文的 SHA-256。 */
+  contentHash: string;
+  createdAt: string;
+  stats?: ArticleLint['stats'] | null;
+  issues?: ArticleLintIssue[];
+  /** 当时生效的规则参数（checks/relax）快照。 */
+  rule?: { checks?: string[]; relax?: string[] } | null;
 }
 
 /** 成稿体检报告：与推送门禁同一套规则。 */
@@ -677,6 +917,11 @@ export interface ArticleLintIssue {
   level: 'error' | 'warn';
   code: string;
   message: string;
+  /**
+   * 命中片段（后端能精确定位时给出，最多 3 条；带上下文的字符串）。
+   * 可选：很多规则（sections/chars/ending_hook 等）没有 hits。
+   */
+  hits?: string[];
 }
 
 export interface PushResult {
@@ -688,8 +933,14 @@ export interface PushResult {
   errcode?: number | null;
   detail?: unknown;
   reason?: string;
+  /** 本次操作前是否已有推送痕迹（mediaId/pushDate 任一非空）——用于区分「首次推送失败」与「曾经推送过、后续失败」。 */
+  everPushed?: boolean;
   /** 被体检门禁拦下时带上完整报告。 */
   lint?: ArticleLint | null;
+  /** 本次推送门禁体检的落库记录（S4-3）。 */
+  lintRun?: ArticleLintRun | null;
+  /** 门禁体检结果未能存档的原因。 */
+  lintPersistError?: string;
   coverMissing?: boolean;
 }
 
@@ -712,4 +963,85 @@ export interface EmphasisApplyResult {
   title: string;
   digest: string;
   contentWechat: string;
+}
+
+// ── 文风配置 ──
+
+/** 文风配置项。key：'global' | '{赛道名}' | 'v:global:{dim}' | 'v:{赛道}:{dim}'。 */
+export interface StylePromptItem {
+  key: string;
+  kind: 'global' | 'track' | 'variant' | 'system' | 'spec' | 'rule';
+  prompt: string;
+  updatedAt: string;
+}
+
+/** 出厂默认值（「恢复默认」用）。variants 的键即配置 key（v:...）。 */
+export interface StylePromptDefaults {
+  global: string;
+  /** 系统提示词（`sys:{赛道}`）：`## system` + `## tail` 两节，含 `{{变量}}`。 */
+  systems: Record<string, string>;
+  tracks: Record<string, string>;
+  variants: Record<string, string>;
+  /** 写作规范（`s:{赛道}`）：段落形态 / 强调标注 / 句式补充 / 去AI味（预留）。 */
+  specs: Record<string, string>;
+  /** 机器规则（`r:{赛道}`）：体检项与选题形态，JSON 文本。 */
+  rules: Record<string, string>;
+}
+
+/** 系统用户角色（与 ModelRole 区分：那是模型用途绑定）。admin>member>guest 只读。 */
+export type UserRole = 'admin' | 'member' | 'guest';
+
+/** 登录/状态返回的用户概要（不含口令）。 */
+export interface AuthUser {
+  id: number | null;
+  username: string;
+  role: UserRole;
+  status?: 'pending' | 'active' | 'disabled';
+  expiresAt?: string | null;
+  /** 冒烟旁路 = smoke，正常登录 = session（管理令牌已退场）。 */
+  via?: 'session' | 'smoke';
+}
+
+/** 鉴权状态（GET /api/auth/status）。不返回令牌本身。 */
+export interface AuthStatus {
+  authRequired: boolean;
+  loggedIn: boolean;
+  user: AuthUser | null;
+}
+
+/** 用户管理列表项（admin，GET /api/users）。 */
+export interface UserAdminItem {
+  id: number;
+  username: string;
+  role: UserRole;
+  status: 'pending' | 'active' | 'disabled';
+  expiresAt: string | null;
+  maxOAAccounts: number;
+  createdAt: string;
+  oaAccountCount: number;
+}
+
+/** 批量删除里单条失败的明细。reason 直接展示给用户，不做二次加工。 */
+export interface BulkDeleteFailure {
+  id: number;
+  reason: string;
+}
+
+/**
+ * 批量删除结果（POST /api/<资源>/bulk-delete）。
+ *
+ * 逐条独立执行：一条失败不阻断其余，所以要同时给成功数与失败明细。
+ */
+export interface BulkDeleteResult {
+  ok: boolean;
+  /** 去重后的请求条数 */
+  total: number;
+  /** 成功删除的条数 */
+  deleted: number;
+  /** 失败明细（逐条带原因） */
+  failed: BulkDeleteFailure[];
+  /** 附加统计：如级联删了几篇文章、归还了几个选题 */
+  details: Record<string, number>;
+  /** 面向用户的一句话总结 */
+  message: string;
 }

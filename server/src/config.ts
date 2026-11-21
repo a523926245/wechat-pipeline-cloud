@@ -6,8 +6,7 @@
  * - 敏感值只从环境变量读取，绝不写进代码库
  */
 
-import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -24,13 +23,15 @@ export const IS_PROD = NODE_ENV === 'production';
 export const PORT = Number.parseInt(process.env.PORT ?? '8787', 10);
 
 /**
- * 数据库连接串。
- * 本地开发用 SQLite（file:./var/tmp/dev.db），生产用 MySQL。
+ * 数据库连接串（MySQL）。
+ * 必须由环境变量 / server/.env 提供；SQLite 运行时代已结束（dev.db 仅归档，不参与运行）。
  */
-export const DATABASE_URL = process.env.DATABASE_URL ?? `file:${join(SERVER_DIR, 'var', 'tmp', 'dev.db')}`;
-
-/** 是否 SQLite（影响锁机制与部分能力降级） */
-export const IS_SQLITE = DATABASE_URL.startsWith('file:');
+export const DATABASE_URL = process.env.DATABASE_URL ?? '';
+if (!DATABASE_URL) {
+  throw new Error(
+    'DATABASE_URL 未配置：需要 MySQL 连接串（mysql://user:pass@host:3306/wechat_pipeline）',
+  );
+}
 
 /** 内容落盘目录（文章 HTML、封面 PNG） */
 export const CONTENT_DIR = process.env.CONTENT_DIR ?? join(BASE_DIR, 'var', 'content');
@@ -91,44 +92,25 @@ export function ensureDir(p: string): string {
 export function ensureContentDirs(): { articles: string; covers: string; comics: string } {
   const articles = ensureDir(join(CONTENT_DIR, 'articles'));
   const covers = ensureDir(join(CONTENT_DIR, 'covers'));
-  // 漫画产线产物：ill-{seq}.png 场景插图 + quote-{seq}.jpg 金句卡
+  // 漫画产线产物：ill-{seq}.png 场景插图 + quote-{articleId}-{seq}.jpg 金句卡（按文章隔离）
   const comics = ensureDir(join(CONTENT_DIR, 'comics'));
   return { articles, covers, comics };
 }
 
 /**
- * Fernet 风格主密钥。生产环境必须从环境变量取，否则重启后已加密的 AppSecret 无法解密。
+ * Fernet 风格主密钥。必须从环境变量取，否则重启后已加密的 AppSecret 无法解密。
  * 这里用 32 字节 base64（AES-256-GCM）。
  */
 export function requireMasterKey(): Buffer {
   const raw = process.env.APP_SECRET_KEY ?? '';
-  if (raw) {
-    const key = Buffer.from(raw, 'base64');
-    if (key.length !== 32) {
-      throw new Error('APP_SECRET_KEY 必须是 32 字节的 base64 字符串（AES-256-GCM）');
-    }
-    return key;
-  }
-  if (IS_PROD || !IS_SQLITE) {
+  if (!raw) {
     throw new Error(
-      'APP_SECRET_KEY 未配置。生产环境必须设置，否则重启后已加密的 AppSecret 将无法解密。',
+      'APP_SECRET_KEY 未配置。必须设置 32 字节 base64（AES-256-GCM），否则重启后已加密的 AppSecret 将无法解密。',
     );
   }
-  return devMasterKey();
-}
-
-let _devKey: Buffer | null = null;
-
-/** 开发用临时密钥：持久化到 var/tmp，避免每次重启变化导致本地数据失效。 */
-function devMasterKey(): Buffer {
-  if (_devKey) return _devKey;
-  const marker = join(SERVER_DIR, 'var', 'tmp', '.dev_master_key');
-  ensureDir(dirname(marker));
-  if (existsSync(marker)) {
-    _devKey = Buffer.from(readFileSync(marker, 'utf8').trim(), 'base64');
-  } else {
-    _devKey = randomBytes(32);
-    writeFileSync(marker, _devKey.toString('base64'), 'utf8');
+  const key = Buffer.from(raw, 'base64');
+  if (key.length !== 32) {
+    throw new Error('APP_SECRET_KEY 必须是 32 字节的 base64 字符串（AES-256-GCM）');
   }
-  return _devKey;
+  return key;
 }

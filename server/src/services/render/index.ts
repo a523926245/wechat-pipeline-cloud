@@ -47,7 +47,7 @@ const SECTION_STYLE =
   `font-size:16px;color:${INK};padding:4px 2px;max-width:677px;margin:0 auto;`;
 
 /** 把强调标记还原成微信内联样式，并修复未闭合的 <strong>。 */
-export function renderInline(text: string): string {
+function renderInline(text: string): string {
   let out = text
     .replace(new RegExp(M_K, 'g'), KEY_OPEN)
     .replace(new RegExp(M_B, 'g'), EM_OPEN)

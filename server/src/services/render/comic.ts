@@ -6,7 +6,7 @@
  *
  * 图片必须先上传微信拿 mmbiz URL 才能嵌正文：
  *   - 插图 ComicPanel.wechatUrl 由 ensureComicAssetsReady 上传并回填（uploadedKey 复用判据同封面）
- *   - 金句卡在渲染时确定性生成/复用（comics/quote-{seq}.jpg），随插图一起上传
+ *   - 金句卡在渲染时确定性生成/复用（comics/quote-{articleId}-{seq}-v{VER}.jpg，文件名带文章 ID 跨文章隔离），随插图一起上传
  */
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -32,14 +32,19 @@ export function readComicMeta(article: Article): ComicComicMeta {
   return unpackJson<ComicComicMeta>(article.comicJson) ?? {};
 }
 
-/** 金句卡相对路径名（comics/quote-{seq}-v{VER}.jpg）；版本号变化即令旧文件/旧上传态失配。 */
-export function quoteCardRelName(seq: number): string {
-  return `quote-${seq}-v${QUOTE_CARD_VERSION}.jpg`;
+/**
+ * 金句卡相对路径名（comics/quote-{articleId}-{seq}-v{VER}.jpg）。
+ * 必须带文章 ID：金句卡内容取自该文章自己的 h2/p，只按 seq 命名会让
+ * 后生成的文章复用先生成文章的卡（跨文章串档，实测踩过）。版本号变化
+ * 即令旧文件/旧上传态失配。
+ */
+export function quoteCardRelName(articleId: number, seq: number): string {
+  return `quote-${articleId}-${seq}-v${QUOTE_CARD_VERSION}.jpg`;
 }
 
 /** 金句卡文件绝对路径。 */
-function quoteCardAbsPath(seq: number): string {
-  return join(ensureContentDirs().comics, quoteCardRelName(seq));
+function quoteCardAbsPath(articleId: number, seq: number): string {
+  return join(ensureContentDirs().comics, quoteCardRelName(articleId, seq));
 }
 
 /**
@@ -56,7 +61,7 @@ export async function ensureQuoteCard(article: Article, seq: number): Promise<st
   if (!headline) {
     throw new BadRequestError(`漫画 ${article.id} 第 ${seq} 格缺少论点标题，无法渲染金句卡`);
   }
-  const out = quoteCardAbsPath(seq);
+  const out = quoteCardAbsPath(article.id, seq);
   if (!existsSync(out)) {
     await renderQuoteCard({ headline, elaboration, outPath: out });
   }
@@ -93,6 +98,21 @@ export async function ensureComicAssetsReady(
   const imgTags: string[] = [];
 
   for (const panel of panels) {
+    // 金句卡（每单元先卡后图，卡是该单元的标题卡）：先确保渲染，再上传（金句卡状态不进库，以文件存在 + uploadedKey 推导）
+    // 文件名带文章 ID + 版号：跨文章隔离，改版后旧文件与旧上传态 key 自然失配 → 重渲重传。
+    const quoteRel = `comics/${quoteCardRelName(articleId, panel.seq)}`;
+    const quoteAbs = quoteCardAbsPath(articleId, panel.seq);
+    if (!existsSync(quoteAbs)) {
+      await ensureQuoteCard(article, panel.seq);
+    }
+    const quoteMeta = readUploadKey(article, quoteRel);
+    if (!quoteMeta || quoteMeta.key !== key(quoteRel)) {
+      const quoteUrl = await client.uploadContentImage(quoteAbs);
+      imgTags.push(imgHtml(quoteUrl));
+      saveUploadKey(article, quoteRel, key(quoteRel), quoteUrl);
+    } else {
+      imgTags.push(imgHtml(quoteMeta.url));
+    }
     // 插图：已上传且文件没变 → 复用；否则重传
     let url = panel.wechatUrl;
     if (!url || panel.uploadedKey !== key(panel.filePath)) {
@@ -105,21 +125,6 @@ export async function ensureComicAssetsReady(
       });
     }
     imgTags.push(imgHtml(url));
-    // 金句卡：先确保渲染，再上传（金句卡状态不进库，以文件存在 + uploadedKey 推导）
-    // 文件名带版号：改版后旧 quote-{seq}.jpg 与旧上传态 key 自然失配 → 重渲重传。
-    const quoteRel = `comics/${quoteCardRelName(panel.seq)}`;
-    const quoteAbs = quoteCardAbsPath(panel.seq);
-    if (!existsSync(quoteAbs)) {
-      await ensureQuoteCard(article, panel.seq);
-    }
-    const quoteMeta = readUploadKey(article, quoteRel);
-    if (!quoteMeta || quoteMeta.key !== key(quoteRel)) {
-      const quoteUrl = await client.uploadContentImage(quoteAbs);
-      imgTags.push(imgHtml(quoteUrl));
-      saveUploadKey(article, quoteRel, key(quoteRel), quoteUrl);
-    } else {
-      imgTags.push(imgHtml(quoteMeta.url));
-    }
   }
 
   const contentWechat = `<section>${imgTags.join('')}</section>`;
@@ -129,6 +134,45 @@ export async function ensureComicAssetsReady(
 
 function imgHtml(url: string): string {
   return `<p style="text-align:center;margin:0 0 4px;"><img src="${url}" style="width:100%;display:block;height:auto;" /></p>`;
+}
+
+/**
+ * 本地预览序列：与 ensureComicAssetsReady 完全相同的「金句卡 + 插图」交替顺序，
+ * 但图片用 /api/content 本地文件 URL，不依赖微信上传（本地开发、出口 IP 不在
+ * 微信白名单导致 40164 时，预览仍能立刻看到成品序列）。已落库的推送产物仍由
+ * 路由层优先返回；金句卡缺则现渲（Chrome，确定性缓存，与推送链路同一生成器）。
+ */
+export async function buildLocalComicPreview(
+  article: Article,
+): Promise<{ ok: true; html: string } | { ok: false; message: string }> {
+  const panels = await prisma.comicPanel.findMany({
+    where: { articleId: article.id },
+    orderBy: { seq: 'asc' },
+  });
+  if (panels.length === 0) return { ok: false, message: '漫画还没有任何分镜格' };
+  const notReady = panels.filter((p) => p.status !== 'success' || !p.filePath);
+  if (notReady.length > 0) {
+    return {
+      ok: false,
+      message: `尚有 ${notReady.length}/${panels.length} 格未生成（第 ${notReady.map((p) => p.seq).join(',')} 格）`,
+    };
+  }
+
+  const imgTags: string[] = [];
+  for (const panel of panels) {
+    const abs = join(CONTENT_DIR, panel.filePath);
+    if (!existsSync(abs)) return { ok: false, message: `第 ${panel.seq} 格图片文件缺失：${panel.filePath}` };
+    // 金句卡（每单元先卡后图）：缺则现渲（首跑数秒）；单卡失败不阻断预览——插图照显，推送链路仍会在 ensure 里如实报错
+    try {
+      const quoteAbs = quoteCardAbsPath(article.id, panel.seq);
+      if (!existsSync(quoteAbs)) await ensureQuoteCard(article, panel.seq);
+      imgTags.push(imgHtml(`/api/content/comics/${quoteCardRelName(article.id, panel.seq)}`));
+    } catch (e) {
+      console.warn('[comic-preview] 第 %d 格金句卡渲染失败：%s', panel.seq, e instanceof Error ? e.message : e);
+    }
+    imgTags.push(imgHtml(`/api/content/${panel.filePath}`));
+  }
+  return { ok: true, html: `<section>${imgTags.join('')}</section>` };
 }
 
 // 金句卡上传态不建表（plan §2.4），用轻量 JSON 文件落盘在 comics/ 下

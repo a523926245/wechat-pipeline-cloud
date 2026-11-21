@@ -1,33 +1,46 @@
 <script setup lang="ts">
 import { Delete, Edit, Refresh, Upload, View } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import { errMsg } from "../api/http.ts";
 import {
+  bulkDeleteArticles,
   deleteArticle,
   getArticle,
   listArticles,
   previewArticle,
   pushArticle,
 } from "../api/index.ts";
+import BatchBar from "../components/BatchBar.vue";
+import EmptyState from "../components/EmptyState.vue";
+import PageHead from "../components/PageHead.vue";
 import StateError from "../components/StateError.vue";
+import StatusTag from "../components/StatusTag.vue";
 import RowActions, { type RowAction } from "../components/RowActions.vue";
+import { useAuth } from "../composables/useAuth.ts";
+import { useBatchDelete } from "../composables/useBatchDelete.ts";
 import type {
   ArticleDetail,
   ArticleListItem,
   ArticleRenderResult,
 } from "../types.ts";
 import {
+  batchDeleteImpact,
+  noAccountGuide,
+  pushFailView,
+  pushFact,
+} from "../utils/article-push.ts";
+import {
   coverUrl,
   friendlyTime,
   pipelineText,
-  statusTag,
-  statusText,
 } from "../utils/format.ts";
+import { parseArticleNeeds, type ArticleNeeds } from "../utils/todo-nav.ts";
 
 const router = useRouter();
+const { userRole } = useAuth();
 const route = useRoute();
 
 const items = ref<ArticleListItem[]>([]);
@@ -64,6 +77,26 @@ const pipeline = computed<string>(() => {
   const v = route.query.pipeline;
   return typeof v === "string" && ["article", "comic"].includes(v) ? v : "";
 });
+/**
+ * 工作台待办专项筛选（S5-UI-2-D-2）：只认服务端支持的 draft_unpushed / repush，
+ * 非法值视为未传（页面回退普通列表，不报错、不空列表）。
+ */
+const needs = computed<ArticleNeeds | undefined>(() =>
+  parseArticleNeeds(route.query.needs),
+);
+/** 待办专项筛选的说明文案：标题 + 条件，进页面就要能看懂「现在是按什么筛的」。 */
+const NEEDS_META: Record<ArticleNeeds, { title: string; cond: string }> = {
+  draft_unpushed: {
+    title: "未推送草稿",
+    cond: "普通文章 · 草稿状态 · 无推送记录",
+  },
+  repush: {
+    title: "待重推文章",
+    cond: "普通文章 · 曾经推送 · 当前处于待处理状态（updated，或有推送痕迹的 draft）",
+  },
+};
+const needsMeta = computed(() => (needs.value ? NEEDS_META[needs.value] : null));
+
 const page = computed<number>(() => {
   const n = Number(route.query.page ?? 1);
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
@@ -74,9 +107,12 @@ async function load() {
   error.value = "";
   try {
     const res = await listArticles({
-      status: status.value || undefined,
+      // needs 生效时不发 status/pipeline：服务端本就以 needs 为准，少发两个条件，
+      // 请求与页面显示（状态下拉已禁用）才能对得上。
+      status: needs.value ? undefined : status.value || undefined,
+      needs: needs.value,
       angleId: angle.value || undefined,
-      pipeline: pipeline.value || undefined,
+      pipeline: needs.value ? undefined : pipeline.value || undefined,
       limit: PAGE_SIZE,
       offset: (page.value - 1) * PAGE_SIZE,
     });
@@ -90,7 +126,59 @@ async function load() {
 }
 
 onMounted(load);
-watch([status, angle, pipeline, page], load);
+watch([status, angle, pipeline, page, needs], load);
+
+/**
+ * 批量删除：与单条删除同一套语义（永久删除；未推送文章占用的选题角度会归还角度池）。
+ * 提示里要点明「哪些会归还角度」——归还后同一选题可能被再次使用。
+ */
+const articleTableRef = ref<{ clearSelection: () => void } | null>(null);
+
+/**
+ * 窄屏（≤900px）表格紧凑模式（S5-UI-3-3 · B）。
+ * 与全局 col-optional 断点一致：窄屏把「推送事实」与选择列一起固定在左侧，
+ * 确保它真实进入可视区且不被 fixed=right 的操作列遮挡；桌面端保持原布局。
+ */
+const narrow = ref(false);
+function syncNarrow() {
+  narrow.value = window.matchMedia("(max-width: 900px)").matches;
+}
+onMounted(syncNarrow);
+window.addEventListener("resize", syncNarrow);
+onUnmounted(() => window.removeEventListener("resize", syncNarrow));
+
+/** 推送事实 tooltip：窄屏日期进 tooltip，完整信息仍可查看，不改 pushFact 判定本身。 */
+function pushFactTip(row: ArticleListItem): string {
+  const f = pushFact(row);
+  const date = f.dateRaw ? friendlyTime(f.dateRaw) : "";
+  return date ? (f.hint + " · 推送日期 " + date) : f.hint;
+}
+
+const batch = useBatchDelete<ArticleListItem>({
+  idOf: (row) => row.id,
+  api: bulkDeleteArticles,
+  tableRef: articleTableRef,
+  // 推送口径与后端删除事务一致：用 hasPushTrace（mediaId/pushDate 任一非空）判「已推送」，
+  // 不再用 status==='pushed'——后者会把「推送后退回草稿」误判成未推送，导致「角度会归还」的文案误导。
+  impact: batchDeleteImpact,
+  title: "批量删除文章",
+  reload: async (res) => {
+    const remain = items.value.length - res.deleted;
+    if (remain <= 0 && page.value > 1) {
+      setQuery({ page: page.value - 1 });
+    } else {
+      await load();
+    }
+  },
+});
+
+/**
+ * 换筛选条件（不是翻页）时清空勾选。
+ * reserve-selection 会让勾选跨数据刷新保留，换筛选后旧勾选指向另一个结果集，留着会删到看不见的文章。
+ */
+watch([status, angle, pipeline, needs], () => {
+  batch.clearSelection();
+});
 
 function setQuery(patch: Record<string, string | number | undefined>) {
   const query: Record<string, string> = {};
@@ -173,14 +261,33 @@ async function push(row: ArticleListItem) {
     if (res.ok) {
       ElMessage.success(res.message ?? "已推送到草稿箱");
     } else {
-      ElMessageBox.alert(
-        res.message ?? "推送失败",
-        `推送未成功（${res.errcode ?? "无 errcode"}）`,
-        {
-          type: "error",
+      // 与改稿页共用同一套分类：already_pushed / pushing / lint_failed 不是微信报错，
+      // 不能用「无 errcode」当标题误导用户（S5-UI-3-0 · P2-5）。
+      // no_account：后端明确 reason，给出真实可执行的账号配置引导（S5-UI-5-P2-4）。
+      if (res.reason === "no_account") {
+        const guide = noAccountGuide(userRole.value);
+        try {
+          if (guide.canManage) {
+            await ElMessageBox.confirm(guide.message, "尚未配置可用于推送的公众号账号", {
+              type: "warning",
+              confirmButtonText: "去账号管理",
+              cancelButtonText: "稍后",
+            });
+            await router.push("/accounts");
+          } else {
+            await ElMessageBox.alert(guide.message, "尚未配置可用于推送的公众号账号", {
+              type: "warning",
+              confirmButtonText: "知道了",
+            });
+          }
+        } catch { /* 用户选择稍后 */ }
+      } else {
+        const view = pushFailView(res);
+        ElMessageBox.alert(res.message ?? "推送失败", view.title, {
+          type: view.type,
           confirmButtonText: "知道了",
-        },
-      );
+        });
+      }
     }
     await load();
   } catch (e) {
@@ -222,26 +329,41 @@ function onArticleCommand(cmd: string, row: ArticleListItem) {
 
 <template>
   <div class="wb-page" v-loading="loading" element-loading-text="正在加载文章…">
-    <header class="wb-page-head">
-      <div>
-        <h2>文章</h2>
-        <p class="wb-page-desc">
-          共 {{ total }} 篇 · 改稿后可推送到公众号草稿箱
-        </p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead title="文章" :desc="`共 ${total} 篇 · 改稿后可推送到公众号草稿箱（只进草稿箱，不会群发）`">
+      <template #actions>
         <el-button :icon="Refresh" @click="load">刷新</el-button>
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="error" :message="error" @retry="load" />
 
-    <el-card v-else shadow="never">
+    <!-- 待办专项筛选说明：从工作台点进来时，必须一眼看出「按什么筛的」以及怎么退出去 -->
+    <el-alert
+      v-if="needsMeta"
+      type="info"
+      show-icon
+      :closable="false"
+      class="needs-alert"
+      :title="`当前筛选：${needsMeta.title}`"
+    >
+      <div class="needs-alert__body">
+        <span class="wb-secondary">{{ needsMeta.cond }}</span>
+        <span class="wb-muted">专项筛选期间状态下拉暂不可用</span>
+        <el-button link type="primary" @click="setQuery({ needs: undefined, page: undefined })">
+          清除筛选
+        </el-button>
+      </div>
+    </el-alert>
+
+    <!-- 注意：这里不能用 v-else——上面的提示条把 v-if/v-else 链打断了（踩过：
+         v-else 找不到相邻 v-if，整张表被丢弃，页面只剩标题）。用独立条件。 -->
+    <el-card v-if="!error" shadow="never">
       <el-form :inline="true" class="wb-filter-bar" @submit.prevent>
         <el-form-item label="状态">
           <el-select
             :model-value="status"
-            placeholder="全部状态"
+            :disabled="Boolean(needs)"
+            :placeholder="needs ? '待办筛选中' : '全部状态'"
             clearable
             style="width: 140px"
             @update:model-value="
@@ -267,7 +389,8 @@ function onArticleCommand(cmd: string, row: ArticleListItem) {
         <el-form-item label="产线">
           <el-select
             :model-value="pipeline"
-            placeholder="全部产线"
+            :disabled="Boolean(needs)"
+            :placeholder="needs ? '待办筛选中' : '全部产线'"
             clearable
             style="width: 130px"
             @update:model-value="
@@ -280,16 +403,44 @@ function onArticleCommand(cmd: string, row: ArticleListItem) {
         </el-form-item>
       </el-form>
 
-      <el-table v-if="items.length" :data="items" size="default">
-        <el-table-column prop="id" label="ID" width="60" />
+      <!-- 批量操作条：有勾选时才出现 -->
+      <BatchBar
+        :count="batch.count.value"
+        :loading="batch.deleting.value"
+        @delete="batch.runBatchDelete()"
+        @clear="batch.clearSelection()"
+      />
+
+      <el-table
+        v-if="items.length"
+        ref="articleTableRef"
+        :data="items"
+        size="default"
+        row-key="id"
+        @selection-change="batch.onSelectionChange"
+      >
+        <!-- reserve-selection：翻页后仍保留勾选（配合 row-key） -->
+        <el-table-column type="selection" width="46" reserve-selection :fixed="narrow ? 'left' : false" />
+        <el-table-column prop="id" label="ID" width="60" class-name="col-optional" />
         <el-table-column label="标题" min-width="260" show-overflow-tooltip>
           <template #default="{ row }">
-            <el-link
-              type="primary"
-              :underline="false"
-              @click="openPreview(row)"
-              >{{ row.title }}</el-link
-            >
+            <span class="article-title-cell">
+              <!-- 产线标识（S5-UI-3-3 · A）：仅漫画显示，普通文章不渲染冗余标签。
+                   pipeline 缺失的历史响应按普通文章处理；文案沿用 GET /pipelines 词表。 -->
+              <StatusTag
+                v-if="row.pipeline === 'comic'"
+                kind="pipeline"
+                value="comic"
+                class="pipeline-tag"
+              />
+              <el-link
+                type="primary"
+                :underline="false"
+                class="article-title-link"
+                @click="openPreview(row)"
+                >{{ row.title }}</el-link
+              >
+            </span>
           </template>
         </el-table-column>
         <el-table-column label="账号" width="110" class-name="col-optional">
@@ -297,12 +448,35 @@ function onArticleCommand(cmd: string, row: ArticleListItem) {
         </el-table-column>
         <el-table-column label="状态" width="84">
           <template #default="{ row }">
-            <el-tag :type="statusTag(row.status)" size="small">{{
-              statusText(row.status)
-            }}</el-tag>
+            <StatusTag kind="article" :value="row.status" />
           </template>
         </el-table-column>
-        <el-table-column prop="chars" label="字数" width="76" />
+        <!-- 推送事实：与「状态」分开看。事实取 mediaId/pushDate（痕迹），文案再按当前 status 细分，
+             避免把「推送后退回草稿」当成没推过（S5-UI-3-0 · P2-1）。
+             S5-UI-3-3 · B：窄屏固定在左侧，真实进入可视区且不被 fixed=right 操作列遮挡；
+             日期收进 tooltip（pushFactTip），列宽紧凑；桌面端维持原宽度与行内日期。 -->
+        <el-table-column
+          label="推送事实"
+          :width="narrow ? 108 : 132"
+          :fixed="narrow ? 'left' : false"
+        >
+          <template #default="{ row }">
+            <el-tooltip
+              :content="pushFactTip(row)"
+              placement="top"
+            >
+              <span class="push-fact-cell">
+                <el-tag :type="pushFact(row).type" size="small" effect="light">
+                  {{ pushFact(row).text }}
+                </el-tag>
+                <span v-if="!narrow && pushFact(row).dateRaw" class="push-fact-date">
+                  {{ friendlyTime(pushFact(row).dateRaw) }}
+                </span>
+              </span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column prop="chars" label="字数" width="76" class-name="col-optional" />
         <el-table-column
           prop="blocks"
           label="段落"
@@ -324,7 +498,30 @@ function onArticleCommand(cmd: string, row: ArticleListItem) {
         </el-table-column>
       </el-table>
 
-      <el-empty
+      <!-- needs 专项的空 ≠ 没文章：给定向文案 + 一个退出筛选的出口，避免被当成加载失败 -->
+      <EmptyState
+        v-else-if="!loading && needs === 'draft_unpushed'"
+        description="没有未推送草稿"
+        hint="所有草稿都已推送过；换过封面被退回草稿的文章会出现在「待重推」里"
+        :image-size="64"
+      >
+        <el-button size="small" @click="setQuery({ needs: undefined, page: undefined })">
+          看全部文章
+        </el-button>
+      </EmptyState>
+
+      <EmptyState
+        v-else-if="!loading && needs === 'repush'"
+        description="没有待重推文章"
+        hint="已推送文章被 AI 改写或换封面后才会进入这里"
+        :image-size="64"
+      >
+        <el-button size="small" @click="setQuery({ needs: undefined, page: undefined })">
+          看全部文章
+        </el-button>
+      </EmptyState>
+
+      <EmptyState
         v-else-if="!loading"
         description="暂无文章，可到「创作计划」立即出稿"
         :image-size="64"
@@ -332,7 +529,7 @@ function onArticleCommand(cmd: string, row: ArticleListItem) {
         <el-button type="primary" size="small" @click="router.push('/plan')"
           >去创作计划</el-button
         >
-      </el-empty>
+      </EmptyState>
 
       <div v-if="total > PAGE_SIZE" class="wb-pager">
         <el-pagination
@@ -381,12 +578,7 @@ function onArticleCommand(cmd: string, row: ArticleListItem) {
             </div>
             <el-descriptions :column="2" border size="small" class="meta-desc">
               <el-descriptions-item label="状态">
-                <el-tag
-                  :type="statusTag(previewDialog.detail.status)"
-                  size="small"
-                >
-                  {{ statusText(previewDialog.detail.status) }}
-                </el-tag>
+                <StatusTag kind="article" :value="previewDialog.detail.status" />
               </el-descriptions-item>
               <el-descriptions-item label="ID">{{
                 previewDialog.detail.id
@@ -481,6 +673,39 @@ function onArticleCommand(cmd: string, row: ArticleListItem) {
   min-width: 0;
 }
 
+.push-fact-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+/* 产线标识（S5-UI-3-3 · A）：标题列内漫画标签与标题并排，不换行撑高行高。 */
+.article-title-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.article-title-cell .pipeline-tag {
+  flex: none;
+}
+
+.article-title-cell .article-title-link {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.push-fact-date {
+  font-size: 12px;
+  color: var(--wb-text-muted);
+  white-space: nowrap;
+}
+
 .warn-alert {
   margin-bottom: var(--wb-space-2);
 }
@@ -488,5 +713,17 @@ function onArticleCommand(cmd: string, row: ArticleListItem) {
 .preview-box {
   max-height: 56vh;
   overflow-y: auto;
+}
+
+/* 待办专项筛选说明条：与 TracksView 的 pending-alert 同一套克制风格 */
+.needs-alert {
+  margin-bottom: var(--wb-space-3);
+}
+
+.needs-alert__body {
+  display: flex;
+  align-items: center;
+  gap: var(--wb-space-2);
+  flex-wrap: wrap;
 }
 </style>

@@ -22,7 +22,7 @@ sudo bash deploy/install.sh                                # 在仓库里时
 
 可选参数：`--skip-build`（dist 已就绪）、`--skip-nginx`（只装后端）、`--skip-systemd`（容器内跑）。
 脚本每一步都会先打印 STEP 说明、再打印等价的手工命令，任一步失败都能照着打印内容接着做。
-**第 7 步（数据库结构）默认会停下来让你选**，不会替你做不可逆的决定——见下文「三、迁移基线」。
+**第 7 步（数据库结构）执行 `prisma migrate deploy`** 应用仓库已提交的迁移——见下文「四、数据库结构迁移」。
 
 ---
 
@@ -85,34 +85,69 @@ sudo cp /opt/wechat-pipeline-cloud/deploy/logrotate/wechat-pipeline /etc/logrota
 
 ---
 
-## 三、迁移基线（第 8 步，必读）
+## 三、初始化管理员账号（部署后必做）
 
-仓库里**没有 `prisma/migrations`**，所以 `npm run prisma:deploy` 第一次必失败。建一次基线：
+开放注册**永远造不出 admin**，首个管理员只能用种子脚本（幂等，重复跑不覆盖）。
+**顺序**：必须在 MySQL schema 同步（`prisma migrate deploy`）之后。生产推荐显式 `--pass`
+（不指定则随机口令**只打印一次**，生产易丢）：
 
 ```bash
-cd /opt/wechat-pipeline-cloud/server
-mkdir -p prisma/migrations/0_init
-npx prisma migrate diff --from-empty \
-    --to-schema-datasource prisma/schema.prisma --script \
-    > prisma/migrations/0_init/migration.sql
-npx prisma migrate deploy
+# systemd 部署：以 wpc 用户 + 生产环境变量执行
+sudo -u wpc bash -c 'set -a; . /etc/wechat-pipeline-cloud/app.env; set +a; \
+  cd /opt/wechat-pipeline-cloud/server && \
+  node --experimental-strip-types scripts/seed-admin.ts -- --pass "你的强口令"'
+
+# Docker 部署
+docker compose exec app node --experimental-strip-types scripts/seed-admin.ts -- --pass "你的强口令"
 ```
 
-如果库里已经有结构（比如先用 `db push` 建过），用 `npx prisma migrate resolve --applied 0_init`
-把它标记为已应用，否则 deploy 会重复执行建表语句。
+首次登录验证一次。**忘记口令救济**（服务器 shell 权限即救济权）：
 
-> `install.sh` 第 7 步检测到无迁移目录时会中断并打印上面这组命令。
-> 强行跳过请用 `ALLOW_DB_PUSH=1`（走 `prisma db push`，**不产生迁移文件、无法回滚**）。
-
-**改了 `prisma/schema.prisma` 之后**（例如本轮新增的 `Article.coverMediaId` / `coverUploaded`），
-必须再建一个迁移：
 ```bash
-npx prisma migrate dev --name add_cover_media_id
+# 同上环境加载方式，加 -- --reset-pass（重置口令并顺带激活被停用的账号）
+node --experimental-strip-types scripts/seed-admin.ts -- --reset-pass
 ```
+
+说明：管理令牌机制已退场（2026-11-11），`--reset-pass` 就是唯一的应急后门；目前无自助
+改密界面，口令直接用 `--pass` 设好最省事。
 
 ---
 
-## 四、调度：Timer 还是常驻
+## 四、数据库结构迁移（第 7 步，必读）
+
+仓库已包含 `prisma/migrations/`（4 个已版本化的迁移，随部署包分发）。
+**不要手工创建 `0_init` 基线**，也不要对正式库执行 `prisma migrate dev` / `prisma db push`
+或 `prisma migrate resolve --applied 0_init` —— 这些操作会绕过迁移历史，可能要求重置正式库，
+且 `db push` 不产生迁移文件、无法回滚。
+
+正式库（以及全新空库）部署已有 Migration，只用一条命令：
+
+```bash
+cd /opt/wechat-pipeline-cloud/server
+npm run prisma:deploy        # = prisma migrate deploy，只向前应用仓库已提交的迁移
+```
+
+`prisma migrate deploy` 只应用仓库中已提交的迁移，不会因 Schema Drift / Migration History
+Conflict 要求重置数据库，是正式库**唯一允许**的迁移方式。`install.sh` 第 7 步检测到迁移目录后
+自动执行同一命令。迁移历史以 `prisma/migrations/` 为准；若记录缺失，应排查部署包而非伪造状态。
+
+**关于 `prisma/schema.prisma` 变更**：结构变更后，由维护者在**独立开发库**上生成新迁移文件并提交
+仓库，正式库只通过 `prisma migrate deploy` 应用。当前 `npm run prisma:migrate` 经
+`scripts/migrate-guard.ts` 命令级护栏，对**迁移主目标与 Shadow 两处都做独立身份校验**：
+- 主目标 `DATABASE_URL` 必须与显式配置 `MIGRATE_DEV_DATABASE_URL` 身份（host+port+db）全等；
+- Shadow 校验：`SHADOW_DATABASE_URL`（Prisma 实际使用的 Shadow 连接，会被 migrate dev 重置并
+  重放迁移历史，不能省略校验）必须与显式允许的 `MIGRATE_DEV_SHADOW_DATABASE_URL` 身份全等；
+- 正式业务库、保留 Shadow 库 `wechat_pipeline_shadow`、Smoke 库以及任何未明确配置的数据库，
+  都不得作为开发迁移的主目标或 Shadow；主目标与 Shadow 必须是不同的数据库；
+- 任一身份缺失 / 解析失败 / 不匹配即 fail-closed 拒绝；`--schema` 等绕过入口亦被拦截。
+
+> 注意：这是 **npm script 入口** 的护栏，不能阻止直接执行 `npx prisma migrate dev` 或直调
+> Prisma CLI。开发者必须自觉：只有显式配置上述两个 `MIGRATE_DEV_*` 变量、且确认身份无误后，
+> 才可用 `npm run prisma:migrate` 在独立开发库上生成迁移。
+
+---
+
+## 五、调度：Timer 还是常驻
 
 | 方案 | 单元 | 适用 |
 |---|---|---|
@@ -124,11 +159,11 @@ Timer 改时间只改一行：`OnCalendar=*-*-* 06:05`。
 
 ---
 
-## 五、上线前置项（本轮代码**没有**解决，必须人工处理）
+## 六、上线前置项（本轮代码**没有**解决，必须人工处理）
 
 | # | 项 | 说明 |
 |---|---|---|
-| 1 | **`/api/*` 裸奔** | 全仓零鉴权：`ADMIN_PASSWORD` / `JWT_SECRET` 定义了但没有引用，CORS 全开。任何人都能读凭据掩码、改模型、推草稿。**必须**配 Nginx basic auth 或限制来源 IP——`nginx/wechat-pipeline.conf` 里已写好可抄的注释样板 |
+| 1 | ~~`/api/*` 裸奔~~ **已解决（2026-11-11）** | 现为口令+会话全量鉴权（公开项仅 `/api/health` 与 `/api/auth/*`），角色权限已挂全路由。上线仍建议：HTTPS（Nginx TLS）、限制来源 IP、`app.env` 权限 600 |
 | 2 | **`APP_SECRET_KEY` 不可变** | 一旦有凭据写入就永远不能改，改了所有已存 AppSecret 都解不开。改前先备份 |
 | 3 | **`/api/health` 会撒谎** | DB 挂了它仍返回 200，只把 `ok:false` 放在 body 里。Nginx/Docker 探活别只看状态码 |
 | 4 | **日志目录硬编码** | `logger.ts` 写死 `<项目根>/var/logs`，不读环境变量。必须保证 `wpc` 对该目录可写，并装 logrotate |
@@ -141,7 +176,7 @@ Timer 改时间只改一行：`OnCalendar=*-*-* 06:05`。
 
 ---
 
-## 六、验收清单
+## 七、验收清单
 
 ```bash
 # 1. 活着，且连的是 MySQL
@@ -172,13 +207,13 @@ curl -sI http://127.0.0.1/assets/$(ls web/dist/assets | head -1) | grep -i cache
 
 ---
 
-## 七、排障速查
+## 八、排障速查
 
 | 现象 | 原因 |
 |---|---|
 | `systemctl start` 立刻失败，`status=203/EXEC` | `ExecStart` 的 node 路径不对（systemd 不读 login shell 的 PATH）。`which node` 后 `sed -i` 改 |
 | 服务起不来，日志说 `APP_SECRET_KEY 必须…` | app.env 没被读到。检查 `EnvironmentFile` 路径、文件权限、以及值**是否带了引号**（systemd 不剥引号） |
-| 界面 500，日志 `Expected String`（Json 字段） | 在生产机上跑过 `schema:sqlite` / `sqlite:generate`，SQLite 版客户端覆盖了生成目录。重跑 `npm run prisma:generate` |
+| 界面 500，日志 `Expected String`（Json 字段） | 生成目录的 client 与 schema 不一致（历史原因如误跑过已废除的 SQLite 生成链）。重跑 `npm run prisma:generate` |
 | 前端能看封面缩略图，推到微信没封面 | 两个可能：① 库里 `coverPath` 是旧机器的绝对路径 → 跑 `npm run fix:cover-paths -- --apply`；② Nginx 把 `/api/content` 路径 rewrite 了 |
 | 每次推送都往永久素材库传一张新图 | 老版本行为。新代码会回填 `coverMediaId` 并复用；若仍复现，检查 `Article.coverUploaded` 是否有值 |
 | 生图/写作接口 504 | Nginx `proxy_read_timeout`（330s）小于后端 `LLM_TIMEOUT_MS`（300s）时就会掐断。两者要一起调 |
@@ -186,7 +221,7 @@ curl -sI http://127.0.0.1/assets/$(ls web/dist/assets | head -1) | grep -i cache
 
 ---
 
-## 八、RHEL / CentOS 差异
+## 九、RHEL / CentOS 差异
 
 | 项 | Debian/Ubuntu | RHEL/CentOS |
 |---|---|---|
@@ -203,7 +238,7 @@ curl -sI http://127.0.0.1/assets/$(ls web/dist/assets | head -1) | grep -i cache
 
 ---
 
-## 九、回滚
+## 十、回滚
 
 ```bash
 sudo systemctl stop wechat-pipeline

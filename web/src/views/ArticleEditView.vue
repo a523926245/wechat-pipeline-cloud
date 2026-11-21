@@ -16,9 +16,11 @@ import { errMsg } from '../api/http.ts';
 import {
   applyEmphasis,
   applyRevise,
+  checkArticleLint,
   generateComicImages,
   generateCover,
   getArticle,
+  listArticleLintRuns,
   listComicPanels,
   previewArticle,
   previewEmphasis,
@@ -27,9 +29,14 @@ import {
   regenerateComicPanel,
   updateArticleContent,
 } from '../api/index.ts';
+import PageHead from '../components/PageHead.vue';
+import SaveBar from '../components/SaveBar.vue';
 import StateError from '../components/StateError.vue';
+import { useAuth } from '../composables/useAuth.ts';
+import { noAccountGuide, pushFailView } from '../utils/article-push.ts';
 import type {
   ArticleDetail,
+  ArticleLintRun,
   ArticleRenderResult,
   ComicPanelItem,
   CoverGenerateResult,
@@ -39,6 +46,7 @@ import {
   coverUrl,
   defaultImageRatio,
   defaultImageSize,
+  friendlyTime,
   imageRatios,
   imageSizes,
   reviseModeText,
@@ -48,6 +56,7 @@ import {
 
 const props = defineProps<{ id: string | number }>();
 const router = useRouter();
+const { userRole } = useAuth();
 const articleId = computed(() => Number(props.id));
 
 const article = ref<ArticleDetail | null>(null);
@@ -60,6 +69,20 @@ const pushing = ref(false);
 const emphasizing = ref(false);
 const revising = ref(false);
 const dirty = ref(false);
+/** 保存失败原因（SaveBar 的 error 态用；失败绝不显示成「已保存」）。 */
+const saveError = ref('');
+
+/**
+ * 编辑页保存态 → SaveBar 五态映射（S5-UI-3-1 · C 档）。
+ * saving > error > dirty > saved：优先级保证失败/进行中不会被「已保存」覆盖。
+ * 未加载完（article 为空）时不用 saved，避免初始化阶段闪一个「已保存」。
+ */
+const saveState = computed<'clean' | 'dirty' | 'saving' | 'saved' | 'error'>(() => {
+  if (saving.value) return 'saving';
+  if (saveError.value) return 'error';
+  if (dirty.value) return 'dirty';
+  return article.value ? 'saved' : 'clean';
+});
 
 // ── AI 改写（revise 角色）──
 const reviseMode = ref<ReviseMode>('polish');
@@ -98,6 +121,8 @@ async function load() {
     html.value = article.value.contentHtml;
     dirty.value = false;
     await reloadPreview();
+    // 体检存档只对文章产线有意义（漫画正文是图片序列，不跑文章体检）。
+    if ((article.value.pipeline ?? 'article') !== 'comic') await loadLintRuns();
     if ((article.value.pipeline ?? 'article') === 'comic') {
       await loadPanels();
       // 进来时若还有没画完的格（或后端正在画）→ 自动轮询看进度；若后端没在跑，
@@ -128,6 +153,84 @@ async function reloadPreview() {
     rendered.value = await previewArticle(articleId.value);
   } catch (e) {
     ElMessage.error(errMsg(e, '预览渲染失败'));
+  }
+}
+
+// ── 成稿体检存档（S4-3）──
+const lintRuns = ref<ArticleLintRun[]>([]);
+const checking = ref(false);
+/** 体检结果未能存档的原因（只有 check/save/push/revise 会写库，预览不会）。 */
+const lintPersistError = ref('');
+
+const lintTriggerText = (t: ArticleLintRun['trigger']): string =>
+  ({ check: '手动检查', save: '保存正文', push: '推送门禁', revise: 'AI 改写' } as Record<string, string>)[t] ?? t;
+
+/**
+ * 体检命中片段（S5-UI-5-P2-3）：只展示后端真实返回的 hits 字符串，
+ * 过滤空/非字符串项，异常字段安全降级为「无命中」。后端最多给 3 条，不做推断或补全。
+ */
+function lintHits(it: { hits?: string[] | null }): string[] {
+  return Array.isArray(it.hits)
+    ? it.hits.filter((h): h is string => typeof h === 'string' && h.trim().length > 0).slice(0, 3)
+    : [];
+}
+
+/** 超长命中片段默认截断，展开后显示全文（不静默丢失查看途径）。 */
+const HIT_TRUNCATE_AT = 48;
+function hitShort(h: string): string {
+  return h.length > HIT_TRUNCATE_AT ? `${h.slice(0, HIT_TRUNCATE_AT)}…` : h;
+}
+
+/** 按问题下标记录哪些问题的命中片段已展开（引用类型，toggle 用新 Set 触发响应）。 */
+const expandedHits = ref<Set<number>>(new Set());
+function toggleHits(i: number) {
+  const next = new Set(expandedHits.value);
+  if (next.has(i)) next.delete(i); else next.add(i);
+  expandedHits.value = next;
+}
+
+/** 历史记录拉取失败只影响辅助信息，不打断页面（当前结论仍来自预览/保存响应）。 */
+async function loadLintRuns() {
+  try {
+    const res = await listArticleLintRuns(articleId.value, 20);
+    lintRuns.value = res.items;
+  } catch {
+    lintRuns.value = [];
+  }
+}
+
+/**
+ * 重新检查：服务端算一遍并把结果落库（新增一行历史，不覆盖旧记录）。
+ * 检查对象是**已保存的正文**——有未保存改动时先拦一下，免得「检查的和你看到的不是同一份」。
+ */
+async function recheck() {
+  if (dirty.value) {
+    ElMessage.warning('正文有未保存改动：先保存（保存时会自动体检并留痕）再重新检查');
+    return;
+  }
+  checking.value = true;
+  lintPersistError.value = '';
+  try {
+    const res = await checkArticleLint(articleId.value);
+    if (res.lint && rendered.value) {
+      rendered.value.lint = res.lint;
+      rendered.value.lintRun = res.lintRun;
+      rendered.value.lintRunStale = false;
+    }
+    if (res.lintPersistError) lintPersistError.value = res.lintPersistError;
+    await loadLintRuns();
+    if (res.lintPersistError) {
+      // 结论有效但没留痕：明确说出「没存档」，不冒充成一次正常检查。
+      ElMessage.warning('已重新检查，但结果未能存档（见体检面板提示）；刷新后不可追溯');
+    } else {
+      ElMessage.success(
+        res.lint?.ok ? '已重新检查：体检通过，结果已存档' : '已重新检查：仍有不合规项，结果已存档',
+      );
+    }
+  } catch (e) {
+    ElMessage.error(errMsg(e, '重新检查失败'));
+  } finally {
+    checking.value = false;
   }
 }
 
@@ -294,6 +397,8 @@ onUnmounted(() => {
 
 function onInput() {
   dirty.value = true;
+  // 内容已改动，上一次的保存失败原因不再对应当前内容，回到「有未保存改动」态。
+  if (saveError.value) saveError.value = '';
 }
 
 function guardUnload(e: BeforeUnloadEvent) {
@@ -331,6 +436,7 @@ async function save() {
     return;
   }
   saving.value = true;
+  saveError.value = '';
   try {
     const res = await updateArticleContent(articleId.value, html.value);
     dirty.value = false;
@@ -339,9 +445,18 @@ async function save() {
     // 否则改一次台词预览就从「插图」退回「脚本」。统一走 preview 拿真实产物。
     if (isComic.value) await reloadPreview();
     else rendered.value = { ...res } as ArticleRenderResult;
-    ElMessage.success('已保存并重新渲染');
+    // 保存即体检并留痕：把「这次存档」显式说出来，失败也明说（不静默）。
+    lintPersistError.value = res.lintPersistError ?? '';
+    if (!isComic.value) await loadLintRuns();
+    if (res.lintPersistError) {
+      ElMessage.warning(`已保存并重新渲染，但体检结果未能存档：${res.lintPersistError}`);
+    } else {
+      ElMessage.success('已保存并重新渲染（体检结果已存档）');
+    }
   } catch (e) {
-    ElMessage.error(errMsg(e, '保存失败'));
+    // 失败要能被 SaveBar 看见：dirty 仍为 true 且 saveError 非空 → error 态，绝不显示「已保存」。
+    saveError.value = errMsg(e, '保存失败');
+    ElMessage.error(saveError.value);
   } finally {
     saving.value = false;
   }
@@ -441,7 +556,19 @@ async function runRevise(apply: boolean) {
     });
     if (article.value) article.value.status = 'updated';
     await load();
-    ElMessage.success(res.changed ? `已应用「${res.modelName}」的改写并重渲染` : '模型未做改动');
+    // 改写后自动体检：刷新历史列表，并把结论如实告诉使用者（不影响已保存的改写结果）。
+    if (!isComic.value) await loadLintRuns();
+    if (res.lintPersistError) {
+      lintPersistError.value = res.lintPersistError;
+      ElMessage.warning('改写已保存，但体检结果未能存档，请留意日志');
+    }
+    if (!res.changed) {
+      ElMessage.info('模型未做改动');
+    } else if (res.lint && !res.lint.ok) {
+      ElMessage.warning(`已应用「${res.modelName}」的改写；但成稿体检发现 ${res.lint.errors.length} 个问题，推送时会被门禁拦下`);
+    } else {
+      ElMessage.success(res.message ?? `已应用「${res.modelName}」的改写并重渲染`);
+    }
   } catch (e) {
     ElMessage.error(errMsg(e, 'AI 改写失败'));
   } finally {
@@ -497,21 +624,48 @@ async function push() {
   pushing.value = true;
   try {
     const res = await pushArticle(articleId.value);
+    // 推送门禁无论放行还是拦截都会留下一条体检记录，回来后刷新历史列表。
+    if (!isComic.value) await loadLintRuns();
+    if (res.lintPersistError) {
+      lintPersistError.value = res.lintPersistError;
+      ElMessage.warning('推送门禁的体检结果未能存档，请留意日志');
+    }
     if (res.ok) {
       ElMessage.success(res.message ?? '已推送到草稿箱');
       await load();
     } else {
-      // 被成稿体检拦下时没有 errcode，标题要换成体检口径，否则会显示「无 errcode」让人以为是微信报错。
-      const title =
-        res.reason === 'lint_failed'
-          ? '成稿体检未通过'
-          : `推送未成功（${res.errcode ?? '无 errcode'}）`;
-      ElMessageBox.alert(res.message ?? '推送失败', title, {
-        type: 'error',
-        confirmButtonText: '知道了',
-      });
+      // 推送失败标题与列表页共用同一套映射（S5-UI-3-0 · P2-5）：
+      // lint_failed / already_pushed / pushing 都不是微信报错，不能显示成「无 errcode」。
+      // no_account：后端明确 reason，给出真实可执行的账号配置引导（S5-UI-5-P2-4）。
+      if (res.reason === 'no_account') {
+        const guide = noAccountGuide(userRole.value);
+        try {
+          if (guide.canManage) {
+            await ElMessageBox.confirm(guide.message, '尚未配置可用于推送的公众号账号', {
+              type: 'warning', confirmButtonText: '去账号管理', cancelButtonText: '稍后',
+            });
+            await router.push('/accounts');
+          } else {
+            await ElMessageBox.alert(guide.message, '尚未配置可用于推送的公众号账号', {
+              type: 'warning', confirmButtonText: '知道了',
+            });
+          }
+        } catch { /* 用户选择稍后 */ }
+      } else {
+        const view = pushFailView(res);
+        ElMessageBox.alert(res.message ?? '推送失败', view.title, {
+          type: view.type,
+          confirmButtonText: '知道了',
+        });
+      }
       // 体检报告随推送结果回传，直接刷新预览区的体检面板，省得用户再点一次重渲染。
-      if (res.lint && rendered.value) rendered.value.lint = res.lint;
+      if (res.lint && rendered.value) {
+        rendered.value.lint = res.lint;
+        if (res.lintRun) {
+          rendered.value.lintRun = res.lintRun;
+          rendered.value.lintRunStale = false;
+        }
+      }
     }
   } catch (e) {
     ElMessage.error(errMsg(e, '推送失败'));
@@ -523,21 +677,15 @@ async function push() {
 
 <template>
   <div class="wb-page" v-loading="loading" element-loading-text="正在加载文章…">
-    <header class="wb-page-head">
-      <div class="head-main">
-        <h2>在线改稿</h2>
-        <p class="wb-page-desc">
-          {{ rendered?.title ?? '加载中…' }}
-        </p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead title="在线改稿" :desc="rendered?.title ?? '加载中…'">
+      <template #actions>
         <el-tag v-if="article" :type="statusTag(article.status)" size="small">
           {{ statusText(article.status) }}
         </el-tag>
         <el-button :icon="ArrowLeft" @click="router.push('/articles')">返回列表</el-button>
         <el-button :icon="Refresh" @click="load">重新加载</el-button>
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="loadError" :message="loadError" @retry="load" />
 
@@ -689,8 +837,14 @@ async function push() {
             @input="onInput"
           />
 
-          <div class="emph-bar">
-            <span class="wb-muted">强调补全：</span>
+          <!-- 两个辅助工具各自成区：标题 + 简短说明 + 原有「预览（改编辑框）/ 应用（写库）」两步，
+               避免强调补全与 AI 改写按钮同构紧邻、初见难分（S5-UI-3-0 · P3-2）。行为与请求参数一律不动。 -->
+          <div class="tool-region">
+            <div class="tool-region-head">
+              <span class="tool-region-title">强调补全</span>
+              <span class="wb-muted">按加粗数量规则补足 strong / 品牌红字，不调用 LLM</span>
+            </div>
+            <div class="emph-bar">
             <el-tooltip content="全篇加粗数量下限" placement="top">
               <el-input-number
                 v-model="emphParams.min"
@@ -736,10 +890,15 @@ async function push() {
             >
               应用并保存
             </el-button>
+            </div>
           </div>
 
-          <div class="ai-bar">
-            <span class="wb-muted">AI 改写：</span>
+          <div class="tool-region">
+            <div class="tool-region-head">
+              <span class="tool-region-title">AI 改写</span>
+              <span class="wb-muted">调用「改写」模型润色 / 重写 / 精简，按补充要求调整</span>
+            </div>
+            <div class="ai-bar">
             <el-radio-group v-model="reviseMode" size="small">
               <el-radio-button v-for="m in reviseModes" :key="m" :value="m">
                 {{ reviseModeText(m) }}
@@ -758,15 +917,21 @@ async function push() {
             <el-button size="small" type="primary" :loading="revising" @click="runRevise(true)">
               改写并保存
             </el-button>
+            </div>
           </div>
 
-          <div class="save-bar">
-            <el-button type="primary" :loading="saving" :disabled="!dirty" @click="save">
-              {{ dirty ? '保存并重渲染' : '已保存' }}
-            </el-button>
+          <!-- 保存态统一走 SaveBar（S5-UI-3-0 · P3-1）：组件负责状态文案 + 保存按钮，
+               推送按钮与快捷键作为自定义动作放进默认 slot。Ctrl/Cmd+S 与离页保护仍在 script 中，未动。 -->
+          <SaveBar
+            class="edit-save-bar"
+            :state="saveState"
+            :error-text="saveError"
+            save-label="保存并重渲染"
+            @save="save"
+          >
             <el-button :icon="Upload" :loading="pushing" @click="push">推送草稿箱</el-button>
             <span class="wb-muted shortcut">Ctrl / ⌘ + S 保存</span>
-          </div>
+          </SaveBar>
         </el-card>
       </el-col>
 
@@ -798,8 +963,15 @@ async function push() {
               <div class="meta-row">
                 <span class="wb-muted label">标题</span><span>{{ rendered.title }}</span>
               </div>
+              <!-- 派生规则说明（S5-UI-3-0 · P2-3）：本轮不引入独立输入框，先把「去哪改」讲清楚，降低困惑。 -->
+              <div class="meta-row derive-note">
+                取自正文首个 h1，自动带「【话】」前缀；改标题请改正文 h1
+              </div>
               <div class="meta-row">
                 <span class="wb-muted label">摘要</span><span>{{ rendered.digest }}</span>
+              </div>
+              <div class="meta-row derive-note">
+                取自正文首段前 54 字；改摘要请改正文首段
               </div>
               <div class="meta-row stats">
                 <span>小标题 {{ rendered.h2Count }}</span>
@@ -820,13 +992,67 @@ async function push() {
                   一句一段 {{ rendered.lint.stats.shortPara }}
                 </span>
               </div>
+              <!-- 存档信息：这条结论是什么时候、由哪个入口留下的，以及它是否还对得上当前正文 -->
+              <div class="lint-archive">
+                <template v-if="rendered.lintRun">
+                  <span class="wb-muted lint-archive-text">
+                    最近存档：{{ lintTriggerText(rendered.lintRun.trigger) }} ·
+                    {{ friendlyTime(rendered.lintRun.createdAt) }} ·
+                    {{ rendered.lintRun.ok ? '通过' : `${rendered.lintRun.errorCount} 项不合规` }}
+                  </span>
+                  <el-tag v-if="rendered.lintRunStale" type="warning" size="small">存档已过期（正文已改）</el-tag>
+                </template>
+                <span v-else class="wb-muted lint-archive-text">尚无存档记录</span>
+                <el-button size="small" :icon="Refresh" :loading="checking" @click="recheck">重新检查</el-button>
+                <el-popover placement="bottom-end" :width="380" trigger="click">
+                  <template #reference>
+                    <el-button link size="small">历史 {{ lintRuns.length }} 次</el-button>
+                  </template>
+                  <div v-if="!lintRuns.length" class="wb-muted">这篇还没有体检记录</div>
+                  <ul v-else class="lint-history">
+                    <li v-for="r in lintRuns" :key="r.id">
+                      <span class="wb-mono">{{ friendlyTime(r.createdAt) }}</span>
+                      <span class="wb-muted">{{ lintTriggerText(r.trigger) }}</span>
+                      <el-tag :type="r.ok ? 'success' : 'danger'" size="small">
+                        {{ r.ok ? '通过' : `${r.errorCount} 错 / ${r.warnCount} 提示` }}
+                      </el-tag>
+                    </li>
+                  </ul>
+                </el-popover>
+              </div>
+              <el-alert
+                v-if="lintPersistError"
+                type="warning"
+                show-icon
+                :closable="false"
+                class="lint-archive-alert"
+                :title="`体检结果未能存档：${lintPersistError}（结论仅本页可见，刷新后不可追溯）`"
+              />
               <ul v-if="rendered.lint.issues.length" class="lint-list">
                 <li
                   v-for="(it, i) in rendered.lint.issues"
                   :key="`li-${i}`"
                   :class="['lint-item', it.level === 'error' ? 'is-error' : 'is-warn']"
                 >
-                  {{ it.message }}
+                  <div class="lint-item-msg">{{ it.message }}</div>
+                  <!-- 命中片段：仅展示后端真实返回的 hits，空/null/缺失不渲染 -->
+                  <div v-if="lintHits(it).length" class="lint-hits">
+                    <div class="lint-hits-head">
+                      <span class="lint-hits-label">命中片段（{{ lintHits(it).length }}）：</span>
+                      <button
+                        v-if="lintHits(it).length > 1 || lintHits(it).some((h) => h.length > HIT_TRUNCATE_AT)"
+                        type="button"
+                        class="lint-hits-toggle"
+                        @click="toggleHits(i)"
+                      >{{ expandedHits.has(i) ? '收起' : '展开全部' }}</button>
+                    </div>
+                    <div
+                      v-for="(h, hi) in lintHits(it)"
+                      :key="`hit-${i}-${hi}`"
+                      class="lint-hit"
+                      :title="h"
+                    >{{ expandedHits.has(i) ? h : hitShort(h) }}</div>
+                  </div>
                 </li>
               </ul>
             </div>
@@ -903,11 +1129,8 @@ async function push() {
 </template>
 
 <style scoped>
-.head-main {
-  min-width: 0;
-}
-
-.head-main .wb-page-desc {
+/* 页头已迁移到 PageHead：内部元素属子组件作用域，用 :deep 保持文章标题过长时省略的原有视觉 */
+:deep(.wb-page-head .wb-page-desc) {
   max-width: 46ch;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -988,12 +1211,9 @@ async function push() {
   min-width: 150px;
 }
 
-.save-bar {
-  display: flex;
-  align-items: center;
-  gap: var(--wb-space-2);
+/* 保存条已迁移到 SaveBar 组件；这里只补组件与上方工具区的间距 */
+.edit-save-bar {
   margin-top: var(--wb-space-3);
-  flex-wrap: wrap;
 }
 
 .cover-row {
@@ -1049,6 +1269,43 @@ async function push() {
   margin-left: auto;
 }
 
+/* 标题/摘要派生规则说明：弱化显示，紧跟在对应字段下方，不抢正文注意力 */
+.derive-note {
+  font-size: 12px;
+  color: var(--wb-text-muted);
+  margin-top: -4px;
+  line-height: 1.5;
+}
+
+/* 两个辅助工具各自的分区：轻边框 + 小标题，与正文工具条拉开层次，不做重卡片堆叠 */
+.tool-region {
+  border: 1px solid var(--wb-border);
+  border-radius: var(--wb-radius-sm);
+  padding: var(--wb-space-2) var(--wb-space-3);
+  margin-top: var(--wb-space-3);
+}
+
+.tool-region-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--wb-space-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--wb-space-2);
+  font-size: 12px;
+}
+
+.tool-region-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--wb-text);
+}
+
+/* 分区内沿用原 emph-bar / ai-bar 的 flex 排布，只把上间距收掉（由容器统一给） */
+.tool-region .emph-bar,
+.tool-region .ai-bar {
+  margin-top: 0;
+}
+
 .meta {
   display: flex;
   flex-direction: column;
@@ -1082,7 +1339,7 @@ async function push() {
 .lint {
   margin-bottom: var(--wb-space-3);
   border: 1px solid var(--wb-border);
-  border-radius: var(--wb-radius-md);
+  border-radius: var(--wb-radius-sm);
   padding: var(--wb-space-2) var(--wb-space-3);
 }
 
@@ -1097,6 +1354,38 @@ async function push() {
   font-size: 12px;
 }
 
+/* 存档行：结论的来源与新鲜度（S4-3） */
+.lint-archive {
+  display: flex;
+  align-items: center;
+  gap: var(--wb-space-2);
+  flex-wrap: wrap;
+  margin-top: var(--wb-space-2);
+  font-size: 12px;
+}
+
+.lint-archive-text {
+  font-size: 12px;
+}
+
+.lint-archive-alert {
+  margin-top: var(--wb-space-2);
+}
+
+.lint-history {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+  line-height: 1.9;
+}
+
+.lint-history li {
+  display: flex;
+  align-items: center;
+  gap: var(--wb-space-2);
+}
+
 .lint-list {
   margin: var(--wb-space-2) 0 0;
   padding-left: 18px;
@@ -1109,7 +1398,47 @@ async function push() {
 }
 
 .lint-item.is-warn {
-  color: var(--wb-text-2);
+  color: var(--wb-text-secondary);
+}
+
+/* 命中片段（S5-UI-5-P2-3）：作为辅助上下文，与问题说明视觉区分、不撑破窄屏 */
+.lint-item-msg {
+  display: inline;
+}
+
+.lint-hits {
+  margin-top: 3px;
+  padding: 4px 8px;
+  border-left: 2px solid var(--wb-border);
+  background: var(--wb-surface);
+  color: var(--wb-text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.lint-hits-head {
+  display: flex;
+  align-items: center;
+  gap: var(--wb-space-2);
+  flex-wrap: wrap;
+}
+
+.lint-hits-label {
+  font-weight: 600;
+}
+
+.lint-hits-toggle {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--wb-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.lint-hit {
+  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
 .media-row {
@@ -1161,7 +1490,7 @@ async function push() {
 
 .panel-card {
   border: 1px solid var(--wb-border);
-  border-radius: var(--wb-radius-md);
+  border-radius: var(--wb-radius-sm);
   padding: var(--wb-space-2);
 }
 
@@ -1169,14 +1498,14 @@ async function push() {
   width: 100%;
   aspect-ratio: 16 / 9;
   border-radius: 4px;
-  background: var(--wb-surface-2);
+  background: var(--wb-surface-muted);
 }
 
 .panel-empty {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--wb-text-3);
+  color: var(--wb-text-muted);
   font-size: 12px;
 }
 
@@ -1191,7 +1520,7 @@ async function push() {
 .panel-err {
   margin: 4px 0 0;
   font-size: 12px;
-  color: var(--wb-text-2);
+  color: var(--wb-text-secondary);
   word-break: break-all;
 }
 

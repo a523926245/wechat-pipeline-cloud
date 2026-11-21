@@ -93,9 +93,9 @@ async function main(): Promise<void> {
     existsSync(CHEESE_FONT) ? `${(statSync(CHEESE_FONT).size / 1024 / 1024).toFixed(1)}MB` : 'missing');
 
   check('QUOTE_CARD_VERSION === 2', QUOTE_CARD_VERSION === 2, `ver=${QUOTE_CARD_VERSION}`);
-  check('版本化文件名格式正确', quoteCardRelName(3) === 'quote-3-v2.jpg', quoteCardRelName(3));
+  check('版本化文件名格式正确（带文章 ID 隔离）', quoteCardRelName(42, 3) === 'quote-42-3-v2.jpg', quoteCardRelName(42, 3));
 
-  const outPath = join(tmpDir, quoteCardRelName(1));
+  const outPath = join(tmpDir, quoteCardRelName(42, 1));
   const spec = { headline: '奶酪体金句标题', elaboration: '这是用于验证字体与版式的阐释文字', outPath };
 
   await renderQuoteCard(spec);

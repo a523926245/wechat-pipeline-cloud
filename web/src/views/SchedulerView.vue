@@ -10,20 +10,24 @@
  */
 import { Cpu, Refresh, VideoPause, VideoPlay } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref } from 'vue';
 
 import { errMsg } from '../api/http.ts';
 import {
-  getContentPrefixes,
   getSchedulerStatus,
   schedulerStart,
   schedulerStop,
   schedulerTick,
   setSchedulerConfig,
-  updateContentPrefixes,
 } from '../api/index.ts';
+import PageHead from '../components/PageHead.vue';
+import { useAuth } from '../composables/useAuth.ts';
 import StateError from '../components/StateError.vue';
-import type { ContentPrefixItem, SchedulerConfig, SchedulerStatus } from '../types.ts';
+import type { AutomationMode, SchedulerConfig, SchedulerStatus } from '../types.ts';
+
+const { userRole } = useAuth();
+/** 全局开关只有 admin 可改（后端 scheduler.ts:90-94 硬拦）；据此构造 payload 与控制禁用态。 */
+const isAdmin = computed(() => userRole.value === 'admin');
 
 const status = ref<SchedulerStatus | null>(null);
 const statusError = ref('');
@@ -34,6 +38,52 @@ const savingCfg = ref(false);
 const cfgDirty = ref(false);
 
 const cfg = reactive<SchedulerConfig>({ enabled: false, writeTime: '06:00', pushEnabled: false });
+const my = reactive<{ automationMode: AutomationMode; writeTime: string }>({
+  automationMode: 'manual',
+  writeTime: '06:00',
+});
+const modeOptions = ref<Array<{ value: AutomationMode; label: string }>>([
+  { value: 'manual', label: '纯手动（只手动出稿/推送）' },
+  { value: 'auto_draft', label: '自动写稿（到点入库，人工审后手动推）' },
+  { value: 'auto_draft_push', label: '自动写稿 + 自动推草稿箱（全自动）' },
+]);
+
+/**
+ * 推送意图横幅。
+ *
+ * 口径（必须与后端一致）：tick 是按**每账号 owner 的 automationMode** 决定推不推
+ * （scheduler.ts `push = auto.mode === 'auto_draft_push'`），全局 `pushEnabled`
+ * 只是「无主账号」的兜底值。所以这里**只消费后端 `pushIntent`**，不再用
+ * `cfg.enabled && !cfg.pushEnabled` 反推——那会把「其实会推」说成「不会推」。
+ *
+ * `pushIntent` 缺省（旧后端 / 夹具未提供）时返回 null：宁可不显示，也不编结论。
+ */
+const pushBanner = computed<{ type: 'info' | 'warning'; title: string } | null>(() => {
+  const s = status.value?.pushIntent?.status;
+  if (!s) return null;
+  if (s === 'none') {
+    return {
+      type: 'info',
+      title: '本次不会推送：没有账号处于「自动写稿 + 自动推草稿箱」模式（到点只写草稿，推送需人工操作）。',
+    };
+  }
+  if (s === 'partial') {
+    return {
+      type: 'warning',
+      title: '本次会有部分账号推草稿箱：全自动模式的账号会推，其余账号只写草稿，人工审后可手动推。仅进草稿箱，不会群发。',
+    };
+  }
+  if (s === 'all') {
+    return {
+      type: 'warning',
+      title: '本次所有就绪账号都会推草稿箱：仍然只是草稿箱，不会群发（AUTO_PUBLISH 恒为 false）。',
+    };
+  }
+  return {
+    type: 'info',
+    title: '无法判断本次是否会推送：当前没有就绪账号（需已启用且凭据格式合规），请先检查账号配置。',
+  };
+});
 
 async function loadStatus() {
   loading.value = true;
@@ -43,6 +93,9 @@ async function loadStatus() {
     cfg.enabled = status.value.config.enabled;
     cfg.writeTime = status.value.config.writeTime;
     cfg.pushEnabled = status.value.config.pushEnabled;
+    my.automationMode = status.value.my?.automationMode ?? 'manual';
+    my.writeTime = status.value.my?.writeTime ?? '06:00';
+    if (status.value.modeOptions?.length) modeOptions.value = status.value.modeOptions;
     cfgDirty.value = false;
   } catch (e) {
     statusError.value = errMsg(e, '调度状态加载失败');
@@ -51,42 +104,6 @@ async function loadStatus() {
   }
 }
 
-// ── 内容标题前缀（文章 / 漫画） ──
-// 起因：旧流水线的 title_prefix 被迁移原样带进来（值「【冒烟】」），所有新草稿标题都带【冒烟】，
-// 而漫画前缀是另一个 key，于是文章【冒烟】、漫画【漫】混排。这里给个能看能改的入口。
-const prefixes = ref<ContentPrefixItem[]>([]);
-const prefixForm = reactive<Record<string, string>>({});
-const savingPrefix = ref(false);
-
-async function loadPrefixes() {
-  try {
-    const res = await getContentPrefixes();
-    prefixes.value = res.items;
-    for (const it of res.items) prefixForm[it.key] = it.value;
-  } catch (e) {
-    statusError.value = errMsg(e, '标题前缀加载失败');
-  }
-}
-
-async function savePrefixes() {
-  savingPrefix.value = true;
-  try {
-    const res = await updateContentPrefixes({ ...prefixForm });
-    prefixes.value = res.items;
-    for (const it of res.items) prefixForm[it.key] = it.value;
-    ElMessage.success(res.message ?? '已保存');
-  } catch (e) {
-    ElMessage.error(errMsg(e, '前缀保存失败'));
-  } finally {
-    savingPrefix.value = false;
-  }
-}
-
-function prefixLabel(key: string): string {
-  if (key === 'title_prefix') return '文章前缀';
-  if (key === 'comic_title_prefix') return '漫画前缀';
-  return key;
-}
 
 function onCfgChange() {
   cfgDirty.value = true;
@@ -95,8 +112,19 @@ function onCfgChange() {
 async function saveCfg() {
   savingCfg.value = true;
   try {
-    const res = await setSchedulerConfig({ ...cfg });
+    // P4：automationMode/writeTime=我的每用户配置（所有角色可改自己）；
+    // enabled/pushEnabled=全局开关，后端对非 admin 只要携带就拒绝（scheduler.ts:90-94）。
+    // 因此 member/guest 只提交个人字段，绝不携带全局字段——不是隐藏功能，而是按真实权限
+    // 提交合法 payload；全局开关对非 admin 禁用（见模板），避免误触与误导。
+    const payload = isAdmin.value
+      ? { ...cfg, automationMode: my.automationMode, writeTime: my.writeTime }
+      : { automationMode: my.automationMode, writeTime: my.writeTime };
+    const res = await setSchedulerConfig(payload);
     Object.assign(cfg, res.config);
+    if (res.my) {
+      my.automationMode = res.my.automationMode;
+      my.writeTime = res.my.writeTime;
+    }
     cfgDirty.value = false;
     ElMessage.success('调度配置已保存');
     await loadStatus();
@@ -145,21 +173,16 @@ async function toggleRunning(start: boolean) {
 
 onMounted(() => {
   void loadStatus();
-  void loadPrefixes();
 });
 </script>
 
 <template>
   <div class="wb-page" v-loading="loading" element-loading-text="正在加载调度配置…">
-    <header class="wb-page-head">
-      <div>
-        <h2>自动调度</h2>
-        <p class="wb-page-desc">定时任务开关、写稿时间与手动心跳补跑</p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead title="自动调度" desc="定时任务开关、写稿时间与手动心跳补跑">
+      <template #actions>
         <el-button :icon="Refresh" @click="loadStatus">刷新</el-button>
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="statusError" :message="statusError" label="调度状态加载失败" @retry="loadStatus" />
 
@@ -181,23 +204,27 @@ onMounted(() => {
       />
 
       <el-form label-width="96px" class="cfg-form">
-        <el-form-item label="启用调度">
-          <el-switch v-model="cfg.enabled" aria-label="启用自动调度" @change="onCfgChange" />
-          <span class="wb-muted hint">到点后按各账号配额自动写稿</span>
+        <el-form-item label="自动化模式">
+          <el-radio-group v-model="my.automationMode" @change="onCfgChange">
+            <el-radio v-for="opt in modeOptions" :key="opt.value" :value="opt.value" border style="margin: 4px 8px 4px 0">
+              {{ opt.label }}
+            </el-radio>
+          </el-radio-group>
         </el-form-item>
         <el-form-item label="写稿时间">
           <el-time-picker
-            v-model="cfg.writeTime"
+            v-model="my.writeTime"
             format="HH:mm"
             value-format="HH:mm"
             placeholder="06:00"
             style="width: 140px"
             @change="onCfgChange"
           />
+          <span class="wb-muted hint">到点后按各账号配额自动写稿（manual 模式不生效）</span>
         </el-form-item>
-        <el-form-item label="级联推送">
-          <el-switch v-model="cfg.pushEnabled" aria-label="级联推送到草稿箱" @change="onCfgChange" />
-          <span class="wb-muted hint">并行期建议关闭，只写草稿不推送</span>
+        <el-form-item label="全局总开关">
+          <el-switch v-model="cfg.enabled" aria-label="全局调度总开关" :disabled="!isAdmin" @change="onCfgChange" />
+          <span class="wb-muted hint">关掉后所有人的自动化都不跑（仅管理员可改）{{ isAdmin ? '' : '；当前账号无权限修改' }}</span>
         </el-form-item>
       </el-form>
 
@@ -239,53 +266,19 @@ onMounted(() => {
       </div>
 
       <el-alert
-        v-if="cfg.enabled && !cfg.pushEnabled"
-        class="dry-run"
-        type="info"
+        v-if="cfg.enabled && pushBanner"
+        class="push-intent"
+        :type="pushBanner.type"
         show-icon
         :closable="false"
-        title="当前为 dry-run：调度会写草稿，但不会推送到公众号。"
+        :title="pushBanner.title"
       />
     </el-card>
 
-    <!-- 内容标题前缀：文章与漫画各一个，避免「文章【冒烟】、漫画【漫】」这种混排 -->
-    <el-card shadow="never">
-      <template #header>内容标题前缀</template>
-
-      <el-form label-width="96px" @submit.prevent>
-        <el-form-item v-for="p in prefixes" :key="p.key" :label="prefixLabel(p.key)">
-          <el-input v-model="prefixForm[p.key]" maxlength="12" style="width: 160px" />
-          <span class="wb-muted prefix-hint">
-            {{ p.desc }}<template v-if="p.value !== prefixForm[p.key]">（当前生效：{{ p.value }}）</template>
-          </span>
-        </el-form-item>
-      </el-form>
-
-      <el-alert
-        type="info"
-        show-icon
-        :closable="false"
-        title="前缀在渲染/建稿时幂等添加（标题已带该前缀就不重复加）。改动只影响之后生成的草稿，历史文章标题不变。"
-      />
-
-      <div class="prefix-actions">
-        <el-button type="primary" :loading="savingPrefix" @click="savePrefixes">保存前缀</el-button>
-      </div>
-    </el-card>
   </div>
 </template>
 
 <style scoped>
-.prefix-hint {
-  margin-left: var(--wb-space-2);
-  font-size: 12px;
-}
-
-.prefix-actions {
-  margin-top: var(--wb-space-3);
-  display: flex;
-  justify-content: flex-end;
-}
 
 .card-head {
   display: flex;
@@ -318,7 +311,7 @@ onMounted(() => {
   margin-left: auto;
 }
 
-.dry-run {
+.push-intent {
   margin-top: var(--wb-space-3);
 }
 </style>

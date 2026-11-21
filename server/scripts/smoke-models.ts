@@ -13,6 +13,10 @@
  *   npm run smoke:models -- --force   # 确认库里没要紧配置后才用这个
  */
 
+// 冒烟旁路：本脚本带裸 fetch/静态请求，跳过 /api 鉴权（生产环境无效）。
+process.env.SMOKE_NO_AUTH = '1';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { createServer } from 'node:http';
 
 import { createApp } from '../src/app.ts';
@@ -96,7 +100,19 @@ async function main(): Promise<void> {
           '它也不再替你清空整表——请先记下这些模型的配置，再跑 `npm run smoke:models -- --force`。',
       );
     }
-    if (foreign > 0) await prisma.llmModel.deleteMany({});
+    if (foreign > 0) {
+      // ⚠️ --force 清整表是高危动作（2026-11-11 实测丢过用户真实模型/密钥）。
+      // 先全量备份到 JSON（含 apiKeyEnc 密文，可用恢复脚本原样回灌），再清。
+      const backupRows = await prisma.llmModel.findMany();
+      const backupBinds = await prisma.modelBinding.findMany();
+      const backupPath = path.resolve(`prisma/models-backup-${Date.now()}.json`);
+      fs.writeFileSync(
+        backupPath,
+        JSON.stringify({ models: backupRows, bindings: backupBinds }, null, 2),
+      );
+      console.log(`⚠️ --force：已备份 ${backupRows.length} 个模型 + ${backupBinds.length} 条绑定 → ${backupPath}`);
+      await prisma.llmModel.deleteMany({});
+    }
 
     // 1. 元数据
     const meta = await call('GET', '/models/meta');
@@ -189,6 +205,35 @@ async function main(): Promise<void> {
 
     const textId = text.json?.id as number;
     const imageId = image.json?.id as number;
+
+    // 4b. 更新回归（2026-11-11 覆写 bug 钉死）：改别的字段不得动 Key / 不得丢表单外参数
+    {
+      const maskBefore = text.json?.apiKeyMask;
+      const r = await call('PUT', `/models/${textId}`, {
+        name: '冒烟-文本模型改名',
+        paramsJson: { temperature: 0.7 },
+      });
+      check('只改名称/温度 → 200', r.status === 200, `status=${r.status}`);
+      check('编辑后 Key 掩码不变（留空=不修改）', r.json?.apiKeyMask === maskBefore,
+        `before=${maskBefore} after=${r.json?.apiKeyMask}`);
+
+      // 空白 Key 不算修改（防误存空格覆盖旧 Key）
+      const ws = await call('PUT', `/models/${textId}`, { apiKey: '   ' });
+      check('空白 Key 被忽略，掩码不变', ws.json?.apiKeyMask === maskBefore,
+        `after=${ws.json?.apiKeyMask}`);
+
+      // paramsJson 合并：先埋 gradioApiName，再用「表单重建」提交 → 未知键必须活着
+      await call('PUT', `/models/${imageId}`, { paramsJson: { gradioApiName: 'generate_image', genWidth: 1344 } });
+      const merge = await call('PUT', `/models/${imageId}`, { paramsJson: { size: '2K', ratio: '21:9' } });
+      const p = merge.json?.paramsJson ?? {};
+      check('paramsJson 合并不丢表单外键', p.gradioApiName === 'generate_image' && p.genWidth === 1344,
+        JSON.stringify(p));
+
+      // 显式 null = 删除该参数（清温度）
+      const clearT = await call('PUT', `/models/${textId}`, { paramsJson: { temperature: null } });
+      check('paramsJson 传 null 删除参数', !('temperature' in (clearT.json?.paramsJson ?? {})),
+        JSON.stringify(clearT.json?.paramsJson));
+    }
 
     // 5. 列表：boundRoles 是数组（旧版是单值，多角色会丢）
     let list = await call('GET', '/models');

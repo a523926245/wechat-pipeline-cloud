@@ -11,7 +11,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../db.ts';
-import { encryptSecret, looksLikePlaceholder, maskSecret } from '../../lib/crypto.ts';
+import { decryptSecret, encryptSecret, looksLikePlaceholder, maskSecret } from '../../lib/crypto.ts';
 import { BadRequestError, CredentialError, NotFoundError, WechatApiError } from '../../errors.ts';
 import {
   createAccount,
@@ -20,9 +20,20 @@ import {
   validateCredentials,
 } from '../../services/accounts.ts';
 import { WechatClient } from '../../services/wechat.ts';
+import {
+  accountOwnerWhere,
+  assertAccountAccess,
+  isAdmin,
+  requirePrincipal,
+} from '../../services/ownership.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { bulkDeleteSchema, runBulkDelete } from '../bulk-delete.ts';
+import { requirePermission } from '../permissions.ts';
 
 export const credentialsRouter: Router = Router();
+
+// P2 RBAC：本路由统一权限点
+credentialsRouter.use(requirePermission('oa_account:manage'));
 
 const idParam = z.coerce.number().int().positive();
 
@@ -42,11 +53,13 @@ const updateSchema = z.object({
   author: z.string().trim().max(64).optional(),
 });
 
-/** 列表：只暴露掩码与状态，绝不返回明文。 */
+/** 列表：只暴露掩码与状态，绝不返回明文。P3：member 只见自己的账号。 */
 credentialsRouter.get(
   '/',
-  asyncHandler(async (_req, res) => {
-    const accounts = await prisma.account.findMany({
+  asyncHandler(async (req, res) => {
+    const principal = requirePrincipal(req);
+    const accounts = await prisma.oAAccount.findMany({
+      where: accountOwnerWhere(principal),
       include: { track: { select: { name: true, slug: true } } },
       orderBy: { id: 'asc' },
     });
@@ -74,6 +87,7 @@ credentialsRouter.get(
 credentialsRouter.post(
   '/',
   asyncHandler(async (req, res) => {
+    const principal = requirePrincipal(req);
     const body = createSchema.parse(req.body);
     const secret = body.secret ?? '';
 
@@ -93,6 +107,7 @@ credentialsRouter.post(
         appid: body.appid,
         secret,
         author: body.author,
+        ownerUserId: principal.userId,
       });
       res.status(201).json({
         id: a.id,
@@ -120,8 +135,10 @@ credentialsRouter.post(
 credentialsRouter.get(
   '/:id',
   asyncHandler(async (req, res) => {
+    const principal = requirePrincipal(req);
     const id = idParam.parse(req.params.id);
-    const a = await prisma.account.findUnique({ where: { id } });
+    const a = await prisma.oAAccount.findUnique({ where: { id } });
+    assertAccountAccess(principal, a, id);
     if (!a) throw new NotFoundError(`账号 ${id} 不存在`);
     res.json({
       id: a.id,
@@ -140,10 +157,12 @@ credentialsRouter.get(
 credentialsRouter.put(
   '/:id',
   asyncHandler(async (req, res) => {
+    const principal = requirePrincipal(req);
     const id = idParam.parse(req.params.id);
     const body = updateSchema.parse(req.body);
 
-    const current = await prisma.account.findUnique({ where: { id } });
+    const current = await prisma.oAAccount.findUnique({ where: { id } });
+    assertAccountAccess(principal, current, id);
     if (!current) throw new NotFoundError(`账号 ${id} 不存在`);
 
     // 改绑赛道：赛道必须真实存在，否则账号会挂到一个不存在的赛道上。
@@ -152,9 +171,13 @@ credentialsRouter.put(
       if (!track) throw new NotFoundError(`赛道 ${body.trackId} 不存在`);
     }
 
-    // 合并：只更新传入的字段，其余沿用现有值
+    // 合并：只更新传入的字段，其余沿用现有值。
+    // ⚠️ Secret 留空 = 不修改（UI 约定「留空表示不修改」）。状态判定必须用**库里已存 Secret 的
+    // 解密值**参与合并，否则「只改赛道/名称」会把凭据状态误判成 placeholder 并禁用账号
+    //（2026-11-11 实测踩坑：改赛道后排产报「仍是占位凭据」）。
+    const secretProvided = typeof body.secret === 'string' && body.secret.trim() !== '';
     const nextAppid = body.appid ?? current.appid;
-    const nextSecret = body.secret ?? '';
+    const nextSecret = body.secret && body.secret.trim() !== '' ? body.secret : decryptSecret(current.secretEnc);
     const author = body.author ?? current.author;
 
     const v = validateCredentials(nextAppid, nextSecret);
@@ -174,13 +197,13 @@ credentialsRouter.put(
     if (body.name !== undefined) data.name = body.name;
     if (body.trackId !== undefined) data.trackId = body.trackId;
     if (body.appid !== undefined) data.appid = nextAppid;
-    if (body.secret !== undefined) {
+    if (secretProvided) {
       data.secretEnc = encryptSecret(nextSecret);
       data.secretMask = maskSecret(nextSecret);
     }
 
     try {
-      const updated = await prisma.account.update({ where: { id }, data });
+      const updated = await prisma.oAAccount.update({ where: { id }, data });
       res.json({
         id: updated.id,
         name: updated.name,
@@ -208,8 +231,10 @@ credentialsRouter.put(
 credentialsRouter.post(
   '/:id/test',
   asyncHandler(async (req, res) => {
+    const principal = requirePrincipal(req);
     const id = idParam.parse(req.params.id);
-    const a = await prisma.account.findUnique({ where: { id } });
+    const a = await prisma.oAAccount.findUnique({ where: { id } });
+    assertAccountAccess(principal, a, id);
     if (!a) throw new NotFoundError(`账号 ${id} 不存在`);
 
     // 占位/缺失账号无需打真实接口，直接告知先配置。
@@ -226,7 +251,7 @@ credentialsRouter.post(
     try {
       const client = await WechatClient.fromAccountId(id);
       await client.getAccessToken(true);
-      const updated = await prisma.account.update({
+      const updated = await prisma.oAAccount.update({
         where: { id },
         data: { credStatus: 'ok', enabled: true },
       });
@@ -251,7 +276,7 @@ credentialsRouter.post(
         message = e.message;
       }
       // 连通失败 → 取消启用，状态置为 invalid（除非是占位/缺失本身）
-      await prisma.account.update({
+      await prisma.oAAccount.update({
         where: { id },
         data: { credStatus: 'invalid', enabled: false },
       }).catch(() => undefined);
@@ -267,6 +292,38 @@ credentialsRouter.post(
 );
 
 /**
+ * 批量删除账号。
+ *
+ * 复用 services/accounts.deleteAccount 的级联事务（删名下文章 → 归还角度 → 删账号），
+ * 逐条独立执行：一条失败不影响其余，失败原因原样返回。
+ *
+ * 归属校验与单条删除完全一致（入口层 assertAccountAccess + 服务层兜底），
+ * 非 admin 删不到别人的账号——批量不会成为绕过归属的旁路。
+ *
+ * 路由顺序：'/bulk-delete' 必须排在 '/:id' 之前（按项目约定固定路径前置）。
+ */
+credentialsRouter.post(
+  '/bulk-delete',
+  asyncHandler(async (req, res) => {
+    const { ids } = bulkDeleteSchema.parse(req.body ?? {});
+    const principal = requirePrincipal(req);
+    const ownerId = isAdmin(principal) ? null : principal.userId;
+    const result = await runBulkDelete(
+      ids,
+      async (id) => {
+        // 入口层先验（与单条删除同款），服务层内部还会再兜底一次
+        const acc = await prisma.oAAccount.findUnique({ where: { id }, select: { ownerUserId: true } });
+        assertAccountAccess(principal, acc, id);
+        const r = await deleteAccount(id, ownerId);
+        return { deletedArticles: r.deletedArticles, recycledAngles: r.recycledAngles };
+      },
+      '账号',
+    );
+    res.json(result);
+  }),
+);
+
+/**
  * 删除账号。级联逻辑全部在 services/accounts.deleteAccount 的事务里完成：
  * 未送达文章所占角度归还池中 → 名下文章删除 → TaskRun 的 accountId 置空 → 删账号。
  * 微信侧已经发出去的内容不受影响（系统只写草稿箱，且这里不碰微信接口）。
@@ -274,8 +331,13 @@ credentialsRouter.post(
 credentialsRouter.delete(
   '/:id',
   asyncHandler(async (req, res) => {
+    const principal = requirePrincipal(req);
     const id = idParam.parse(req.params.id);
-    const r = await deleteAccount(id);
+    // P3 归属校验（最高危路径：级联删文章）——入口层先验，deleteAccount 内服务层兜底
+    const acc = await prisma.oAAccount.findUnique({ where: { id }, select: { ownerUserId: true } });
+    assertAccountAccess(principal, acc, id);
+    // 服务层兜底只约束非 admin（admin 会话的 userId 非空，直接传会把 admin 自己当属主误拦）
+    const r = await deleteAccount(id, isAdmin(principal) ? null : principal.userId);
     res.json({
       ok: true,
       id: r.id,

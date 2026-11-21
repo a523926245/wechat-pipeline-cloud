@@ -23,6 +23,10 @@ import { emphasisRouter } from './api/routes/emphasis.ts';
 import { schedulerRouter } from './api/routes/scheduler.ts';
 import { dashboardRouter } from './api/routes/dashboard.ts';
 import { anglesRouter } from './api/routes/angles.ts';
+import { stylePromptsRouter } from './api/routes/style-prompts.ts';
+import { authRouter } from './api/routes/auth.ts';
+import { usersRouter } from './api/routes/users.ts';
+import { authGuard } from './api/auth-guard.ts';
 
 export function createApp() {
   const app = express();
@@ -35,6 +39,14 @@ export function createApp() {
 
   // 接口访问日志：每条 /api 请求在响应结束时输出到控制台（复用 logger，同时落文件）
   app.use(requestLogger);
+
+  // 鉴权（2026-11-11 上线红线收口）：/api/* 默认全拦，公开项只有 /health 与 /auth/*。
+  // 必须挂在静态内容与业务路由之前，否则 /api/content 会绕过鉴权。
+  app.use('/api', authGuard);
+  // 登录/登出/状态/注册（公开，guard 已放行 /auth/*）
+  app.use('/api/auth', authRouter);
+  // 用户管理（审批/角色/配额，admin 专属——requirePermission 在路由内硬拦）
+  app.use('/api/users', usersRouter);
 
   // 内容文件（文章 HTML、生成的封面图）。挂在 /api 下是为了复用前端的 /api 代理，
   // 无需改 vite.config.ts。必须在业务路由之前注册，否则会被下面的 404 兜底吃掉。
@@ -54,6 +66,7 @@ export function createApp() {
   app.use('/api/emphasize', emphasisRouter);
   app.use('/api/scheduler', schedulerRouter);
   app.use('/api/dashboard', dashboardRouter);
+  app.use('/api/style-prompts', stylePromptsRouter);
 
   // 未知路由
   app.use('/api', (_req, res) => {

@@ -60,6 +60,13 @@ async function request<T>(
   }
 
   if (!res.ok) {
+    // 401 = 鉴权失效（2026-11-11 /api 全量鉴权）：踢回登录页。
+    // 登录接口自身的 401（令牌输错）不跳，交给页面提示。
+    if (res.status === 401 && !path.startsWith('/auth') && typeof window !== 'undefined') {
+      if (!window.location.pathname.startsWith('/login')) {
+        window.location.href = '/login';
+      }
+    }
     const err = (data ?? {}) as ErrorBody;
     const payload = err.error ?? {};
     throw new ApiError(
@@ -79,6 +86,8 @@ export const http = {
     request<T>('POST', path, body, query),
   put: <T>(path: string, body?: unknown, query?: Record<string, unknown>) =>
     request<T>('PUT', path, body, query),
+  patch: <T>(path: string, body?: unknown, query?: Record<string, unknown>) =>
+    request<T>('PATCH', path, body, query),
   del: <T>(path: string, body?: unknown, query?: Record<string, unknown>) =>
     request<T>('DELETE', path, body, query),
 };

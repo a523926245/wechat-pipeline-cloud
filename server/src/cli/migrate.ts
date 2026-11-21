@@ -354,7 +354,7 @@ async function main(): Promise<void> {
   // SQLite 单写者，交互式事务一旦拉长会阻塞整库，这一步是必须的。
   const [trackRows, accountRows, angleRows] = await Promise.all([
     prisma.track.findMany({ select: { id: true, slug: true } }),
-    prisma.account.findMany({
+    prisma.oAAccount.findMany({
       select: {
         id: true,
         trackId: true,
@@ -426,13 +426,13 @@ async function main(): Promise<void> {
         if (existing) {
           // appid 是 @unique，升级占位→真实时可能与别行冲突；冲突就保留原值
           const data = finalAppid === existing.appid ? accData : { ...accData, appid: finalAppid };
-          const row = await prisma.account.update({ where: { id: existing.id }, data });
+          const row = await prisma.oAAccount.update({ where: { id: existing.id }, data });
           accountByName.set(`${track.id}|${accName}`, {
             ...row,
             secretEnc: row.secretEnc ?? null,
           });
         } else {
-          const row = await prisma.account.create({
+          const row = await prisma.oAAccount.create({
             data: { ...accData, trackId: track.id, appid: finalAppid },
           });
           accountByName.set(`${track.id}|${accName}`, {

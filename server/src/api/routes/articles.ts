@@ -15,14 +15,23 @@ import { z } from 'zod';
 
 import { prisma } from '../../db.ts';
 import { unpackJson } from '../../db-json.ts';
-import { BadRequestError, NotFoundError } from '../../errors.ts';
+import { BadRequestError, ConflictError, NotFoundError } from '../../errors.ts';
+import { claimAngleInTx } from '../../services/angle-claim.ts';
 import { parseArticle } from '../../services/parse/index.ts';
 import { renderArticle } from '../../services/render/index.ts';
+import { buildLocalComicPreview } from '../../services/render/comic.ts';
 import { pushArticleToDraft } from '../../services/publisher.ts';
 import { lintArticle } from '../../services/lint.ts';
+import { latestLintRun, listLintRuns, recordLintRun, htmlFingerprint, type LintRunBrief } from '../../services/lint-store.ts';
+import { assertAngleApproved } from '../../services/topic-review.ts';
 import { generateCoverForArticle } from '../../services/cover.ts';
 import { toRelativeCoverPath } from '../../services/content-path.ts';
+import { assertAccountAccess, assertArticleAccess, isAdmin, requirePrincipal } from '../../services/ownership.ts';
+import { deleteArticleById } from '../../services/article-delete.ts';
+import { loadTrackRule } from '../../services/style-prompts.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { bulkDeleteSchema, runBulkDelete } from '../bulk-delete.ts';
+import { requirePermission } from '../permissions.ts';
 import { createComicDraft } from '../../services/comic/write.ts';
 import {
   isComicGenerating,
@@ -32,6 +41,15 @@ import {
 } from '../../services/comic/panels.ts';
 
 export const articlesRouter: Router = Router();
+
+// P2 RBAC：按 method+path 分发权限点（member 不改稿 → PUT 走 content:revise 仅 admin）
+articlesRouter.use((req, res, next) => {
+  const p = req.path;
+  if (req.method === 'GET') return requirePermission('data:view')(req, res, next);
+  if (/^\/\d+\/push$/.test(p)) return requirePermission('content:push')(req, res, next);
+  if (req.method === 'PUT') return requirePermission('content:revise')(req, res, next);
+  return requirePermission('content:generate')(req, res, next);
+});
 
 const idParam = z.coerce.number().int().positive();
 
@@ -82,18 +100,35 @@ const comicCreateSchema = z.object({
 articlesRouter.post(
   '/comic/create',
   asyncHandler(async (req, res) => {
+    const principal = requirePrincipal(req);
     const body = comicCreateSchema.parse(req.body);
-    const account = await prisma.account.findUnique({ where: { id: body.accountId } });
+    const account = await prisma.oAAccount.findUnique({ where: { id: body.accountId } });
+    assertAccountAccess(principal, account, body.accountId);
     if (!account) throw new NotFoundError(`账号 ${body.accountId} 不存在`);
     const angle = await prisma.angle.findUnique({ where: { id: body.angleId } });
     if (!angle) throw new NotFoundError(`选题 ${body.angleId} 不存在`);
+    // S4-1 补充核查：漫画脚本以选题正文为创作输入，必须已审核通过（reserve 路径另有 planner 过滤）。
+    assertAngleApproved(angle);
+    // S4-4-1 R4：手动建稿同样要消耗选题（占用在建稿事务内做，这里只给出清晰文案）。
+    if (angle.used) {
+      throw new ConflictError(
+        `选题「${angle.theme}」已被占用（已用于其他文章），不能重复用于新建漫画；如需再用请先归还该选题`,
+      );
+    }
     const track = await prisma.track.findUnique({ where: { id: account.trackId } });
     if (!track) throw new NotFoundError(`账号所在赛道不存在`);
-    const result = await createComicDraft(account, angle, track, {
-      unitCount: body.unitCount,
-      chain: body.chain,
-      extra: body.extra,
-    });
+    const result = await createComicDraft(
+      account,
+      angle,
+      track,
+      {
+        unitCount: body.unitCount,
+        chain: body.chain,
+        extra: body.extra,
+      },
+      // 唯一需要「建稿即占题」的手动入口；排产路径已在 reserve 阶段占用，不能重复占。
+      { claimAngle: true },
+    );
     // 建稿即开跑插图：用户预期是「点了就等图」，不是再去文章页手动点一次。
     kickComicImages(result.articleId);
     res.status(201).json({ ok: true, ...result, generating: true });
@@ -172,13 +207,38 @@ articlesRouter.post(
   asyncHandler(async (req, res) => {
     const body = createSchema.parse(req.body);
 
-    // 账号必须真实存在，否则文章会挂到一个已被删除的账号上、永远推不出去。
+    // 账号必须真实存在且归属当前用户（P3），否则文章会挂到他人账号上。
+    // 同时取出 name / ownerUserId：R4 占题时要把「谁占的」写进 Angle 的归属字段。
+    let owner: { id: number; name: string; ownerUserId: number | null } | null = null;
     if (body.accountId != null) {
-      const acc = await prisma.account.findUnique({
+      owner = await prisma.oAAccount.findUnique({
         where: { id: body.accountId },
-        select: { id: true },
+        select: { id: true, name: true, ownerUserId: true },
       });
-      if (!acc) throw new NotFoundError(`账号 ${body.accountId} 不存在`);
+      assertAccountAccess(requirePrincipal(req), owner, body.accountId);
+      if (!owner) throw new NotFoundError(`账号 ${body.accountId} 不存在`);
+    }
+
+    // S4-1 补充核查：挂稿的 angleId 是文章的「选题归属」——绑定即意味着该选题进入生产。
+    // 正文虽由调用方提供（服务端不读选题正文），但候选/待修改/已拒绝选题不得成为生产文章的主题，
+    // 否则审核门可被挂稿绕过。
+    // S4-4-1 R4：绑定还意味着**消耗选题**——审核门禁通过后必须先占用（used=true），
+    // 否则同一选题会被排产再领一次，写出第二篇同题文章。这里的预检只负责给出清晰文案，
+    // 真正的占用交给事务内的条件更新（并发下只有一方成功）。
+    // 不存在的 angleId 保持原有处理方式（不新增 404，落库时按原外键行为失败）。
+    if (body.angleId != null) {
+      const ang = await prisma.angle.findUnique({
+        where: { id: body.angleId },
+        select: { id: true, theme: true, status: true, used: true },
+      });
+      if (ang) {
+        assertAngleApproved(ang);
+        if (ang.used) {
+          throw new ConflictError(
+            `选题「${ang.theme}」已被占用（已用于其他文章），不能重复用于新建文章；如需再用请先归还该选题`,
+          );
+        }
+      }
     }
 
     const { parsed, rendered } = await build(body.contentHtml, {
@@ -186,24 +246,30 @@ articlesRouter.post(
       digest: body.digest,
     });
 
-    const article = await prisma.article.create({
-      data: {
-        trackId: body.trackId ?? null,
-        accountId: body.accountId ?? null,
-        angleId: body.angleId ?? null,
-        title: rendered.title,
-        digest: rendered.digest,
-        contentHtml: body.contentHtml,
-        contentWechat: rendered.contentWechat,
-        // 这是外部唯一能直接写 coverPath 的入口，必须归一化成相对路径，
-        // 否则一台机器的绝对路径被固化进库，换机器后静默无封面。
-        coverPath: body.coverPath ? toRelativeCoverPath(body.coverPath.trim()) : '',
-        blocks: parsed.h2Count + parsed.pCount,
-        chars: parsed.charCount,
-        idempotencyKey: randomUUID(),
-        pushDate: '',
-        status: 'draft',
-      },
+    // 占题与建稿同一事务（R4）：创建失败 → 占用自动回滚，不会留下「被占但没有文章」的题。
+    const article = await prisma.$transaction(async (tx) => {
+      if (body.angleId != null) {
+        await claimAngleInTx(tx, body.angleId, owner);
+      }
+      return tx.article.create({
+        data: {
+          trackId: body.trackId ?? null,
+          accountId: body.accountId ?? null,
+          angleId: body.angleId ?? null,
+          title: rendered.title,
+          digest: rendered.digest,
+          contentHtml: body.contentHtml,
+          contentWechat: rendered.contentWechat,
+          // 这是外部唯一能直接写 coverPath 的入口，必须归一化成相对路径，
+          // 否则一台机器的绝对路径被固化进库，换机器后静默无封面。
+          coverPath: body.coverPath ? toRelativeCoverPath(body.coverPath.trim()) : '',
+          blocks: parsed.h2Count + parsed.pCount,
+          chars: parsed.charCount,
+          idempotencyKey: randomUUID(),
+          pushDate: '',
+          status: 'draft',
+        },
+      });
     });
 
     res.status(201).json({
@@ -221,13 +287,23 @@ articlesRouter.post(
 );
 
 /**
- * 列表：供前端文章页使用。支持 status / accountId / angleId / pipeline 过滤与分页。
+ * 列表：供前端文章页使用。支持 status / needs / accountId / angleId / pipeline 过滤与分页。
  * 默认按创建时间倒序，返回精简字段（不含正文，避免列表响应过大）。
+ *
+ * `needs`（S5-UI-2-D-2）：工作台待办的专项筛选，只认 `draft_unpushed` / `repush`，
+ * 非法值按未传处理（不 400，与 pipeline 的处理风格一致）。
+ *   - 与 `status` **互斥**：同传时 needs 优先，status 被忽略（两套条件叠起来只会互相打架）。
+ *   - 隐含 `pipeline='article'`：漫画草稿不属于这两类待办，天然排除。
+ *   - 可与 accountId / angleId / limit / offset 叠加；member 归属过滤照常生效。
+ *   - items 与 total 共用同一个 where，禁止任何一侧另算。
  */
 articlesRouter.get(
   '/',
   asyncHandler(async (req, res) => {
     const status = typeof req.query.status === 'string' && req.query.status ? req.query.status : undefined;
+    const needsRaw = typeof req.query.needs === 'string' ? req.query.needs : '';
+    const needs: 'draft_unpushed' | 'repush' | undefined =
+      needsRaw === 'draft_unpushed' || needsRaw === 'repush' ? needsRaw : undefined;
     const accountId = req.query.accountId ? Number(req.query.accountId) : undefined;
     const angleId = req.query.angleId ? Number(req.query.angleId) : undefined;
     // 产线过滤：'article' | 'comic'；不传则不过滤（兼容旧前端）
@@ -240,11 +316,37 @@ articlesRouter.get(
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 100) : 20;
     const offset = Number.isFinite(offsetRaw) ? Math.max(offsetRaw, 0) : 0;
 
+    const principal = requirePrincipal(req);
     const where: Record<string, unknown> = {};
-    if (status) where.status = status;
+    if (needs) {
+      // needs 优先：与 status / pipeline 同传时以 needs 为准（pipeline 由 needs 固定为 article）
+      where.pipeline = 'article';
+      if (needs === 'draft_unpushed') {
+        // 从未推送过：状态是草稿，且两个推送事实字段都为空。
+        // 只判 ''（不用 TRIM / Raw SQL）：写入侧只产生 '' 或真实值，幻影空白属人工改库，
+        // 由 smoke 的空白监测兜底（见 scripts/smoke-dashboard.ts 的 [10] 段）。
+        where.status = 'draft';
+        where.mediaId = '';
+        where.pushDate = '';
+      } else {
+        // 待重推：已改写等推送（updated），或草稿态但曾有推送痕迹（如换封面被退回 draft）。
+        // 后者必须用 OR 表达「两个字段任一非空」，且与 status='draft' 是 AND 关系。
+        where.OR = [
+          { status: 'updated' },
+          {
+            status: 'draft',
+            OR: [{ mediaId: { not: '' } }, { pushDate: { not: '' } }],
+          },
+        ];
+      }
+    } else {
+      if (status) where.status = status;
+      if (pipeline) where.pipeline = pipeline;
+    }
     if (accountId && Number.isFinite(accountId)) where.accountId = accountId;
     if (angleId && Number.isFinite(angleId)) where.angleId = angleId;
-    if (pipeline) where.pipeline = pipeline;
+    // P3 归属过滤：member 只见自己账号名下的文章
+    if (!isAdmin(principal)) where.account = { ownerUserId: principal.userId ?? -1 };
 
     const [rows, total] = await Promise.all([
       prisma.article.findMany({
@@ -270,7 +372,7 @@ articlesRouter.get(
 
     const accIds = [...new Set(rows.map((r) => r.accountId).filter((x): x is number => x != null))];
     const accs = accIds.length
-      ? await prisma.account.findMany({ where: { id: { in: accIds } }, select: { id: true, name: true } })
+      ? await prisma.oAAccount.findMany({ where: { id: { in: accIds } }, select: { id: true, name: true } })
       : [];
     const nameById = new Map(accs.map((a) => [a.id, a.name] as const));
 
@@ -288,6 +390,8 @@ articlesRouter.get(
         blocks: r.blocks,
         mediaId: r.mediaId,
         pushDate: r.pushDate,
+        // 产线标识（S5-UI-3-3 · A）：select 已含该字段，列表据此区分文章/漫画。
+        pipeline: r.pipeline,
         createdAt: r.createdAt.toISOString(),
       })),
     });
@@ -298,7 +402,8 @@ articlesRouter.get(
   '/:id',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
-    const a = await prisma.article.findUnique({ where: { id } });
+    const a = await prisma.article.findUnique({ where: { id }, include: { account: { select: { ownerUserId: true } }, track: { select: { name: true } } } });
+    assertArticleAccess(requirePrincipal(req), a, id);
     if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
     res.json({
       id: a.id,
@@ -330,34 +435,42 @@ articlesRouter.get(
  * 删除单篇文章。角度回收语义与 deleteAccount 一致：
  *  - 未送达微信（draft/updated/failed）的文章，其占用的角度归还池中，可再次选题；
  *  - 已推送（pushed）的不归还，否则同一选题会被再写一遍。
+ *
+ * 语义实现放在 services/article-delete.ts：批量删除复用同一份规则，避免两边漂移。
  */
 articlesRouter.delete(
   '/:id',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
-    const result = await prisma.$transaction(async (tx) => {
-      const a = await tx.article.findUnique({
-        where: { id },
-        select: { id: true, title: true, status: true, angleId: true },
-      });
-      if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
-
-      let recycledAngle = false;
-      if (a.status !== 'pushed' && a.angleId != null) {
-        // 用 updateMany 而非 update：选题可能已被手动删除（那时 angleId 会先被置空，
-        // 但并发读到旧值时 update 会抛 P2025 变成 500）。updateMany 找不到就影响 0 行。
-        const back = await tx.angle.updateMany({
-          where: { id: a.angleId },
-          data: { used: false, usedBy: '', usedDate: null },
-        });
-        recycledAngle = back.count > 0;
-      }
-
-      await tx.article.delete({ where: { id } });
-      return { id: a.id, title: a.title, recycledAngle };
-    });
-
+    const principal = requirePrincipal(req);
+    const result = await deleteArticleById(id, principal);
     res.json({ ok: true, ...result });
+  }),
+);
+
+/**
+ * 批量删除文章。
+ *
+ * 与单条删除共用 services/article-delete.ts 的角度回收规则。
+ * 逐条独立执行：一条失败不影响其余，失败原因原样返回给前端展示。
+ *
+ * 路由顺序：'/bulk-delete' 是字母路径，必须排在 '/:id(\\d+)' 之前
+ * （虽然数字约束本身也能挡住，但按项目约定固定路径一律前置）。
+ */
+articlesRouter.post(
+  '/bulk-delete',
+  asyncHandler(async (req, res) => {
+    const { ids } = bulkDeleteSchema.parse(req.body ?? {});
+    const principal = requirePrincipal(req);
+    const result = await runBulkDelete(
+      ids,
+      async (id) => {
+        const r = await deleteArticleById(id, principal);
+        return { recycledAngles: r.recycledAngle ? 1 : 0 };
+      },
+      '文章',
+    );
+    res.json(result);
   }),
 );
 
@@ -366,7 +479,8 @@ articlesRouter.get(
   '/:id/preview',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
-    const a = await prisma.article.findUnique({ where: { id } });
+    const a = await prisma.article.findUnique({ where: { id }, include: { account: { select: { ownerUserId: true } }, track: { select: { name: true } } } });
+    assertArticleAccess(requirePrincipal(req), a, id);
     if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
     const { parsed, rendered } = await build(a.contentHtml, {});
 
@@ -377,24 +491,50 @@ articlesRouter.get(
       const pending = await prisma.comicPanel.count({
         where: { articleId: id, status: { not: 'success' } },
       });
-      const ready = pending === 0 && !!a.contentWechat;
+      // 已落库的推送产物（微信图床 URL）优先，维持「预览 = 推送产物」
+      let contentWechat: string | null = pending === 0 && a.contentWechat ? a.contentWechat : null;
+      const comicReady = contentWechat !== null;
+      let message = '';
+      if (pending === 0 && contentWechat === null) {
+        // 全格成功但尚未上传（本地开发常见：出口 IP 不在微信白名单，上传撞 40164）→
+        // 用本地文件组同序「金句卡 + 插图」序列：预览立即可见，推送时仍替换为图床 URL
+        const local = await buildLocalComicPreview(a);
+        if (local.ok) {
+          contentWechat = local.html;
+          message = '本地预览：图片为本地文件（未上传微信），推送时自动替换为图床链接';
+        } else {
+          message = local.message;
+        }
+      } else if (!comicReady) {
+        message = `插图未就绪（还差 ${pending} 格），当前显示的是台词脚本`;
+      }
       res.json({
         id: a.id,
         title: a.title,
         digest: a.digest,
-        contentWechat: ready ? a.contentWechat : rendered.contentWechat,
+        contentWechat: contentWechat ?? rendered.contentWechat,
         h2Count: parsed.h2Count,
         pCount: parsed.pCount,
         charCount: parsed.charCount,
         boldCount: parsed.boldCount,
         warnings: parsed.warnings,
-        comicReady: ready,
+        // comicReady 语义不变：是否为落库的推送产物（本地预览=false，推送门禁不受影响）
+        comicReady,
         comicPending: pending,
-        message: ready ? '' : `插图未就绪（还差 ${pending} 格），当前显示的是台词脚本`,
+        message,
       });
       return;
     }
 
+    // 成稿体检：与推送门禁同一套规则，改稿页据此提示「现在能不能推、还差什么」。
+    // checks 与 relax 必须取自同一条 `r:{赛道}` 规则：漏传 relax 会让配置页配的 warn 豁免失效。
+    const lintRule = a.pipeline === 'comic' ? null : await loadTrackRule(a.track?.name ?? '');
+    // 最近一次存档（S4-3）：只读不写——预览是「打开页面就看一眼」的动作，不该在历史里
+    // 刷出一堆 page_view 记录；要留痕走「重新检查」按钮（已在 GET /:id/lint）。
+    // stale=true 表示存档所对应的正文已不是当前正文（改过稿但没保存/保存时没落成），
+    // 前端据此提示「存档结果已过期」，避免把旧结论当现行结论展示。
+    const lastRun = lintRule ? await latestLintRun(a.id) : null;
+    const curHash = lintRule ? htmlFingerprint(a.contentHtml) : '';
     res.json({
       id: a.id,
       title: rendered.title,
@@ -405,24 +545,73 @@ articlesRouter.get(
       charCount: parsed.charCount,
       boldCount: parsed.boldCount,
       warnings: parsed.warnings,
-      // 成稿体检：与推送门禁同一套规则，改稿页据此提示「现在能不能推、还差什么」。
-      lint: a.pipeline === 'comic' ? null : lintArticle(a.contentHtml, parsed),
+      lint: lintRule ? lintArticle(a.contentHtml, parsed, a.track?.name ?? '', lintRule.checks, lintRule.relax) : null,
+      lintRun: lastRun,
+      lintRunStale: lastRun ? lastRun.contentHash !== curHash : false,
+      contentHash: curHash,
     });
   }),
 );
 
 /**
- * 成稿体检：只算不落库，返回与推送门禁完全一致的判定。
- * 漫画产线不适用（正文是图片序列），返回 lint:null。
+ * 成稿体检：算 + 落库，返回与推送门禁完全一致的判定。
+ * 漫画产线不适用（正文是图片序列），返回 lint:null、lintRun:null。
+ *
+ * 落库口径（S4-3）：每调用一次就新增一行历史（trigger='check'），不覆盖既有记录。
+ * 落库失败不改变体检结论，但**必须**在响应里显式告知（lintPersistError），
+ * 不允许把「检查成功、没存档」渲染成一切正常。
  */
 articlesRouter.get(
   '/:id/lint',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
-    const a = await prisma.article.findUnique({ where: { id } });
+    const a = await prisma.article.findUnique({ where: { id }, include: { account: { select: { ownerUserId: true } }, track: { select: { name: true } } } });
+    assertArticleAccess(requirePrincipal(req), a, id);
     if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
-    const lint = a.pipeline === 'comic' ? null : lintArticle(a.contentHtml);
-    res.json({ id: a.id, pipeline: a.pipeline, lint });
+    const trackName = a.track?.name ?? '';
+    const rule = a.pipeline === 'comic' ? null : await loadTrackRule(trackName);
+    const lint = rule ? lintArticle(a.contentHtml, undefined, trackName, rule.checks, rule.relax) : null;
+    let lintRun: LintRunBrief | null = null;
+    let lintPersistError: string | undefined;
+    if (rule && lint) {
+      const rec = await recordLintRun({
+        articleId: a.id,
+        trigger: 'check',
+        report: lint,
+        contentHtml: a.contentHtml,
+        rule: { checks: rule.checks, relax: rule.relax },
+      });
+      lintRun = rec.run ?? null;
+      lintPersistError = rec.error;
+    }
+    res.json({
+      id: a.id,
+      pipeline: a.pipeline,
+      lint,
+      lintRun,
+      ...(lintPersistError ? { lintPersistError } : {}),
+    });
+  }),
+);
+
+/**
+ * 历史检查记录（新的在前）：回答「这篇以前体检过几次、每次什么结论」。
+ * 只读，不改写任何行——历史是既成事实，重算会变成伪造追溯。
+ */
+articlesRouter.get(
+  '/:id/lint-runs',
+  asyncHandler(async (req, res) => {
+    const id = idParam.parse(req.params.id);
+    const limitRaw = req.query.limit ? Number(req.query.limit) : 20;
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 100) : 20;
+    const a = await prisma.article.findUnique({
+      where: { id },
+      select: { id: true, pipeline: true, accountId: true, account: { select: { ownerUserId: true } } },
+    });
+    assertArticleAccess(requirePrincipal(req), a, id);
+    if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
+    const items = a.pipeline === 'comic' ? [] : await listLintRuns(a.id, limit);
+    res.json({ id: a.id, items });
   }),
 );
 
@@ -432,7 +621,8 @@ articlesRouter.put(
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
     const body = updateContentSchema.parse(req.body);
-    const a = await prisma.article.findUnique({ where: { id } });
+    const a = await prisma.article.findUnique({ where: { id }, include: { account: { select: { ownerUserId: true } }, track: { select: { name: true } } } });
+    assertArticleAccess(requirePrincipal(req), a, id);
     if (!a) throw new NotFoundError(`文章 ${id} 不存在`);
 
     const { parsed, rendered } = await build(body.contentHtml, {});
@@ -462,6 +652,26 @@ articlesRouter.put(
       },
     });
 
+    // 保存即体检并留痕（trigger='save'）：改稿的动作与当时的结论绑在一条时间线上，
+    // 「改完这版到底过没过、和上一版比少了哪几条」不再需要事后猜。
+    const lintRule = a.pipeline === 'comic' ? null : await loadTrackRule(a.track?.name ?? '');
+    const lint = lintRule
+      ? lintArticle(body.contentHtml, parsed, a.track?.name ?? '', lintRule.checks, lintRule.relax)
+      : null;
+    let lintRun: LintRunBrief | null = null;
+    let lintPersistError: string | undefined;
+    if (lintRule && lint) {
+      const rec = await recordLintRun({
+        articleId: updated.id,
+        trigger: 'save',
+        report: lint,
+        contentHtml: body.contentHtml,
+        rule: { checks: lintRule.checks, relax: lintRule.relax },
+      });
+      lintRun = rec.run ?? null;
+      // 正文已保存成功，留痕失败不回滚、也不改成 500——但必须让调用方看见（不静默）。
+      lintPersistError = rec.error;
+    }
     res.json({
       id: updated.id,
       title: rendered.title,
@@ -473,7 +683,9 @@ articlesRouter.put(
       boldCount: parsed.boldCount,
       status: updated.status,
       warnings: parsed.warnings,
-      lint: a.pipeline === 'comic' ? null : lintArticle(body.contentHtml, parsed),
+      lint,
+      lintRun,
+      ...(lintPersistError ? { lintPersistError } : {}),
     });
   }),
 );
@@ -487,6 +699,9 @@ articlesRouter.post(
   '/:id/push',
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
+    // P3 入口层归属校验（pushArticleToDraft 服务层另有兜底）
+    const pa = await prisma.article.findUnique({ where: { id }, select: { accountId: true, account: { select: { ownerUserId: true } } } });
+    assertArticleAccess(requirePrincipal(req), { accountId: pa?.accountId ?? null, account: pa?.account ?? null }, id);
     const result = await pushArticleToDraft(id);
     res.status(200).json(result);
   }),
@@ -510,6 +725,8 @@ articlesRouter.post(
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
     const body = coverSchema.parse(req.body ?? {});
+    const pa = await prisma.article.findUnique({ where: { id }, select: { accountId: true, account: { select: { ownerUserId: true } } } });
+    assertArticleAccess(requirePrincipal(req), { accountId: pa?.accountId ?? null, account: pa?.account ?? null }, id);
     const result = await generateCoverForArticle(id, body);
     res.status(200).json(result);
   }),

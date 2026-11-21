@@ -11,11 +11,19 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../db.ts';
+import { assertAccountAccess, isAdmin, requirePrincipal } from '../../services/ownership.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { requirePermission } from '../permissions.ts';
 import { NotFoundError } from '../../errors.ts';
 import { buildPlan, runPipelineForAccount } from '../../services/planner.ts';
 
 const plansRouter = Router();
+
+// P2 RBAC：看计划=data:view，手动触发排产=content:generate
+plansRouter.use((req, res, next) => {
+  const perm = req.method === 'GET' ? 'data:view' : 'content:generate';
+  return requirePermission(perm)(req, res, next);
+});
 
 const triggerSchema = z.object({
   accountId: z.number().int().positive(),
@@ -30,7 +38,12 @@ plansRouter.get(
   asyncHandler(async (req, res) => {
     const target = typeof req.query.account === 'string' ? req.query.account : undefined;
     const backlogDays = req.query.backlogDays ? Number(req.query.backlogDays) : 3;
-    const plan = await buildPlan(target, Number.isFinite(backlogDays) ? backlogDays : 3);
+    const principal = requirePrincipal(req);
+    const plan = await buildPlan(
+      target,
+      Number.isFinite(backlogDays) ? backlogDays : 3,
+      isAdmin(principal) ? null : principal.userId,
+    );
     res.json(plan);
   }),
 );
@@ -40,22 +53,37 @@ plansRouter.post(
   '/trigger',
   asyncHandler(async (req, res) => {
     const body = triggerSchema.parse(req.body);
-    const acc = await prisma.account.findUnique({ where: { id: body.accountId } });
+    const acc = await prisma.oAAccount.findUnique({ where: { id: body.accountId } });
+    assertAccountAccess(requirePrincipal(req), acc, body.accountId);
     if (!acc) throw new NotFoundError(`账号 ${body.accountId} 不存在`);
 
     const result = await runPipelineForAccount(body.accountId, body.pipeline ?? 'article', body.count);
 
+    // 结果语义（S5-UI-5-P1）：ok 只看真实创建的文章，不把失败/跳过算成功。
+    const succeeded = result.created.length;
+    const failed = result.failed.length;
+    const skipped = result.skipped;
+    let message: string;
+    if (succeeded > 0 && failed === 0) {
+      message = `已为「${result.account}」生成 ${succeeded} 篇草稿`;
+    } else if (succeeded > 0 && failed > 0) {
+      message = `已为「${result.account}」生成 ${succeeded} 篇草稿，${failed} 篇失败`;
+    } else if (failed > 0) {
+      message = `本批 ${failed} 篇建稿失败，未生成草稿：${result.failed.map((f) => f.note).join('；').slice(0, 200)}`;
+    } else {
+      // 无成功、无失败：全部跳过（配额满 / 无可消费选题），用后端给出的真实原因。
+      message = result.reason ?? '本批未生成草稿（无可排产选题）';
+    }
     res.status(200).json({
-      ok: result.created.length > 0,
+      ok: succeeded > 0,
       accountId: result.accountId,
       account: result.account,
       need: result.need,
       created: result.created,
+      failed: result.failed,
+      skipped,
       reason: result.reason ?? null,
-      message:
-        result.created.length > 0
-          ? `已为「${result.account}」生成 ${result.created.length} 篇草稿`
-          : result.reason ?? '未生成',
+      message,
     });
   }),
 );

@@ -120,8 +120,16 @@ function toUnits(inner: string): Unit[] {
 /**
  * 把句子按目标长度重新打包成 <p>。
  * 超过 hardMax 的单个长句无法再切（已在句边界），只能单独成段，交由体检提示。
+ *
+ * ⚠️ `startIdx` 必须**跨小节连续**，不能每节从 0 开始。
+ * 2026-11-11 实测踩到的坑：阶梯原本在每节都从第 0 项重新取，
+ * 于是每一节的段长节奏**一模一样**（实测 4 节的段长序列分别是
+ * [35,122,46,105,60,34] / [41,116,42,98,64,63] / [39,127,50,108,59,50] / [38,119,31,107,59,79]），
+ * 各节段数齐齐整整 [6,6,6,6]——这正是 AI 检测器说的「结构高度规整」。
+ * 阶梯本来就是用来造**全篇**长短差的，让它每节重启等于自己制造模板感。
+ * 现在阶梯跨节连续走，各节的段长节奏自然错开。
  */
-function packUnits(units: Unit[], o: Required<ReflowOptions>): string[] {
+function packUnits(units: Unit[], o: Required<ReflowOptions>, startIdx: number): string[] {
   const out: string[] = [];
   let buf: string[] = [];
   let len = 0;
@@ -134,7 +142,8 @@ function packUnits(units: Unit[], o: Required<ReflowOptions>): string[] {
   };
   for (const u of units) {
     // 每段的目标长度沿阶梯走，制造长短差；targetMax 只作上限裁剪。
-    const target = Math.min(ladder[out.length % ladder.length] ?? o.targetMax, o.targetMax);
+    // 阶梯下标跨小节连续（startIdx + 已产出的段数），避免每节节奏雷同。
+    const target = Math.min(ladder[(startIdx + out.length) % ladder.length] ?? o.targetMax, o.targetMax);
     if (buf.length > 0 && (len + u.len > target || len >= o.hardMax)) flush();
     buf.push(u.text);
     len += u.len;
@@ -159,7 +168,8 @@ export function reflowParagraphs(html: string, opts: ReflowOptions = {}): Reflow
 
   const flush = (): void => {
     if (pending.length === 0) return;
-    const packed = packUnits(pending, o);
+    // 阶梯下标跨小节连续：startIdx 传已产出的总段数。
+    const packed = packUnits(pending, o, after);
     after += packed.length;
     out.push(...packed);
     pending = [];

@@ -1,0 +1,100 @@
+$ npm run smoke:angles
+npm warn Unknown user config "home". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+
+> wechat-pipeline-server@0.1.0 smoke:angles
+> node --experimental-strip-types scripts/smoke-isolated.ts run angles
+
+════════════════════════════════════════════════════════
+[t0] RUN target=angles  timeout=300000ms
+[t0] REAL      = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.db
+[t0] ISOLATED  = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.smoke-mweieaunnf6v.db
+[t0] CONTENT   = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\var\tmp\smoke-iso-mweieaunnf6v\content
+[t0] ENV-ALLOW = PATH, SYSTEMROOT, WINDIR, TEMP, TMP, LANG, TZ + DATABASE_URL/CONTENT_DIR/NODE_ENV（其余剥离：APP_SECRET_KEY、一切 *TOKEN/*SECRET/*KEY、代理变量）
+[t0] NET       = Node 层网络入口隔离（smoke-net-guard），非 OS 级全网络隔离
+[t0] NOTE Windows 下隔离库文件权限由 ACL 继承（POSIX 场景 chmod 0600）
+[t0] WRITER-SCAN …
+[t0] WRITER-SCAN ok（8787 未监听 / 无 scheduler 进程）
+[t0] REAL-FP  K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.db sha256=fea0f12373a54678165f95651e358552e5eae17031046052aaff560dc86fc3f5 size=974848 mtime=1794460805028
+[t0] REAL-WAL = absent
+[t0] ISO-CREATE prisma db push → dev.smoke-mweieaunnf6v.db
+[t0] ISO-CREATE ok（schema-only）
+[t0] ISO-VERIFY ② database_list = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.smoke-mweieaunnf6v.db
+[t0] ISO-EMPTY tables=15/15 rows=0
+[t0] ISO-VERIFY PASS（落盘 / 连接实测 / 表结构 / 行数=0）
+[t0] ENV-INJECT readback ok
+[t0] SPAWN node --import file:///K:/WorkBuddy%20WorkSpace/project/wechat-pipeline-cloud/server/scripts/smoke-net-guard.mjs --experimental-strip-types K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\scripts\smoke-run.ts angles
+[smoke-net-guard] loaded（Node 层网络入口隔离，非 OS 级全网络隔离）pid=8812
+[smoke-db-guard] REAL      = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.db
+[smoke-db-guard] ISOLATED  = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.smoke-mweieaunnf6v.db
+[smoke-db-guard] PASS（命名 / 路径归一反真实库 / 目录 / 落盘 校验通过）
+[smoke-run] import ./smoke-angles.ts …
+[smoke-net-guard] BLOCKED child_process.execSync → 子进程不在冒烟放行范围：chcp 65001
+[smoke-net-guard] listen(0) 未指定 host → 强制绑定 127.0.0.1（规则 1）
+[smoke-net-guard] REGISTERED 127.0.0.1:62981
+[auth] SMOKE_NO_AUTH=1：鉴权已旁路（仅限冒烟，生产环境无效）
+{"level":30,"time":"2026-11-13T05:01:15.986Z","env":"development","reqId":1,"ip":"127.0.0.1","msg":"GET /api/angles/?trackId=1 -> 200 (31ms)"}
+  PASS  1 列表 total=3
+  PASS  1 列表含 articleCount 字段
+  PASS  1 列表含正文 content
+{"level":30,"time":"2026-11-13T05:01:15.998Z","env":"development","reqId":2,"ip":"127.0.0.1","msg":"GET /api/angles/?trackId=1&used=unused -> 200 (2ms)"}
+  PASS  2 used=unused → 2 条
+{"level":30,"time":"2026-11-13T05:01:16.004Z","env":"development","reqId":3,"ip":"127.0.0.1","msg":"GET /api/angles/?trackId=1&used=used -> 200 (2ms)"}
+  PASS  2 used=used → 1 条
+{"level":30,"time":"2026-11-13T05:01:16.009Z","env":"development","reqId":4,"ip":"127.0.0.1","msg":"GET /api/angles/?trackId=1&keyword=%E5%85%B4%E8%B6%A3%E7%8F%AD -> 200 (2ms)"}
+  PASS  3 keyword 命中 content
+{"level":30,"time":"2026-11-13T05:01:16.013Z","env":"development","reqId":5,"ip":"127.0.0.1","msg":"GET /api/angles/?trackId=1&keyword=%E8%B5%B7%E5%BA%8A%E6%88%98%E4%BA%89 -> 200 (2ms)"}
+  PASS  3 keyword 命中 theme
+{"level":30,"time":"2026-11-13T05:01:16.017Z","env":"development","reqId":6,"ip":"127.0.0.1","msg":"GET /api/angles/?trackId=1&limit=2&offset=0 -> 200 (1ms)"}
+  PASS  4 分页 items=2 且 total 仍=3
+{"level":40,"time":"2026-11-13T05:01:16.021Z","env":"development","reqId":7,"ip":"127.0.0.1","msg":"GET /api/angles/ -> 400 (1ms)"}
+  PASS  5 缺 trackId → 400
+{"level":40,"time":"2026-11-13T05:01:16.024Z","env":"development","reqId":8,"ip":"127.0.0.1","msg":"GET /api/angles/?trackId=abc -> 400 (1ms)"}
+  PASS  5 trackId=abc → 400
+{"level":30,"time":"2026-11-13T05:01:16.028Z","env":"development","reqId":9,"ip":"127.0.0.1","msg":"GET /api/angles/?trackId=999999 -> 200 (2ms)"}
+  PASS  6 不存在赛道 → 200 total=0
+{"level":30,"time":"2026-11-13T05:01:16.160Z","env":"development","id":4,"trackId":1,"source":"manual","scope":"article","msg":"手动新增选题"}
+{"level":30,"time":"2026-11-13T05:01:16.161Z","env":"development","reqId":10,"ip":"127.0.0.1","msg":"POST /api/angles/ -> 201 (60ms)"}
+  PASS  7 新增 → 201
+  PASS  7 新增 seq=max+1(4)
+  PASS  7 新增 code ≤32 且非空
+  PASS  7 新增 used=false 且 source=manual
+{"level":30,"time":"2026-11-13T05:01:16.210Z","env":"development","id":5,"trackId":1,"source":"manual","scope":"article","msg":"手动新增选题"}
+{"level":30,"time":"2026-11-13T05:01:16.211Z","env":"development","reqId":11,"ip":"127.0.0.1","msg":"POST /api/angles/ -> 201 (47ms)"}
+  PASS  7 再新增 seq=5 且 code 不重复
+{"level":40,"time":"2026-11-13T05:01:16.214Z","env":"development","reqId":12,"ip":"127.0.0.1","msg":"POST /api/angles/ -> 400 (0ms)"}
+  PASS  8 content 空 → 400
+{"level":40,"time":"2026-11-13T05:01:16.219Z","env":"development","reqId":13,"ip":"127.0.0.1","msg":"POST /api/angles/ -> 400 (0ms)"}
+  PASS  8 content 501 字 → 400
+{"level":40,"time":"2026-11-13T05:01:16.223Z","env":"development","code":"not_found","status":404,"msg":"赛道 999999 不存在"}
+{"level":40,"time":"2026-11-13T05:01:16.223Z","env":"development","reqId":14,"ip":"127.0.0.1","msg":"POST /api/angles/ -> 404 (1ms)"}
+  PASS  9 新增到不存在赛道 → 404
+{"level":30,"time":"2026-11-13T05:01:16.292Z","env":"development","reqId":15,"ip":"127.0.0.1","msg":"PUT /api/angles/1 -> 200 (67ms)"}
+  PASS  10 编辑生效
+{"level":30,"time":"2026-11-13T05:01:16.345Z","env":"development","reqId":16,"ip":"127.0.0.1","msg":"PUT /api/angles/1 -> 200 (50ms)"}
+  PASS  11 传 used/usedBy 不改消费态
+{"level":40,"time":"2026-11-13T05:01:16.348Z","env":"development","code":"not_found","status":404,"msg":"选题 999999 不存在"}
+{"level":40,"time":"2026-11-13T05:01:16.348Z","env":"development","reqId":17,"ip":"127.0.0.1","msg":"PUT /api/angles/999999 -> 404 (1ms)"}
+  PASS  12 编辑不存在 → 404
+{"level":30,"time":"2026-11-13T05:01:16.444Z","env":"development","id":2,"trackId":1,"used":false,"unlinkedArticles":0,"msg":"删除选题"}
+{"level":30,"time":"2026-11-13T05:01:16.445Z","env":"development","reqId":18,"ip":"127.0.0.1","msg":"DELETE /api/angles/2 -> 200 (94ms)"}
+  PASS  13 删未用 → unlinkedArticles=0
+{"level":30,"time":"2026-11-13T05:01:16.489Z","env":"development","id":3,"trackId":1,"used":true,"unlinkedArticles":1,"msg":"删除选题"}
+{"level":30,"time":"2026-11-13T05:01:16.490Z","env":"development","reqId":19,"ip":"127.0.0.1","msg":"DELETE /api/angles/3 -> 200 (43ms)"}
+  PASS  14 删已用 → unlinkedArticles=1 且 used=true
+  PASS  14 文章 angleId 已置空
+  PASS  14 文章正文不受影响
+{"level":40,"time":"2026-11-13T05:01:16.494Z","env":"development","code":"not_found","status":404,"msg":"选题 3 不存在"}
+{"level":40,"time":"2026-11-13T05:01:16.495Z","env":"development","reqId":20,"ip":"127.0.0.1","msg":"DELETE /api/angles/3 -> 404 (1ms)"}
+  PASS  15 重复删除 → 404
+{"level":40,"time":"2026-11-13T05:01:16.500Z","env":"development","reqId":21,"ip":"127.0.0.1","msg":"DELETE /api/angles/abc -> 404 (1ms)"}
+  PASS  16 DELETE /abc → 404
+{"level":30,"time":"2026-11-13T05:01:16.505Z","env":"development","reqId":22,"ip":"127.0.0.1","msg":"GET /api/tracks -> 200 (2ms)"}
+  PASS  17 赛道 angleTotal 已同步为 3
+{"level":30,"time":"2026-11-13T05:01:16.606Z","env":"development","reqId":23,"ip":"127.0.0.1","msg":"DELETE /api/articles/1 -> 200 (99ms)"}
+  PASS  18 删文章 → 200 且 recycledAngle=false
+
+SMOKE ANGLES: ALL PASS (30 项)
+[t0] CHILD EXIT = 0
+[t0] CLEANUP ok（隔离库与临时内容目录已删除）
+[t0] REAL-DB FINGERPRINT MATCH（原库零写入）
+EXIT_CODE=0

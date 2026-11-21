@@ -1,8 +1,7 @@
 /**
  * Prisma 客户端单例。
  *
- * 注意：本地用 SQLite schema 生成过 client 后，切回 MySQL 需要重新
- * `npm run prisma:generate`，因为两者共用同一个生成目录。
+ * 注意：改 prisma/schema.prisma 后需重新 `npm run prisma:generate`。
  */
 
 import { PrismaClient } from '@prisma/client';
@@ -22,18 +21,13 @@ export async function checkDb(): Promise<boolean> {
 }
 
 /**
- * 命名锁，防止排产等动作并发重入。
- *
- * MySQL 用 GET_LOCK；SQLite 无此能力，退化为直接放行（本地开发单进程够用）。
+ * 命名锁，防止排产等动作并发重入（MySQL GET_LOCK）。
  */
 export async function withLock<T>(
   name: string,
   timeoutSec: number,
   fn: () => Promise<T>,
 ): Promise<T | null> {
-  const isSqlite = (process.env.DATABASE_URL ?? '').startsWith('file:');
-  if (isSqlite) return fn();
-
   const rows = (await prisma.$queryRawUnsafe(
     'SELECT GET_LOCK(?, ?) AS got',
     name,

@@ -733,12 +733,23 @@ async function mcpExtractImages(result: Record<string, unknown>, base: string, a
     const o = item as Record<string, unknown>;
     for (const key of ['text', 'json', 'content', 'data']) {
       if (typeof o[key] === 'string') {
+        const s = o[key] as string;
         try {
-          const parsed = JSON.parse(o[key] as string) as unknown;
+          const parsed = JSON.parse(s) as unknown;
           const found = await mcpImagesFromValue(parsed, base, apiKey);
           if (found.length > 0) return found;
         } catch {
-          // 非 JSON，忽略
+          // 非 JSON：真实上游会回 Python repr（含 'url'/'path' 的单引号列表），按 URL 扫
+          const urlHit = s.match(/https?:\/\/[^\s'"\\)\]]+/);
+          if (urlHit) {
+            const found = await mcpImagesFromValue(urlHit[0], base, apiKey);
+            if (found.length > 0) return found;
+          }
+          const pathHit = s.match(/\/tmp\/gradio\/[^'"\s\]]+/);
+          if (pathHit) {
+            const found = await mcpImagesFromValue(`/gradio_api/file=${pathHit[0]}`, base, apiKey);
+            if (found.length > 0) return found;
+          }
         }
       }
     }

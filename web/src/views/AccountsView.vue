@@ -2,10 +2,11 @@
 import { Connection, Delete, Edit, Plus, Refresh, Search } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import type { FormInstance, FormRules } from 'element-plus';
-import { computed, nextTick, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 
 import { errMsg } from '../api/http.ts';
 import {
+  bulkDeleteCredentials,
   createCredential,
   deleteCredential,
   listArticles,
@@ -14,10 +15,14 @@ import {
   testCredential,
   updateCredential,
 } from '../api/index.ts';
+import BatchBar from '../components/BatchBar.vue';
+import EmptyState from '../components/EmptyState.vue';
+import PageHead from '../components/PageHead.vue';
 import StateError from '../components/StateError.vue';
 import RowActions, { type RowAction } from '../components/RowActions.vue';
+import { useBatchDelete } from '../composables/useBatchDelete.ts';
 import type { CredentialItem, TrackItem } from '../types.ts';
-import { credTag, credText } from '../utils/format.ts';
+import { credHint, credTag, credText } from '../utils/format.ts';
 
 const items = ref<CredentialItem[]>([]);
 const loading = ref(false);
@@ -67,7 +72,7 @@ const rows = computed(() => {
   );
 });
 
-const readyCount = computed(() => items.value.filter((i) => i.credStatus === 'ok').length);
+const credOkCount = computed(() => items.value.filter((i) => i.credStatus === 'ok').length);
 
 function trackName(trackId: number): string {
   return tracks.value.find((t) => t.id === trackId)?.name ?? `#${trackId}`;
@@ -272,6 +277,35 @@ async function runTest(row: CredentialItem) {
   }
 }
 
+/**
+ * 批量删除：与单条删除同一套级联语义（删账号 → 删其名下文章 → 归还未推送文章占用的角度）。
+ *
+ * 这是全站后果最重的删除（会连带删文章），所以确认弹窗要把影响讲透：
+ * 名下有几篇文章、这些文章占的选题会不会回池。
+ */
+const accountTableRef = ref<{ clearSelection: () => void } | null>(null);
+
+const batch = useBatchDelete<CredentialItem>({
+  idOf: (row) => row.id,
+  api: bulkDeleteCredentials,
+  tableRef: accountTableRef,
+  impact: (rows) => {
+    const parts: string[] = [
+      `将删除 ${rows.length} 个公众号账号，并**一并删除这些账号名下的所有文章**（微信草稿箱里已推送的内容不受影响）。`,
+    ];
+    parts.push('未送达微信的文章所占的选题角度会归还角度池，可能被再次用于新文章。');
+    parts.push('此操作不可恢复。');
+    return parts.join('\n');
+  },
+  title: '批量删除账号',
+  reload: load,
+});
+
+// 搜索关键词变了就是换了个结果集，旧的勾选要清掉
+watch(keyword, () => {
+  batch.clearSelection();
+});
+
 /** 行操作菜单项，供 RowActions 组件渲染。 */
 function accountActions(row: CredentialItem): RowAction[] {
   return [
@@ -295,14 +329,11 @@ function onAccountCommand(cmd: string, row: CredentialItem) {
 
 <template>
   <div class="wb-page" v-loading="loading" element-loading-text="正在加载账号…">
-    <header class="wb-page-head">
-      <div>
-        <h2>账号管理</h2>
-        <p class="wb-page-desc">
-          共 {{ items.length }} 个公众号账号 · 就绪 {{ readyCount }} 个 · Secret 只显示掩码
-        </p>
-      </div>
-      <div class="wb-page-actions">
+    <PageHead
+      title="账号管理"
+      :desc="`共 ${items.length} 个公众号账号 · 凭据格式合规 ${credOkCount} 个（不代表接口已验证） · Secret 只显示掩码`"
+    >
+      <template #actions>
         <el-input
           v-model="keyword"
           :prefix-icon="Search"
@@ -313,8 +344,8 @@ function onAccountCommand(cmd: string, row: CredentialItem) {
         />
         <el-button :icon="Refresh" @click="load">刷新</el-button>
         <el-button type="primary" :icon="Plus" @click="openCreate">新增账号</el-button>
-      </div>
-    </header>
+      </template>
+    </PageHead>
 
     <StateError v-if="error" :message="error" @retry="load" />
 
@@ -327,9 +358,25 @@ function onAccountCommand(cmd: string, row: CredentialItem) {
     />
 
     <el-card shadow="never">
+      <!-- 批量操作条：有勾选时才出现 -->
+      <BatchBar
+        :count="batch.count.value"
+        :loading="batch.deleting.value"
+        @delete="batch.runBatchDelete()"
+        @clear="batch.clearSelection()"
+      />
+
       <!-- 宽度约定：数字/状态列固定 width；文本列用 min-width + show-overflow-tooltip——
            min-width 列会按比例分摊表格剩余宽度（自适应撑满），只有挤不下时才出省略号 -->
-      <el-table :data="rows" size="default">
+      <el-table
+        ref="accountTableRef"
+        :data="rows"
+        size="default"
+        row-key="id"
+        @selection-change="batch.onSelectionChange"
+      >
+        <!-- reserve-selection：换搜索词时由 watch 清空，这里保留勾选状态 -->
+        <el-table-column type="selection" width="46" reserve-selection />
         <el-table-column prop="id" label="ID" width="62" />
         <el-table-column prop="name" label="账号" min-width="170" show-overflow-tooltip />
         <el-table-column
@@ -361,7 +408,9 @@ function onAccountCommand(cmd: string, row: CredentialItem) {
         />
         <el-table-column label="状态" width="96">
           <template #default="{ row }">
-            <el-tag :type="credTag(row.credStatus)" size="small">{{ credText(row.credStatus) }}</el-tag>
+            <el-tooltip :content="credHint(row.credStatus)" placement="top">
+              <el-tag :type="credTag(row.credStatus)" size="small">{{ credText(row.credStatus) }}</el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="启用" width="72">
@@ -380,11 +429,14 @@ function onAccountCommand(cmd: string, row: CredentialItem) {
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty :description="keyword ? '没有匹配的账号' : '还没有账号，新增一个开始创作'">
+          <EmptyState
+            :description="keyword ? '没有匹配的账号' : '还没有账号，新增一个开始创作'"
+            :hint="keyword ? '清空搜索框可看全部账号' : undefined"
+          >
             <el-button v-if="!keyword" type="primary" :icon="Plus" size="small" @click="openCreate">
               新增账号
             </el-button>
-          </el-empty>
+          </EmptyState>
         </template>
       </el-table>
     </el-card>

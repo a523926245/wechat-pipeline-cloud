@@ -25,11 +25,19 @@ import {
   listAngles,
   reassignOffIpAngles,
   releaseAngle,
+  rescoreAngle,
   updateAngle,
 } from '../../services/angles.ts';
+import { listTopicReviews, reviewAngle } from '../../services/topic-review.ts';
+import { requirePrincipal } from '../../services/ownership.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { bulkDeleteSchema, runBulkDelete } from '../bulk-delete.ts';
+import { requirePermission } from '../permissions.ts';
 
 export const anglesRouter: Router = Router();
+
+// P2 RBAC：本路由统一权限点
+anglesRouter.use(requirePermission('system:manage'));
 
 const ID_PATH = '/:id(\\d+)';
 const idParam = z.coerce.number().int().positive();
@@ -43,12 +51,16 @@ const scopeField = z.enum(['article', 'comic', 'shared']);
 const listQuery = z.object({
   trackId: z.coerce.number().int().positive(),
   used: z.enum(['unused', 'used', 'all']).optional().default('all'),
+  /** 审核态过滤（S4-1）。 */
+  status: z.enum(['candidate', 'needs_revision', 'approved', 'rejected', 'all']).optional().default('all'),
   scope: scopeField.optional(),
   /** offIp=1 只看含 IP 外角色的选题（漫画产线治理）。 */
   offIp: z
     .union([z.literal('1'), z.literal('true'), z.literal('0'), z.literal('false')])
     .optional(),
   keyword: z.string().trim().max(64).optional(),
+  /** score=按总分降序（未评分排最后）；缺省按 seq。 */
+  sort: z.enum(['seq', 'score']).optional().default('seq'),
   limit: z.coerce.number().int().min(1).max(100).optional().default(20),
   offset: z.coerce.number().int().min(0).optional().default(0),
 });
@@ -67,7 +79,7 @@ const updateSchema = z.object({
   scope: scopeField.optional(),
 });
 
-/** 列表：按赛道 + 使用状态 + 切片 + 关键词过滤，分页返回明细。 */
+/** 列表：按赛道 + 使用状态 + 审核态 + 切片 + 关键词过滤，分页返回明细。 */
 anglesRouter.get(
   '/',
   asyncHandler(async (req, res) => {
@@ -75,9 +87,11 @@ anglesRouter.get(
     const result = await listAngles({
       trackId: q.trackId,
       used: q.used,
+      status: q.status,
       scope: q.scope,
       offIp: q.offIp === '1' || q.offIp === 'true',
       keyword: q.keyword,
+      sort: q.sort,
       limit: q.limit,
       offset: q.offset,
     });
@@ -85,7 +99,7 @@ anglesRouter.get(
   }),
 );
 
-/** 手动新增一条选题（seq 自动取当前最大值 +1）。 */
+/** 手动新增一条选题（seq 自动取当前最大值 +1）。S4-2：L0/L1 重复 400 拒绝（detail 带命中明细），L2 历史相似只提示。 */
 anglesRouter.post(
   '/',
   asyncHandler(async (req, res) => {
@@ -97,7 +111,10 @@ anglesRouter.post(
       source: body.source,
       scope: body.scope,
     });
-    res.status(201).json({ ...item, message: '选题已新增' });
+    const warnNote = item.dedupWarnings && item.dedupWarnings.length > 0
+      ? `；注意：与 ${item.dedupWarnings.length} 篇历史文章标题相似（已记录，仅提示不拦截）`
+      : '';
+    res.status(201).json({ ...item, message: `选题已新增${warnNote}` });
   }),
 );
 
@@ -113,6 +130,30 @@ anglesRouter.post(
   }),
 );
 
+/**
+ * 批量删除选题。
+ *
+ * 复用 services/angles.ts 的 deleteAngle（同一套「解除文章关联后删选题」语义），
+ * 逐条独立执行：一条失败不影响其余，失败原因原样返回。
+ *
+ * 路由顺序：'/bulk-delete' 是字母路径，必须排在 '/:id(\\d+)' 之前。
+ */
+anglesRouter.post(
+  '/bulk-delete',
+  asyncHandler(async (req, res) => {
+    const { ids } = bulkDeleteSchema.parse(req.body ?? {});
+    const result = await runBulkDelete(
+      ids,
+      async (id) => {
+        const r = await deleteAngle(id);
+        return { unlinkedArticles: r.unlinkedArticles };
+      },
+      '选题',
+    );
+    res.json(result);
+  }),
+);
+
 /** 详情。删除前前端会再来拉一次，避免用列表里的过期数据做提示（防重入靠最新值）。 */
 anglesRouter.get(
   ID_PATH,
@@ -122,14 +163,38 @@ anglesRouter.get(
   }),
 );
 
-/** 编辑：只允许改 theme / content / scope（消费态不可改）。 */
+/** 编辑：只允许改 theme / content / scope（消费态不可改）。HF1：内容实质变更且原为 approved 时退回候选，返回体带退回提示。S4-2：L0/L1 重复 400 拒绝，L2 历史相似只提示。 */
 anglesRouter.put(
   ID_PATH,
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
     const body = updateSchema.parse(req.body);
     const item = await updateAngle(id, body);
-    res.json({ ...item, message: '已保存' });
+    const parts = [
+      item.reviewReset
+        ? '已保存；选题内容已修改，状态退回「候选待审」，旧评分已失效，需重新评分并人工审核通过后才能再用于创作'
+        : '已保存',
+    ];
+    if (item.dedupWarnings && item.dedupWarnings.length > 0) {
+      parts.push(`注意：与 ${item.dedupWarnings.length} 篇历史文章标题相似（已记录，仅提示不拦截）`);
+    }
+    res.json({ ...item, message: parts.join('；') });
+  }),
+);
+
+/**
+ * 重新评分（R1）：approved 编辑退回的候选必须重新取得有效六维评分才能再过审。
+ * 评分失败/缺失只落 scoreError、不清「待重新评分」标记，仍不可 approve。
+ */
+anglesRouter.post(
+  '/:id(\\d+)/rescore',
+  asyncHandler(async (req, res) => {
+    const id = idParam.parse(req.params.id);
+    const result = await rescoreAngle(id);
+    const message = result.rescored
+      ? `已重新评分（总分 ${result.scoreTotal ?? '-'}），可提交人工审核`
+      : `重新评分失败：${result.scoreError ?? '评分缺失或不完整'}；仍需重新评分并人工审核通过后才能再用于创作`;
+    res.json({ ...result, message });
   }),
 );
 
@@ -142,6 +207,44 @@ anglesRouter.post(
   asyncHandler(async (req, res) => {
     const id = idParam.parse(req.params.id);
     res.json(await releaseAngle(id));
+  }),
+);
+
+/**
+ * 人工审核（S4-1）：通过 / 拒绝 / 要求修改。
+ *
+ * - 只走后端状态机（topic-review.reviewAngle），前端无法直接改写 status；
+ * - 评分（六维）不替代人工审核：LLM 的 suggestion 不经此端口，此端口只收人工 verdict；
+ * - approved / rejected 为终态，非法流转返回 400。
+ */
+const reviewSchema = z.object({
+  verdict: z.enum(['approved', 'needs_revision', 'rejected']),
+  reason: z.string().trim().max(500).optional(),
+});
+
+anglesRouter.post(
+  '/:id(\\d+)/review',
+  asyncHandler(async (req, res) => {
+    const id = idParam.parse(req.params.id);
+    const body = reviewSchema.parse(req.body ?? {});
+    const principal = requirePrincipal(req);
+    const record = await reviewAngle(id, {
+      verdict: body.verdict,
+      reason: body.reason,
+      reviewedBy: principal.username ?? String(principal.userId ?? ''),
+    });
+    const item = await getAngle(id);
+    res.json({ ok: true, review: record, item, message: `已${body.verdict === 'approved' ? '通过' : body.verdict === 'rejected' ? '拒绝' : '要求修改'}` });
+  }),
+);
+
+/** 审核记录（多轮全留，新轮在前）。 */
+anglesRouter.get(
+  '/:id(\\d+)/reviews',
+  asyncHandler(async (req, res) => {
+    const id = idParam.parse(req.params.id);
+    const items = await listTopicReviews(id);
+    res.json({ total: items.length, items });
   }),
 );
 

@@ -1,0 +1,82 @@
+$ npm run smoke:style
+npm warn Unknown user config "home". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+
+> wechat-pipeline-server@0.1.0 smoke:style
+> node --experimental-strip-types scripts/smoke-isolated.ts run style
+
+════════════════════════════════════════════════════════
+[t0] RUN target=style  timeout=300000ms
+[t0] REAL      = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.db
+[t0] ISOLATED  = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.smoke-mweidyddjke8.db
+[t0] CONTENT   = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\var\tmp\smoke-iso-mweidyddjke8\content
+[t0] ENV-ALLOW = PATH, SYSTEMROOT, WINDIR, TEMP, TMP, LANG, TZ + DATABASE_URL/CONTENT_DIR/NODE_ENV（其余剥离：APP_SECRET_KEY、一切 *TOKEN/*SECRET/*KEY、代理变量）
+[t0] NET       = Node 层网络入口隔离（smoke-net-guard），非 OS 级全网络隔离
+[t0] NOTE Windows 下隔离库文件权限由 ACL 继承（POSIX 场景 chmod 0600）
+[t0] WRITER-SCAN …
+[t0] WRITER-SCAN ok（8787 未监听 / 无 scheduler 进程）
+[t0] REAL-FP  K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.db sha256=fea0f12373a54678165f95651e358552e5eae17031046052aaff560dc86fc3f5 size=974848 mtime=1794460805028
+[t0] REAL-WAL = absent
+[t0] ISO-CREATE prisma db push → dev.smoke-mweidyddjke8.db
+[t0] ISO-CREATE ok（schema-only）
+[t0] ISO-VERIFY ② database_list = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.smoke-mweidyddjke8.db
+[t0] ISO-EMPTY tables=15/15 rows=0
+[t0] ISO-VERIFY PASS（落盘 / 连接实测 / 表结构 / 行数=0）
+[t0] ENV-INJECT readback ok
+[t0] SPAWN node --import file:///K:/WorkBuddy%20WorkSpace/project/wechat-pipeline-cloud/server/scripts/smoke-net-guard.mjs --experimental-strip-types K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\scripts\smoke-run.ts style
+[smoke-net-guard] loaded（Node 层网络入口隔离，非 OS 级全网络隔离）pid=22984
+[smoke-db-guard] REAL      = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.db
+[smoke-db-guard] ISOLATED  = K:\WorkBuddy WorkSpace\project\wechat-pipeline-cloud\server\prisma\dev.smoke-mweidyddjke8.db
+[smoke-db-guard] PASS（命名 / 路径归一反真实库 / 目录 / 落盘 校验通过）
+[smoke-run] import ./smoke-style-prompts.ts …
+[smoke-net-guard] BLOCKED child_process.execSync → 子进程不在冒烟放行范围：chcp 65001
+style-prompts smoke
+
+[1] 播种与清单
+{"level":30,"time":"2026-11-13T05:00:59.510Z","env":"development","changed":["v:星座:structure"],"msg":"文风种子已升级到 v5（星座群像字数算术）"}
+  PASS  总纲已播种
+  PASS  赛道文体已播种（育儿）
+  PASS  变体行已播种（v:global:title）
+  PASS  变体行已播种（v:职场:length）
+  PASS  重复播种不增加行数
+
+[2] 读写与默认值
+  PASS  upsert 返回 key
+  PASS  get 往返一致
+  PASS  global 不可删
+  PASS  篇幅变体有出厂默认值
+  PASS  默认值含总纲与变体
+
+[2.5] 变体分隔符（骨架卡）与写作规范分节
+  PASS  有 --- 时按块切（2 条，不是 5 条）
+  PASS  骨架卡整块保留换行
+  PASS  无 --- 时按行切（兼容旧数据）
+  PASS  s: 按 ## 切小节
+
+[3] 变体轮换与篇幅档解析
+  PASS  篇幅档解析
+  PASS  非法篇幅档拒绝
+  PASS  游标递增
+  PASS  标题轮换（3 条周期）
+  PASS  篇幅档解析出锚
+  PASS  篇幅档轮换
+  PASS  游标可读回
+  PASS  读游标不推进
+
+[4] prompt 注入
+  PASS  loadStyleForTrack 取到赛道文体
+  PASS  loadGlobalPrompt 取到总纲
+  PASS  总纲进 prompt
+  PASS  赛道文风进 prompt
+  PASS  变体段进 prompt
+  PASS  标题公式进 prompt
+  PASS  结构骨架进 prompt
+  PASS  篇幅档进 prompt
+  PASS  无配置时回落兜底
+  PASS  system 篇幅锚跟随变体
+  PASS  清理完成
+
+全部通过（33 项断言）
+[t0] CHILD EXIT = 0
+[t0] CLEANUP ok（隔离库与临时内容目录已删除）
+[t0] REAL-DB FINGERPRINT MATCH（原库零写入）
+EXIT_CODE=0

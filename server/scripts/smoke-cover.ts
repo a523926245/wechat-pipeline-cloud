@@ -12,6 +12,8 @@
  * 跑法：npm run smoke:cover
  */
 
+// 冒烟旁路：本脚本带裸 fetch/静态请求，跳过 /api 鉴权（生产环境无效）。
+process.env.SMOKE_NO_AUTH = '1';
 import { existsSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
@@ -123,7 +125,7 @@ async function main(): Promise<void> {
       data: { name: '冒烟封面赛道', slug: 'smoke-cover', quotaPerDay: 1 },
     });
     const secret = 'smoke-secret-0123456789';
-    const accountA = await prisma.account.create({
+    const accountA = await prisma.oAAccount.create({
       data: {
         trackId: track.id,
         name: '冒烟账号A',
@@ -135,7 +137,7 @@ async function main(): Promise<void> {
         enabled: true,
       },
     });
-    const accountB = await prisma.account.create({
+    const accountB = await prisma.oAAccount.create({
       data: {
         trackId: track.id,
         name: '冒烟账号B',
@@ -308,7 +310,7 @@ async function main(): Promise<void> {
       await prisma.modelBinding.deleteMany({ where: { role: 'cover' } });
     }
     await prisma.wechatToken.deleteMany({});
-    await prisma.account.deleteMany({ where: { appid: { startsWith: 'wxsmokecover' } } });
+    await prisma.oAAccount.deleteMany({ where: { appid: { startsWith: 'wxsmokecover' } } });
     await prisma.track.deleteMany({ where: { slug: 'smoke-cover' } });
     for (const f of createdFiles) if (existsSync(f)) unlinkSync(f);
     for (const f of readdirSync(coversDir)) {

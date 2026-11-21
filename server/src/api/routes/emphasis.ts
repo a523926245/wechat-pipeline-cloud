@@ -10,12 +10,16 @@ import { z } from 'zod';
 
 import { prisma } from '../../db.ts';
 import { asyncHandler } from '../async-handler.ts';
+import { requirePermission } from '../permissions.ts';
 import { NotFoundError } from '../../errors.ts';
 import { processEmphasis, DEFAULT_MIN, DEFAULT_MAX } from '../../services/emphasis.ts';
 import { parseArticle } from '../../services/parse/index.ts';
 import { renderArticle } from '../../services/render/index.ts';
 
 const emphasisRouter = Router();
+
+// P2 RBAC：本路由统一权限点
+emphasisRouter.use(requirePermission('content:revise'));
 
 const previewSchema = z.object({
   contentHtml: z.string().min(1),

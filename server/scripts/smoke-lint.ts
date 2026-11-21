@@ -20,6 +20,8 @@
  * 跑法：npm run smoke:lint
  */
 
+process.env.SMOKE_NO_AUTH = '1';
+
 import { createApp } from '../src/app.ts';
 import { prisma } from '../src/db.ts';
 import {
@@ -36,8 +38,10 @@ import { processEmphasis } from '../src/services/emphasis.ts';
 import { ensureEllipsis } from '../src/services/ellipsis.ts';
 import { looksLikeArticleHtml, sanitizeModelHtml } from '../src/services/html-sanitize.ts';
 import { lintArticle, lintSummary } from '../src/services/lint.ts';
+import { recordLintRun } from '../src/services/lint-store.ts';
 import { reflowParagraphs } from '../src/services/paragraph-reflow.ts';
-import { buildPrompt, SYSTEM_PROMPT } from '../src/services/writer.ts';
+import { buildPrompt, buildSystemPrompt, renderTemplate, SYSTEM_PROMPT } from '../src/services/writer.ts';
+import { DEFAULT_SYSTEM_PROMPTS, loadTrackRule, migrateStyleSeedsV16, parseSystemTemplate } from '../src/services/style-prompts.ts';
 import { newStyleHtml, oldStyleHtml } from './fixtures/article-sample.ts';
 
 let passed = 0;
@@ -55,36 +59,88 @@ function expect(label: string, cond: boolean, detail?: unknown): void {
 function testPrompt(): void {
   const track = { id: 1, name: '育儿', slug: 'parenting' } as never;
   const angle = { id: 1, theme: '饭桌拉锯', content: '孩子说不想吃时，家长的第一反应决定了整场对话' } as never;
-  const p = buildPrompt(angle, track);
 
-  expect('1 提示词：赛道名进来了', p.includes('赛道：育儿'), p.slice(0, 60));
-  expect('1 提示词：本赛道文风块进来了', p.includes('【本赛道文风】'));
-  expect('1 提示词：调性读到了（中文键回归测试）', p.includes('调性：温柔共情'), p.slice(0, 300));
-  expect('1 提示词：目标读者读到了', p.includes('目标读者：'));
-  expect('1 提示词：禁忌读到了', p.includes('禁忌：'));
-  expect('1 提示词：结构主线规范进来了', p.includes('【结构主线规范'));
-  expect('1 提示词：段落形态规范进来了', p.includes('【段落形态规范】'));
-  expect('1 提示词：禁止概括句进来了', p.includes('禁止概括句'));
-  expect('1 提示词：细腻度规范进来了', p.includes('【细腻度规范】'));
-  expect('1 提示词：句式禁忌规范进来了', p.includes('【句式禁忌规范'));
-  expect('1 提示词：替代表达进来了（只禁不给写法会失效）', p.includes('替代表达'), p.slice(0, 400));
-  expect('1 提示词：选题主题与角度在末尾', p.includes('本次选题角度：') && p.indexOf('本次选题角度') > p.indexOf('【细腻度规范】'));
-  // 结尾钩子写在不可截断的 tail 里：实测它在规范区被预算挤掉过一次，成稿提问就整个消失了。
-  expect('1 提示词：结尾钩子指令进来了', p.includes('雨靴里的那颗玻璃珠'), p.slice(-400));
+  // ① 什么都不配：只有赛道名 + 选题 + 篇幅锚。
+  // ⚠️ 2026-11-11 起不再从 style_dna.json 兜底任何文风块——没配就是没配，
+  // 缺了要在产稿/体检里暴露，而不是悄悄塞一份别的赛道的调性。
+  const bare = buildPrompt(angle, track);
+  expect('1 提示词：赛道名进来了', bare.includes('赛道：育儿'), bare.slice(0, 60));
+  expect('1 提示词：没配文风时不虚构文风块', !bare.includes('【本赛道文风'), bare.slice(0, 200));
+  expect('1 提示词：选题主题与角度在末尾', bare.includes('本次选题主题：') && bare.includes('本次选题角度：'));
+  // ①.5 系统提示词按赛道分开（2026-11-12）
+  //
+  // 这是「星座稿写成育儿稿」的直接防线。改造前六条赛道共用一份写死的 12 条，
+  // 实测两篇不同赛道的成稿标题句式、四节骨架、结尾句型全部同构。
+  // 这里钉死三件事：赛道之间 system 不同、赛道 tail 真的进 prompt、数字变量没有丢。
+  const zodTpl = parseSystemTemplate(DEFAULT_SYSTEM_PROMPTS['星座'] ?? '');
+  const parTpl = parseSystemTemplate(DEFAULT_SYSTEM_PROMPTS['育儿'] ?? '');
+  expect('1 提示词：星座 / 育儿 的 system 不是同一份', zodTpl.system !== parTpl.system);
+  expect('1 提示词：星座 system 要求群像覆盖', /12 个/.test(zodTpl.system) && /类别 \+ 数量/.test(zodTpl.system));
+  expect('1 提示词：育儿 system 要求成人世界类比', parTpl.system.includes('成人世界类比'));
+  const zodRendered = buildSystemPrompt({ template: zodTpl.system });
+  expect(
+    '1 提示词：星座 system 仍带段数锚（模板没写数字时由代码补）',
+    zodRendered.includes(`${PARA_TARGET_MIN}-${PARA_TARGET_MAX} 个 <p>`),
+  );
+  expect('1 提示词：星座 system 不再要求复合长段落', !zodRendered.includes('主体是复合长段落'));
 
-  // 去 AI 味（2026-10-14 新增）：朱雀检测判 100% AI 特征，三条判定理由必须逐条进 prompt。
-  // 这块最容易静默失效——预算不够时排在最末的规范会被截掉，所以必须断言「真的渲染出来了」。
-  expect('1 提示词：去AI味规范进来了', p.includes('【去AI味规范'), p.slice(0, 400));
-  expect('1 提示词：语言去模式化进来了（对应「语言模式化」）', p.includes('一 语言去模式化'));
-  expect('1 提示词：结构去规整进来了（对应「结构高度规整」）', p.includes('二 结构去规整'));
-  expect('1 提示词：情感写实进来了（对应「情感色彩较弱」）', p.includes('三 情感写实'));
-  expect('1 提示词：引用禁区进来了（杜撰人名实证发生过）', p.includes('引用禁区'));
-  expect('1 提示词：优先级排在段落形态之前', p.indexOf('【去AI味规范') < p.indexOf('【段落形态规范】'));
+  const zodPrompt = buildPrompt(angle, { id: 2, name: '星座', slug: 'zodiac' } as never, {
+    system: { system: zodTpl.system, tail: zodTpl.tail, fromDb: false, sourceKey: 'code:星座' },
+  });
+  expect('1 提示词：赛道 tail 进了 user 消息', zodPrompt.includes('每个星座一段'));
+  expect('1 提示词：不同赛道的 tail 不一样', !bare.includes('每个星座一段'));
+
+  // 模板漏写数字时必须补硬锚：否则「提示词可配置」会变成「门禁静默失效」
+  const noAnchor = buildPrompt(angle, track, {
+    system: { system: '', tail: '随便写点收尾。', fromDb: false, sourceKey: 'test' },
+  });
+  expect(
+    '1 提示词：tail 漏写数字时程序补硬锚',
+    noAnchor.includes(`${PARA_TARGET_MIN}-${PARA_TARGET_MAX} 个 <p>`) &&
+      noAnchor.includes(`${TARGET_CHARS_MIN}-${TARGET_CHARS_MAX} 字`),
+  );
+
+  // 未定义变量原样保留，配置页写错变量名时能在 prompt 里一眼看见
+  const rt = renderTemplate('段数 {{pMin}} 个，未知 {{nope}}', { pMin: 7 });
+  expect('1 提示词：模板变量替换', rt.text === '段数 7 个，未知 {{nope}}', rt.text);
+  expect('1 提示词：未定义变量被报出来', rt.unknown.includes('nope'));
+
+  // ② 旧的全局规范块全部退役（改为按赛道存 `s:{赛道}`）
+  for (const gone of ['【结构主线规范', '【段落形态规范】', '【细腻度规范】', '【句式禁忌规范', '【强调标注规范', '【去AI味规范']) {
+    expect(`1 提示词：全局块已退役（${gone}）`, !bare.includes(gone), gone);
+  }
+
+  // ③ 配了赛道文风 + 写作规范：按 s:{赛道} 的 `##` 小节逐个注入
+  const spec = {
+    sections: {
+      段落形态: '- 主体段落 3-5 句',
+      强调标注: '- 全篇 8-12 处加粗',
+      句式补充: '- 不许写星座歧视',
+      '去AI味（预留）': '- 未启用，不应进 prompt',
+    },
+    loose: '',
+    fromDb: true,
+  };
+  const p = buildPrompt(angle, track, { style: { trackPrompt: '调性：温柔共情' }, spec });
+  expect('1 提示词：本赛道文风块进来了', p.includes('【本赛道文风（硬性）】'));
+  expect('1 提示词：赛道行原文进来了', p.includes('调性：温柔共情'));
+  expect('1 提示词：写作规范·段落形态进来了', p.includes('【写作规范 · 段落形态】'));
+  expect('1 提示词：写作规范·强调标注进来了', p.includes('【写作规范 · 强调标注】'));
+  expect('1 提示词：写作规范·句式补充进来了', p.includes('【写作规范 · 句式补充】'));
+  expect('1 提示词：去AI味预留小节不进 prompt', !p.includes('未启用，不应进 prompt'));
+
+  // ④ 多行骨架卡（--- 分隔）必须整块进 tail，不能被切成一行
+  const card = '骨架｜对号入座型\n① 开场一个场景\n② 六个行为切片\n③ 写一个反例\n④ 回扣物件提问';
+  const withCard = buildPrompt(angle, track, {
+    variants: { title: '标题甲', structure: card, length: '1800-2200|17-19|标准', lengthTarget: null, cursor: 1 },
+  });
+  expect('1 提示词：骨架卡整块进 tail', withCard.includes(card), withCard.slice(-600));
 
   const unknown = buildPrompt(angle, { id: 2, name: '不存在的赛道', slug: 'nope' } as never);
-  expect('1 提示词：未知赛道不注入文风块但流程不崩', !unknown.includes('【本赛道文风】') && unknown.includes('本次选题角度'));
+  expect('1 提示词：未知赛道不注入文风块但流程不崩', !unknown.includes('【本赛道文风') && unknown.includes('本次选题角度'));
 
   expect(`1 提示词：小标题区间取自 constants（${MIN_SECTIONS}-${MAX_SECTIONS}）`, MIN_SECTIONS === 3 && MAX_SECTIONS === 4);
+
 
   // ── 段落数锚与提示词自洽（2026-10-15）────────────────────────────
   // 背景：字数上不去的真因不是模型不听话，而是提示词里三处账互相打架
@@ -153,12 +209,104 @@ function testSanitize(): void {
   // ⑤ 真的没有标题时不介入（那是没写出文章，该判废的还得判废）
   const junk = '抱歉，我无法完成这个请求。';
   expect('1.5 无标题：不伪造结构', looksLikeArticleHtml(sanitizeModelHtml(junk)) === false, sanitizeModelHtml(junk));
+
+  // ⑥ 标题写成 <strong> 的救回（2026-11-11 真机抓到）
+  // 模型偶尔把标题包进 <strong> 而不是 <h1>，原先直接判「内容不可用」回退骨架，
+  // 白烧一次生成。这里断言它被救回来，且正文里的 <strong> 不被误改。
+  const strongTitle = sanitizeModelHtml(
+    '<strong>水逆第三天，已读不回不是忙</strong> <h2>火象把没回翻成我在搞事情</h2> <p>周三下午两点四十分。</p>',
+  );
+  expect('1.5 强标题：救回成 h1', strongTitle.includes('<h1>水逆第三天，已读不回不是忙</h1>'), strongTitle);
+  expect('1.5 强标题：救回后仍是合法文章结构', looksLikeArticleHtml(strongTitle) === true, strongTitle);
+  const normalStrong = sanitizeModelHtml('<h1>标题</h1><p>这里是<strong>强调</strong>，不是标题。</p>');
+  expect('1.5 强标题：正文里的 strong 不被误改', normalStrong.includes('<strong>强调</strong>'), normalStrong);
+}
+
+// ── 1.6 星座赛道：赛道规范按配置注入、专属体检按 r: 启用 ──
+//
+// 为什么单独一个函数：星座是最早需要「不同于通用写法」的赛道，
+// 也是唯一带专属体检项的赛道，这里把它的三条契约钉死：
+//   ① 写作规范从 s:星座 进来，不再靠代码里的赛道名分支
+//   ② 结尾示范句与赛道同源（育儿示范出现在星座稿里 = 塞了无关物件）
+//   ③ 体检项由 r:星座 决定，其它赛道不该被星座规则误伤
+function testZodiac(): void {
+  const track = { id: 3, name: '星座', slug: 'zodiac' } as never;
+  const angle = { id: 1, theme: '水逆第三天', content: '水逆第三天，他把已读不回包装成了在忙' } as never;
+
+  // ① 没有任何配置时：不虚构星座专属规范（旧版会塞一大块 星座赛道规范）
+  const bare = buildPrompt(angle, track);
+  expect('1.6 未配规范时不虚构星座块', !bare.includes('【星座赛道规范'), bare.slice(0, 300));
+  for (const gone of ['【结构主线规范', '【细腻度规范', '【去AI味规范']) {
+    expect(`1.6 全局块已退役（${gone}）`, !bare.includes(gone), gone);
+  }
+
+  // ② 配了 s:星座：段落形态 / 强调标注 / 句式补充 三节都在
+  const spec = {
+    sections: {
+      段落形态: '- 主体段落 3-5 句',
+      强调标注: '- 全篇 8-12 处加粗',
+      句式补充: '- 不做星座歧视与排序',
+      '去AI味（预留）': '- 未启用',
+    },
+    loose: '',
+    fromDb: true,
+  };
+  const p = buildPrompt(angle, track, { style: { trackPrompt: '内容身份：写的是星座内容\n分组纪律：不许写满 12 个' }, spec });
+  expect('1.6 星座写作规范·段落形态进了 prompt', p.includes('【写作规范 · 段落形态】'), p.slice(0, 400));
+  expect('1.6 星座写作规范·句式补充进了 prompt', p.includes('【写作规范 · 句式补充】'), p.slice(0, 400));
+  expect('1.6 赛道行里的分组纪律进了 prompt', p.includes('不许写满 12 个'), p.slice(0, 400));
+  expect('1.6 星座禁忌进了 prompt', p.includes('不做星座歧视与排序'), p.slice(0, 400));
+
+  // ③ 示范句必须与赛道同源
+  //
+  // 2026-11-12：示范句从代码常量搬进了 `sys:{赛道}` 的 tail 节，可以改。
+  // 这里钉的是「不传赛道模板就不许出现别的赛道的物件」——历史上星座稿结尾
+  // 出现过育儿语境的雨靴玻璃珠，根因就是示范句写死在代码里、六赛道共用一份。
+  const zodTpl2 = parseSystemTemplate(DEFAULT_SYSTEM_PROMPTS['星座'] ?? '');
+  const pz = buildPrompt(angle, track, {
+    style: { trackPrompt: '内容身份：写的是星座内容\n分组纪律：不许写满 12 个' },
+    spec,
+    system: { system: zodTpl2.system, tail: zodTpl2.tail, fromDb: false, sourceKey: 'code:星座' },
+  });
+  expect('1.6 不传赛道模板时不泄漏别的赛道物件', !p.includes('雨靴里的那颗玻璃珠'), p.slice(-500));
+  expect(
+    '1.6 传入星座模板后用的是星座收尾',
+    pz.includes('每个星座一段') && !pz.includes('雨靴里的那颗玻璃珠'),
+    pz.slice(-500),
+  );
+
+
+  // 星座稿的体检：星象词不足 → 提示「不像星座文章」
+  const noAstro = newStyleHtml();
+  const zr = lintArticle(noAstro, undefined, '星座');
+  expect('1.6 星座稿缺星象词会被提示', zr.warnings.some((w) => w.code === 'zodiac_topic'), zr.warnings);
+  // 同一篇稿子不传赛道名 → 不查星座专属项（其它赛道不该被星座规则误伤）
+  const other = lintArticle(noAstro);
+  expect('1.6 非星座赛道不查星座专属项', !other.warnings.some((w) => w.code === 'zodiac_topic'), other.warnings);
+
+  // 教科书腔：星座稿里插学术引用 → 提示
+  const textbook = newStyleHtml().replace(
+    '我蹲下去把抹布搭在椅背上，什么也没说',
+    '心理学里有个概念叫认知负荷，当多任务切换频繁时，个体的沟通意愿会呈非线性下降',
+  );
+  const tr = lintArticle(textbook, undefined, '星座');
+  expect('1.6 教科书腔会被提示', tr.warnings.some((w) => w.code === 'zodiac_textbook'), tr.warnings);
+
+  // 否定框架补了「与其X不如Y」：提示词早禁了，正则却一直没抓 —— 这里钉死
+  const consult = newStyleHtml().replace(
+    '我蹲下去把抹布搭在椅背上，什么也没说',
+    '与其追着问，不如等他先开口',
+  );
+  expect(
+    '1.6 否定框架：「与其X不如Y」也被拦',
+    lintArticle(consult).errors.some((e) => e.code === 'negation'),
+    lintArticle(consult).errors,
+  );
 }
 
 // ── 2. lint：旧文风必须拦 ──
 function testOldStyle(): void {
-  const r = lintArticle(oldStyleHtml());
-  const codes = r.errors.map((e) => e.code);
+  const r = lintArticle(oldStyleHtml());  const codes = r.errors.map((e) => e.code);
   const warns = r.warnings.map((w) => w.code);
   expect('2 旧文风：不通过', r.ok === false, r.errors);
   expect('2 旧文风：小标题数违规被拦', codes.includes('sections'), r.errors);
@@ -241,6 +389,7 @@ interface JsonRes<T> {
 async function main(): Promise<void> {
   console.log('— 提示词注入 —');
   testPrompt();
+  testZodiac();
   console.log('— 模型产出清洗 —');
   testSanitize();
   console.log('— 旧文风必须被拦 —');
@@ -252,13 +401,16 @@ async function main(): Promise<void> {
 
   const app = createApp();
   const server = app.listen(0);
+  if (!(globalThis as { __SMOKE_NET__?: { register(s: unknown): boolean } }).__SMOKE_NET__?.register(server)) throw new Error('smoke-net-guard 未预载，拒绝运行（必须经 smoke-run.ts 引导）'); // T0 端口登记胶水
   const port = (server.address() as { port: number }).port;
   const base = `http://127.0.0.1:${port}`;
-
+  // /api/* 已加鉴权；本脚本测门禁不测鉴权，走 SMOKE_NO_AUTH 旁路（同 smoke:cover 等）。
   async function call<T>(method: string, path: string, body?: unknown): Promise<JsonRes<T>> {
     const res = await fetch(`${base}${path}`, {
       method,
-      headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+      headers: {
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const json = (await res.json().catch(() => null)) as T;
@@ -302,6 +454,26 @@ async function main(): Promise<void> {
   expect(
     '7 重排：引号成对',
     (rf3.contentHtml.match(/「/g) ?? []).length === (rf3.contentHtml.match(/」/g) ?? []).length,
+  );
+
+  // ── 阶梯跨节连续（2026-11-11 修的确定性 bug）──
+  // 原来阶梯每节都从第 0 项重新取，于是各节的段长节奏一模一样
+  // （实测 4 节的段长序列几乎重合），各节段数齐齐整整 [6,6,6,6]——
+  // 这正是 AI 检测器说的「结构高度规整」，而且是**我们自己造出来的**，不是模型写的。
+  // 这里用两节内容相同的长文钉死：两节的段长序列不能一样。
+  const sameSection = `<p>${'这是内容相同的一节，用来检查阶梯是不是每节都从零开始。'.repeat(6)}</p>`;
+  const rfLadder = reflowParagraphs(`<h2>第一节</h2>${sameSection}<h2>第二节</h2>${sameSection}`);
+  const ladderSections = rfLadder.contentHtml
+    .split(/<h2>/)
+    .slice(1)
+    .map((sec) =>
+      [...sec.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/g)].map((m) => (m[1] ?? '').replace(/<[^>]+>/g, '').length),
+    );
+  expect('7 重排：阶梯跨节连续（两节都有内容）', ladderSections.length === 2, ladderSections);
+  expect(
+    '7 重排：两节段长节奏不相同（否则是自己制造模板感）',
+    JSON.stringify(ladderSections[0]) !== JSON.stringify(ladderSections[1]),
+    ladderSections,
   );
 
   // 嵌套加粗：模型复述整篇时会造出来，带着它往下走计数与插入位置全错位，必须先拍平。
@@ -360,6 +532,141 @@ async function main(): Promise<void> {
     hooked.warnings,
   );
 
+  // ── 9b 结尾判据分赛道（S4-5 A 档）──
+  // 这一组验的是「判据该不该要求这条赛道、这件事」：
+  //   sys:星座 明文允许「一句可截图的话，或一句『你是第几个 / @ 那个 XX 座』」并禁止抒情提问
+  //   sys:育儿 全文没有「结尾要提问」的写法要求
+  // 两条都用同一段**无问号**正文做对比：豁免前报、豁免后不报，证明改的是判据而不是正文。
+  console.log('— 结尾判据分赛道 —');
+  const noHookTail = `${head}<p>它吃完还会抬头望一望窗户，像在看谁。</p>`;
+  const zodiacTail = `${head}<p>@那个总在群里已读不回的双鱼座</p>`;
+  const preChangeRelax = ['para_shape', 'para_short'];
+
+  expect(
+    '9.1 星座：无问号结尾，豁免前会报（正是与 sys:星座 口径冲突的那条）',
+    lintArticle(noHookTail, undefined, '星座', undefined, preChangeRelax).warnings.some(
+      (w) => w.code === 'ending_hook',
+    ) === true,
+  );
+  expect(
+    '9.2 星座：目标形态样本（@ 那个 XX 座）豁免后不再报',
+    lintArticle(zodiacTail, undefined, '星座').warnings.some((w) => w.code === 'ending_hook') === false,
+    lintArticle(zodiacTail, undefined, '星座').warnings,
+  );
+  expect(
+    '9.3 育儿：无问号结尾，豁免前会报',
+    lintArticle(noHookTail, undefined, '育儿', undefined, ['para_short']).warnings.some(
+      (w) => w.code === 'ending_hook',
+    ) === true,
+  );
+  expect(
+    '9.4 育儿：豁免后不再报（sys:育儿 没要求过结尾提问）',
+    lintArticle(noHookTail, undefined, '育儿').warnings.some((w) => w.code === 'ending_hook') === false,
+    lintArticle(noHookTail, undefined, '育儿').warnings,
+  );
+  expect(
+    '9.5 没有 r: 行的赛道不受影响：科技仍报 ending_hook',
+    lintArticle(noHookTail, undefined, '科技').warnings.some((w) => w.code === 'ending_hook') === true,
+  );
+  expect(
+    '9.5 未知赛道不受影响：仍报 ending_hook（不是把检查全局关掉）',
+    lintArticle(noHookTail, undefined, '__smoke_unknown_track__').warnings.some(
+      (w) => w.code === 'ending_hook',
+    ) === true,
+  );
+
+  // 库内规则真的加载生效（loadTrackRule 走 DB → 种子回落，lint 侧用的是同一份数据）
+  const ruleZodiac = await loadTrackRule('星座');
+  const ruleParenting = await loadTrackRule('育儿');
+  const ruleTech = await loadTrackRule('科技');
+  expect(
+    '9.6 库内加载：星座/育儿 relax 含 ending_hook，科技不含',
+    ruleZodiac.relax?.includes('ending_hook') === true &&
+      ruleParenting.relax?.includes('ending_hook') === true &&
+      ruleTech.relax?.includes('ending_hook') !== true,
+    { zodiac: ruleZodiac.relax, parenting: ruleParenting.relax, tech: ruleTech.relax },
+  );
+  // S4-5 B 档：科技新增了种子规则（checks:[] + scene），体检侧不该因此多豁免或少检查。
+  expect(
+    '9.6 形态（B 档）：科技=scene、星座=zodiac、育儿=default（种子可加载）',
+    ruleTech.angleMode === 'scene' && ruleZodiac.angleMode === 'zodiac' && ruleParenting.angleMode === 'default',
+    { tech: ruleTech.angleMode, zodiac: ruleZodiac.angleMode, parenting: ruleParenting.angleMode },
+  );
+  expect(
+    '9.6 科技新增规则未放行 ending_hook（relax 为空）',
+    (ruleTech.relax ?? []).length === 0,
+    ruleTech.relax,
+  );
+
+  // ── 9c V16 存量迁移（S4-5 A 档，仅隔离库；未接入启动链）──
+  // 隔离库是新播种的，天生就带豁免 → 直接跑迁移等于空转。所以先把行还原成旧值，再验「只追加、不改别的」。
+  console.log('— V16 存量配置迁移 —');
+  const readRuleJson = async (key: string) => {
+    const row = await prisma.stylePrompt.findUnique({ where: { key } });
+    return row
+      ? (JSON.parse(row.prompt) as { checks?: unknown; angleMode?: unknown; relax?: unknown })
+      : null;
+  };
+  const v16Flag = 'style_seed_v16';
+  const zodiacRuleKey = 'r:星座';
+  const oldZodiacRule = {
+    checks: ['zodiac_topic', 'zodiac_textbook', 'zodiac_repeat', 'zodiac_dup'],
+    angleMode: 'zodiac',
+    relax: ['para_shape', 'para_short'],
+  };
+  await prisma.stylePrompt.update({
+    where: { key: zodiacRuleKey },
+    data: { prompt: JSON.stringify(oldZodiacRule, null, 2) },
+  });
+  await prisma.stylePrompt.update({
+    where: { key: 'r:育儿' },
+    data: { prompt: JSON.stringify({ checks: [], angleMode: 'default', relax: ['para_short'] }, null, 2) },
+  });
+  await prisma.setting.deleteMany({ where: { k: v16Flag } });
+
+  await migrateStyleSeedsV16();
+  const zAfter = await readRuleJson(zodiacRuleKey);
+  const yAfter = await readRuleJson('r:育儿');
+  expect(
+    '9.7 V16：星座 relax 追加 ending_hook（原有两项保留、顺序不变）',
+    JSON.stringify(zAfter?.relax) === JSON.stringify(['para_shape', 'para_short', 'ending_hook']),
+    zAfter?.relax,
+  );
+  expect(
+    '9.7 V16：育儿 relax 追加 ending_hook',
+    JSON.stringify(yAfter?.relax) === JSON.stringify(['para_short', 'ending_hook']),
+    yAfter?.relax,
+  );
+  expect(
+    '9.7 V16：checks / angleMode 原样保留（不借机改规则本体）',
+    JSON.stringify(zAfter?.checks) === JSON.stringify(oldZodiacRule.checks) &&
+      zAfter?.angleMode === 'zodiac',
+    zAfter,
+  );
+
+  // 幂等：标记被删掉后再跑一次，不应重复追加
+  await prisma.setting.deleteMany({ where: { k: v16Flag } });
+  await migrateStyleSeedsV16();
+  const zAgain = await readRuleJson(zodiacRuleKey);
+  expect(
+    '9.8 V16 幂等：重复执行不重复追加',
+    (zAgain?.relax as string[] | undefined)?.filter((c) => c === 'ending_hook').length === 1,
+    zAgain?.relax,
+  );
+
+  // 注释里那条保守规则：行内**没有** relax 键时不许替它写一个只有 ending_hook 的数组
+  // （否则会把种子里继承来的 para_shape / para_short 顶掉）
+  const noRelaxPrompt = JSON.stringify({ checks: [], angleMode: 'default' }, null, 2);
+  await prisma.stylePrompt.update({ where: { key: 'r:育儿' }, data: { prompt: noRelaxPrompt } });
+  await prisma.setting.deleteMany({ where: { k: v16Flag } });
+  await migrateStyleSeedsV16();
+  const yNoRelax = await readRuleJson('r:育儿');
+  expect(
+    '9.9 V16：行里没有 relax 键时不动它（交给种子继承）',
+    yNoRelax?.relax === undefined,
+    yNoRelax,
+  );
+
   const stamp = Date.now().toString(36);
   let trackId = 0;
 
@@ -370,7 +677,7 @@ async function main(): Promise<void> {
     trackId = track.id;
 
     // credStatus='ok' 但没有真实密钥：门禁排在微信调用之前，所以能安全地验证「拦住了」。
-    const account = await prisma.account.create({
+    const account = await prisma.oAAccount.create({
       data: { trackId, name: `__smoke_lint_acc_${stamp}__`, appid: `wx${stamp}`, credStatus: 'ok', enabled: true },
     });
 
@@ -447,6 +754,190 @@ async function main(): Promise<void> {
     });
     const comicLint = await call<{ lint: unknown }>('GET', `/api/articles/${comic.id}/lint`);
     expect('6 HTTP：漫画产线不做文章体检（lint=null）', comicLint.json.lint === null, comicLint.json.lint);
+
+    // ── 10 体检结果落库（S4-3）──
+    // 目的：把「检查结论只在响应里活一次」变成「一次执行一行历史」。
+    // 关注四件事：结论存得下、对外可读、多次检查不覆盖、失败不伪装成功。
+    console.log('— 10 体检结果落库 —');
+    type RunBrief = {
+      id: number;
+      trigger: string;
+      ok: boolean;
+      errorCount: number;
+      warnCount: number;
+      contentHash: string;
+    };
+    type RunItem = RunBrief & { issues?: { code: string }[]; stats?: { charCount: number } | null };
+
+    // 基线：第 6 节已经对 good 做过一次检查（现在也会落库），后续断言一律以「相对增量」为准，
+    // 免得把「前面用例顺手写了几条」硬编码进期望值——那种断言改一处就全碎。
+    const gh0 = await call<{ items: RunItem[] }>('GET', `/api/articles/${good.id}/lint-runs`);
+    const baseGood = gh0.json.items.length;
+    expect('10.0 落库基线可读（历史接口可用）', baseGood === 1, baseGood);
+    // bad 的基线：第 5 节既检查过一次、也推过一次（被拦），各留一条。
+    const bh0 = await call<{ items: RunItem[] }>('GET', `/api/articles/${bad.id}/lint-runs`);
+    const baseBad = bh0.json.items.length;
+    expect('10.0 被拦文章的基线=2（check + push 各一条）', baseBad === 2, baseBad);
+
+    // 10.1 通过的文章：GET /:id/lint 算完即落库，且结论与直接计算一致（规则语义未变）
+    const g1 = await call<{ lint: { ok: boolean } | null; lintRun: RunBrief | null }>(
+      'GET',
+      `/api/articles/${good.id}/lint`,
+    );
+    expect(
+      '10.1 体检通过：返回存档记录（trigger=check / ok=true）',
+      g1.json.lintRun?.trigger === 'check' && g1.json.lintRun?.ok === true,
+      g1.json.lintRun,
+    );
+    expect(
+      '10.1 落库不改变结论：与 lintArticle 直接算一致',
+      g1.json.lint?.ok === lintArticle(newStyleHtml()).ok && g1.json.lintRun?.errorCount === 0,
+      g1.json.lint,
+    );
+
+    const gh1 = await call<{ items: RunItem[] }>('GET', `/api/articles/${good.id}/lint-runs`);
+    expect(
+      '10.2 能读回存档（基线+1 条，含明细快照）',
+      gh1.json.items.length === baseGood + 1 && Array.isArray(gh1.json.items[0]?.issues),
+      gh1.json.items.length,
+    );
+    expect(
+      '10.2 存档带正文指纹（64 位 sha256）',
+      gh1.json.items[0]?.contentHash === g1.json.lintRun?.contentHash &&
+        (g1.json.lintRun?.contentHash ?? '').length === 64,
+      g1.json.lintRun?.contentHash,
+    );
+
+    // 10.3 未通过的文章：结论与不合规明细都留得下来
+    const b1 = await call<{ lint: { ok: boolean } | null; lintRun: RunBrief | null }>(
+      'GET',
+      `/api/articles/${bad.id}/lint`,
+    );
+    expect(
+      '10.3 体检未通过：存档 ok=false 且错误数>0',
+      b1.json.lintRun?.ok === false && (b1.json.lintRun?.errorCount ?? 0) > 0,
+      b1.json.lintRun,
+    );
+    const bh1 = await call<{ items: RunItem[] }>('GET', `/api/articles/${bad.id}/lint-runs`);
+    expect(
+      '10.3 未通过的明细可读回（errors 含 sections）',
+      bh1.json.items[0]?.issues?.some((i) => i.code === 'sections') === true,
+      bh1.json.items[0]?.issues,
+    );
+
+    // 10.4 连续检查：历史累加、新记录在前、旧记录原样保留
+    const g2 = await call<{ lintRun: RunBrief | null }>('GET', `/api/articles/${good.id}/lint`);
+    const gh2 = await call<{ items: RunItem[] }>('GET', `/api/articles/${good.id}/lint-runs`);
+    expect(
+      '10.4 再检查一次：历史 +1 条（新增而非覆盖）',
+      gh2.json.items.length === baseGood + 2,
+      gh2.json.items.length,
+    );
+    expect(
+      '10.4 最新一条在首位且就是本次记录',
+      gh2.json.items[0]?.id === g2.json.lintRun?.id && (gh2.json.items[1]?.id ?? 0) < (gh2.json.items[0]?.id ?? 0),
+      gh2.json.items.map((i) => i.id),
+    );
+    expect(
+      '10.4 旧记录原样保留（id 与首次检查相同）',
+      gh2.json.items[1]?.id === gh1.json.items[0]?.id,
+      gh2.json.items.map((i) => i.id),
+    );
+
+    // 10.5 保存正文：保存即体检并留痕（trigger=save）
+    const sv = await call<{ lint: { ok: boolean } | null; lintRun: RunBrief | null; status: string }>(
+      'PUT',
+      `/api/articles/${good.id}/content`,
+      { contentHtml: oldStyleHtml() },
+    );
+    expect('10.5 保存正文：存档 trigger=save', sv.json.lintRun?.trigger === 'save', sv.json.lintRun);
+    expect(
+      '10.5 保存后结论为不通过（换成旧文风）',
+      sv.json.lintRun?.ok === false && sv.json.lint?.ok === false,
+      sv.json.lint,
+    );
+    const gh3 = await call<{ items: RunItem[] }>('GET', `/api/articles/${good.id}/lint-runs`);
+    expect(
+      '10.5 保存也进历史（基线+3 条，新的在前）',
+      gh3.json.items.length === baseGood + 3 && gh3.json.items[0]?.trigger === 'save',
+      gh3.json.items.map((i) => i.trigger),
+    );
+
+    // 10.6 推送门禁：被拦下同样留痕（第 5 节对 bad 的那次 push）
+    const bh2 = await call<{ items: RunItem[] }>('GET', `/api/articles/${bad.id}/lint-runs`);
+    expect(
+      '10.6 推送门禁留痕（存在 push 记录且 ok=false）',
+      bh2.json.items.some((i) => i.trigger === 'push' && i.ok === false),
+      bh2.json.items.map((i) => `${i.trigger}:${i.ok}`),
+    );
+
+    // 10.7 关联正确：两篇文章各记各的，不串数据
+    expect(
+      '10.7 文章A历史里没有 push 记录（未被他文污染）',
+      gh3.json.items.every((i) => i.trigger !== 'push'),
+      gh3.json.items.map((i) => i.trigger),
+    );
+    // 10.7 关联正确：两篇文章各记各的，不串数据（库层按 articleId 核对，不看接口口径）
+    const goodRows = await prisma.articleLintRun.count({ where: { articleId: good.id } });
+    const badRows = await prisma.articleLintRun.count({ where: { articleId: bad.id } });
+    expect(
+      '10.7 关联正确：A=基线+3 / B=基线+1，各记各的',
+      goodRows === baseGood + 3 && badRows === baseBad + 1,
+      { goodRows, badRows, baseGood, baseBad },
+    );
+
+    // 10.8 预览：带最近存档、能判过期，且自身不写库
+    await prisma.article.update({ where: { id: good.id }, data: { contentHtml: newStyleHtml() } });
+    const pv = await call<{ lintRun: RunItem | null; lintRunStale: boolean; lint: { ok: boolean } | null }>(
+      'GET',
+      `/api/articles/${good.id}/preview`,
+    );
+    expect('10.8 预览带最近存档', pv.json.lintRun?.trigger === 'save', pv.json.lintRun);
+    expect(
+      '10.8 存档正文≠当前正文 → stale=true（不把旧结论当现行结论）',
+      pv.json.lintRunStale === true,
+      pv.json.lintRunStale,
+    );
+    const gh4 = await call<{ items: RunItem[] }>('GET', `/api/articles/${good.id}/lint-runs`);
+    expect(
+      '10.8 预览只读：历史条数不变（仍是基线+3）',
+      gh4.json.items.length === baseGood + 3,
+      gh4.json.items.length,
+    );
+
+    // 10.9 落库失败必须显式报错：不抛异常、不伪装成检查成功
+    const persistFail = await recordLintRun({
+      articleId: 999999,
+      trigger: 'check',
+      report: lintArticle(newStyleHtml()),
+      contentHtml: newStyleHtml(),
+    });
+    expect(
+      '10.9 落库失败：saved=false 且带错误原因（外键约束）',
+      persistFail.saved === false && Boolean(persistFail.error) && persistFail.run === undefined,
+      persistFail,
+    );
+
+    // 10.10 级联：删文章即删其体检记录，不留孤儿行
+    const tmp = await prisma.article.create({
+      data: {
+        trackId,
+        accountId: account.id,
+        pipeline: 'article',
+        title: '冒烟-级联',
+        digest: '',
+        contentHtml: newStyleHtml(),
+        contentWechat: '<section></section>',
+        pushDate: '',
+        status: 'draft',
+        idempotencyKey: `smoke-lint-cascade-${stamp}`,
+      },
+    });
+    await call('GET', `/api/articles/${tmp.id}/lint`);
+    const beforeDel = await prisma.articleLintRun.count({ where: { articleId: tmp.id } });
+    await prisma.article.delete({ where: { id: tmp.id } });
+    const afterDel = await prisma.articleLintRun.count({ where: { articleId: tmp.id } });
+    expect('10.10 删文章级联删除体检记录（1 → 0）', beforeDel === 1 && afterDel === 0, { beforeDel, afterDel });
   } finally {
     server.close();
     // 赛道删除会级联账号与其名下文章，一次清干净。

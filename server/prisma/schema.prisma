@@ -1,19 +1,18 @@
 // 数据字典真源。
-// 生产用 MySQL（utf8mb4）；本地无 MySQL 时由 scripts/gen-sqlite-schema.mjs
-// 自动生成等价的 SQLite 版本，无需维护两份。
+// 运行库为 MySQL（utf8mb4）。
 //
 // 变更记录：
-// 2026-10 新增 Article.coverMediaId / coverUploaded（封面永久素材复用）。
-//   生产上线前必须生成含这两个字段的 baseline migration，否则 publisher 一跑就
-//   Unknown column —— 见 deploy/README.md「上线前置项」。
+// 2026-10 新增 Article.coverMediaId / coverUploaded（封面永久素材复用，
+//   已含于初始迁移 20261113145706_init）。
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "mysql"
-  url      = env("DATABASE_URL")
+  provider          = "mysql"
+  url               = env("DATABASE_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
 }
 
 enum CredStatus {
@@ -28,6 +27,26 @@ enum ArticleStatus {
   pushed
   updated
   failed
+}
+
+/// 选题审核态（D1：status 只管审核态，used 只管消费态，两者不合并）。
+/// 状态图：candidate ─┬─ approved ─(used=true 由排产置)─▶ 已消费
+///                     ├─ needs_revision ─┬─ approved
+///                     │                  └─ rejected
+///                     └─ rejected
+/// approved / rejected 为终态；「标重复」= TopicReview 事件（verdict=rejected, reason=dup_*），不新增主状态。
+enum AngleStatus {
+  candidate
+  needs_revision
+  approved
+  rejected
+}
+
+/// TopicReview.verdict：人工审核操作三态（评分不替代人工审核，无自动 verdict）。
+enum TopicVerdict {
+  approved
+  needs_revision
+  rejected
 }
 
 enum TaskStatus {
@@ -57,6 +76,21 @@ enum Trigger {
   api
 }
 
+/// 系统用户角色（与 ModelRole 是两回事：那个是模型用途绑定）。
+/// admin=全权+用户管理；member=客户（管自己的公众号/自动化/数据）；guest=只读（默认注册角色）。
+enum UserRole {
+  admin
+  member
+  guest
+}
+
+/// 系统用户状态。开放注册+管理员审批：pending →（审批）active；disabled=封禁。
+enum UserStatus {
+  pending
+  active
+  disabled
+}
+
 enum LogLevel {
   debug
   info
@@ -66,7 +100,6 @@ enum LogLevel {
 
 /// 调用协议：决定 services/llm.ts 走哪条 HTTP 通道。
 /// 用枚举而非 String：未知协议只能在运行时炸，枚举让非法值在写入时就被拦下。
-/// 本地 SQLite（gen-sqlite-schema.mjs 自动生成）会把它降级为 String，
 /// 代码侧统一用 services/model-registry.ts 的本地联合类型 Protocol，不 import Prisma 枚举。
 enum ModelProtocol {
   openai_chat
@@ -74,6 +107,8 @@ enum ModelProtocol {
   agnes_image
   /// ModelScope Qwen Image（gradio REST 直连 studio 端点，2026-10 已实证可用）
   modelscope_qwen_image
+  /// ModelScope Qwen Image MCP 备选通道（MCP Streamable HTTP，JSON-RPC over SSE）
+  modelscope_qwen_image_mcp
   /// 预留：尚未实现分派，保存时会被拒绝
   anthropic_messages
   /// 预留：尚未实现分派，保存时会被拒绝
@@ -97,6 +132,8 @@ enum ModelRole {
   comic_script
   /// 漫画格：按单元提示词逐格生成场景插图（画面内含中文气泡）
   comic_panel
+  /// 漫画格（备选通道）：主通道失败时同心跳降级的备用生图通道
+  comic_panel_fallback
 }
 
 /// 赛道。账号挂在赛道下，同赛道多账号共享该赛道的角度池。
@@ -113,7 +150,7 @@ model Track {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
-  accounts Account[]
+  accounts OAAccount[]
   angles   Angle[]
   articles Article[]
   /// 赛道下的产线（article / comic），各自配额与开关独立。见 TrackPipeline。
@@ -124,7 +161,7 @@ model Track {
 
 /// 赛道下的产线。同一账号同一赛道可并行跑多条产线（文章 / 漫画），
 /// 各自配额独立、各自的角度切片独立（Angle.scope）。
-/// kind 用 String 而非 enum：与 SQLite 枚举降级策略一致，且新增产线类型不应改 schema。
+/// kind 用 String 而非 enum：新增产线类型不应改 schema。
 /// 读口径统一走 services/pipeline.ts（缺行回落 Track.quotaPerDay 旧语义）。
 model TrackPipeline {
   id          Int      @id @default(autoincrement())
@@ -144,10 +181,14 @@ model TrackPipeline {
   @@index([enabled])
 }
 
-/// 公众号账号。AppSecret 加密存储，API 层只暴露 secretMask。
-model Account {
+/// 公众号账号（OAAccount，与系统用户 User 区分）。AppSecret 加密存储，API 层只暴露 secretMask。
+/// 模型名改自 Account（2026-11 多用户改造），@@map("Account") 稳住表名——旧库零数据迁移。
+/// ownerUserId = 归属系统用户（轻量归属，非租户）：NULL=未归属（历史/冒烟数据，仅 admin 可管）。
+model OAAccount {
   id          Int        @id @default(autoincrement())
   trackId     Int
+  /// 归属系统用户；SetNull：删用户不删公众号资产（归为未归属，待 admin 认领）。
+  ownerUserId Int?
   name        String     @db.VarChar(64)
   appid       String     @unique @db.VarChar(32)
   secretEnc   Bytes?
@@ -159,10 +200,52 @@ model Account {
   updatedAt   DateTime   @updatedAt
 
   track   Track         @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  owner   User?         @relation(fields: [ownerUserId], references: [id], onDelete: SetNull)
   tokens  WechatToken[]
   articles Article[]
 
   @@index([trackId, enabled])
+  @@index([ownerUserId])
+  @@map("Account")
+}
+
+/// 系统登录用户（区别于公众号账号 OAAccount）。开放注册+管理员审批；预留订阅付费自动开通口子。
+/// expiresAt=订阅有效期钩子（可空=不过期；到期降只读）；maxOAAccounts=可绑公众号数上限。
+/// automationMode/writeTime=每客户自动化开关（P4）：manual=纯手动 / auto_draft=自动写稿 /
+/// auto_draft_push=自动写稿+推草稿箱。群发红线与本开关解耦（AUTO_PUBLISH=false 永不动）。
+model User {
+  id            Int        @id @default(autoincrement())
+  username      String     @unique @db.VarChar(64)
+  passwordHash  String     @db.VarChar(255)
+  role          UserRole   @default(guest)
+  status        UserStatus @default(pending)
+  expiresAt     DateTime?
+  maxOAAccounts Int        @default(1)
+  /// 每客户自动化模式。default manual=最安全（不自动动手）。
+  automationMode String    @default("manual") @db.VarChar(24)
+  /// 每客户的每日写稿时间点 HH:mm（服务器本地时区）。
+  writeTime     String     @default("06:00") @db.VarChar(5)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  oaAccounts OAAccount[]
+  sessions   UserSession[]
+
+  @@index([status, role])
+}
+
+/// 登录会话（per-user，替代单管理令牌；管理令牌降为 break-glass）。
+/// httpOnly cookie 只存 session id，服务端查库校验——可随时吊销。
+model UserSession {
+  id        String   @id @db.VarChar(64)
+  userId    Int
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 /// access_token 缓存。本机流水线每次运行都重新取 token，上云必须缓存（微信有调用频率限制）。
@@ -174,7 +257,7 @@ model WechatToken {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
-  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  account OAAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
 
   @@index([expiresAt])
 }
@@ -191,8 +274,22 @@ model Angle {
   theme     String    @db.VarChar(64)
   content   String    @db.VarChar(500)
   scope     String    @default("article") @db.VarChar(16)
+  /// 审核态（D1）：candidate / needs_revision / approved / rejected。扩库与手动新增一律进 candidate，
+  /// 只有 approved 可被排产消费（planner/reserve 过滤）。终态 approved/rejected 不可再流转。
+  status    AngleStatus @default(candidate)
+  /// 已完成的审核轮数（每条 TopicReview 事件 +1，0=从未审核）。
+  reviewRound Int       @default(0)
+  /// 六维评分依据/风险说明/判重结果（S4-1 起：scores{fit,scene,conflict,method,safety,novelty,total}、
+  /// scoreSource/scoreModel/scoredAt/riskHits/suggestion/rationale，失败时 scoreError）。
+  /// 评分只影响排序与人工参考，不替代人工审核，不设自动批准/淘汰阈值。
+  metaJson  Json?
   used      Boolean   @default(false)
+  /// 展示用占用标签（账号名，兼容旧数据与导出）。结构化归属见 usedById/usedByAccountId。
   usedBy    String    @default("") @db.VarChar(64)
+  /// 占用者：系统用户 id（跨客户防重复的归属标记，谁抢到归谁）。
+  usedById  Int?
+  /// 占用者：公众号账号 id（区分同用户多号）。
+  usedByAccountId Int?
   usedDate  String?   @db.VarChar(10)
   source    String    @default("") @db.VarChar(64)
   createdAt DateTime  @default(now())
@@ -200,11 +297,45 @@ model Angle {
 
   track    Track      @relation(fields: [trackId], references: [id], onDelete: Cascade)
   articles Article[]
+  /// 审核事件流水（一候选多轮全留，回答「修改后重审如何追踪」）。
+  topicReviews TopicReview[]
 
   @@unique([trackId, code])
   @@index([trackId, scope, used, seq])
-  @@index([trackId, used, seq])
+  /// DATABASE-DESIGN-REVIEW §③：现 [trackId,used,seq] 演进为 [trackId,status,seq]。
+  @@index([trackId, status, seq])
   @@index([theme])
+}
+
+/// 选题审核记录（D1：Angle.status + used + TopicReview 事件表，不建 TopicCandidate）。
+/// N:1 → Angle（angleId + round）；一候选多轮审核全留。
+/// 字段依据 DATABASE-DESIGN-REVIEW §④：scoresJson（六维）/ riskHits / dupHits / verdict / reason / model / createdAt。
+/// promptVersionHash / contractVersion 暂缺：S3 裁决 PromptVersion / TrackContract 不实施，
+/// 写了就是伪造追溯（决策 C：不伪造历史），待相关能力落地后再补列。
+/// reviewedBy：审核操作者（登录名，空=未记录），满足「审核操作可追溯」的最低要求，非审批流/角色机制。
+model TopicReview {
+  id         Int          @id @default(autoincrement())
+  angleId    Int
+  /// 审核轮数：同一 angleId 下从 1 递增（与 Angle.reviewRound 同步推进）。
+  round      Int
+  /// 六维评分快照（审核时刻 Angle.metaJson.scores 的拷贝）：{fit,scene,conflict,method,safety,novelty,total}。
+  scoresJson Json?
+  /// 风险项快照（评分/守门发现的风险说明）。
+  riskHits   Json?
+  /// 判重命中（相似 Angle id+分数）。S4-2 去重链接入前恒空。
+  dupHits    Json?
+  verdict    TopicVerdict
+  reason     String       @default("") @db.VarChar(500)
+  /// 评分所用模型名快照（D5：第一版复用 write 角色）。
+  model      String       @default("") @db.VarChar(64)
+  /// 审核操作者（登录名）。
+  reviewedBy String       @default("") @db.VarChar(64)
+  createdAt  DateTime     @default(now())
+
+  angle Angle @relation(fields: [angleId], references: [id], onDelete: Cascade)
+
+  @@index([angleId, round])
+  @@index([verdict, createdAt])
 }
 
 /// 文章。contentHtml 可编辑，contentWechat 是推送渲染产物（由同一渲染函数产出）。
@@ -216,7 +347,7 @@ model Article {
   title           String        @db.VarChar(255)
   digest          String        @default("") @db.VarChar(255)
   contentHtml     String        @db.Text
-  contentWechat   String        @default("") @db.LongText
+  contentWechat   String        @default(dbgenerated("('')")) @db.LongText
   contentPath     String        @default("") @db.VarChar(255)
   coverPath       String        @default("") @db.VarChar(255)
   /// 封面上传为微信永久素材后的 media_id。publisher 据此复用，避免每次推送都往
@@ -246,10 +377,12 @@ model Article {
   track   Track?   @relation(fields: [trackId], references: [id], onDelete: SetNull)
   // 删账号即删其名下文章：避免产生永远推不出去的孤儿文章。
   // 应用层 services/accounts.deleteAccount 也做了显式级联，双保险。
-  account Account? @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  account OAAccount? @relation(fields: [accountId], references: [id], onDelete: Cascade)
   angle   Angle?   @relation(fields: [angleId], references: [id], onDelete: SetNull)
   /// 漫画逐格资产（pipeline='comic' 时才有行）。
   comicPanels ComicPanel[]
+  /// 成稿体检执行记录（S4-3：一次检查一行，历史保留不覆盖）。
+  lintRuns ArticleLintRun[]
 
   @@index([pushDate, accountId])
   @@index([status])
@@ -261,7 +394,7 @@ model Article {
 /// 漫画逐格资产行级状态机。每格一张场景插图（含中文气泡），
 /// 支持逐格慢生成、单格失败重跑、换账号重传 —— 用行级 status + updatedAt
 /// 构成轮询队列，替代引入任务队列框架。
-/// 金句卡（1080×540 文字卡）不入库：渲染阶段确定性生成，落盘 comics/quote-{seq}.jpg。
+/// 金句卡（1080×540 文字卡）不入库：渲染阶段确定性生成，落盘 comics/quote-{articleId}-{seq}-v{VER}.jpg（按文章隔离）。
 model ComicPanel {
   id            Int      @id @default(autoincrement())
   articleId     Int
@@ -290,6 +423,35 @@ model ComicPanel {
   @@unique([articleId, seq])
   @@index([articleId, status])
   @@index([status, updatedAt])
+}
+
+/// 成稿体检（lint）执行记录。**一次检查一行，历史不覆盖**——这是与「把报告塞进一个 Json 列」
+/// 的根本差别：`Article.qualityJson` 那种单列写法存完就被下一次覆盖，追溯不到「上一版稿子为什么没过」。
+/// 快照口径：statsJson / issuesJson 是检查当时 LintReport 的原样拷贝，规则改动不回溯既有行
+/// （旧行如实反映旧规则下的结论，不做重算改写）。
+/// trigger 区分执行入口：check=改稿页手动重新检查 / save=保存正文 / push=推送门禁。
+model ArticleLintRun {
+  id         Int      @id @default(autoincrement())
+  articleId  Int
+  /// 触发入口：check | save | push（见 services/lint-store.ts 的 LintTrigger）
+  trigger    String   @db.VarChar(16)
+  /// 无 error 级问题即为通过（与 LintReport.ok 同义）
+  ok         Boolean
+  errorCount Int      @default(0)
+  warnCount  Int      @default(0)
+  /// LintStats 快照：{h2Count,pCount,charCount,boldCount,keyCount,longPara,shortPara,longRatio,shortRatio}
+  statsJson  Json?
+  /// LintIssue[] 快照（即 LintReport.issues，含 level/code/message/hits；errors/warnings 由 level 派生）
+  issuesJson Json?
+  /// 本次检查生效的规则参数快照：{checks,relax}。回答「这次比上次少报一条，是规则改了还是稿子改了」。
+  ruleJson   Json?
+  /// 被检查正文（contentHtml）的 SHA-256。用于判断「这条记录还对不对应当前正文」。
+  contentHash String  @default("") @db.VarChar(64)
+  createdAt  DateTime @default(now())
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId, createdAt])
 }
 
 /// 任务执行记录。排产、写作、生图、推送都走这里，便于监控与重试。
@@ -389,4 +551,20 @@ model Setting {
   readonly  Boolean  @default(false)
   desc      String   @default("") @db.VarChar(255)
   updatedAt DateTime @updatedAt
+}
+
+/// 文风配置：创作总纲 + 各赛道文体 prompt 的单一真源（「文风配置」页可改）。
+/// 写稿（services/writer.ts）与题库扩库（services/angles.ts）都从这里读——
+/// 改配置即改文风/题库口径，不用改代码。key='global' 是创作总纲（正能量等全局约束），
+/// 其余 key 为赛道名（育儿/教育/职场/星座/激励…），kind 随之为 global | track。
+/// 覆盖顺序：库里的行 > config/style_dna.json 的 tracks 兜底 > 无赛道层。
+model StylePrompt {
+  id        Int      @id @default(autoincrement())
+  key       String   @unique @db.VarChar(64)
+  kind      String   @default("track") @db.VarChar(16)
+  prompt    String   @db.Text
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@index([kind])
 }

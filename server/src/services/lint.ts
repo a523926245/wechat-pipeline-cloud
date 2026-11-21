@@ -1,19 +1,18 @@
 /**
  * 成稿体检（推送门禁）。
  *
- * 背景：`config/style_dna.json` 一直写着「五项质检，全过方可推送」，而 `constants.ts` 里
- * 那几个阈值（字数 / 节数 / 强调密度）此前**全项目零引用**——规则是死的，写手怎么写都放行。
- * 本服务把它们变成真的门禁：推送前跑一遍，不过就不推。
- *
  * 设计取舍：
  * - **分级**。`error` 拦推送，`warn` 只提示。段落形态这种「靠模型自觉」的指标若也硬拦，
  *   会把大量只差一点的稿子卡死在草稿箱；字数/节数/破折号这类客观指标则必须硬拦。
- * - **阈值单一真源**。`constants.ts` 与 `style_dna.json` 是同一套数，改一处即可，
- *   这里不做第二份硬编码。
+ * - **阈值单一真源**。数值全部来自 `constants.ts`，这里不做第二份硬编码。
  * - **只管文章产线**。漫画正文是图片序列 + 台词，结构规则完全不同，直接跳过。
  *
- * 2026-10-13 版规则（用户反馈「小标题太多 / 每个小标题下先写概括句 / 通篇一句一段太碎」）：
- *   小标题 3-4 个、禁止通篇一句一段、复合长段落不少于 1/3、禁止破折号与否定框架。
+ * ⚠️ 2026-11-11：AI 味相关检查（`ai_taste`：句长 CV / 短句率 / 等长窗口 / 段长 CV /
+ * 各节段数齐步走 / 格言收尾 / 情绪结算句 / 口语毛边 / 省略号）**整体移除**。
+ * 去 AI 味是独立能力，接口预留在 `services/ai-taste/index.ts`。
+ * 移除原因是它混在写稿链路里让调试信号变浑：改一句提示词，说不清是写作变好了
+ * 还是机器感变少了。**段落形态、结尾钩子、引用出处、贩卖焦虑、强调密度这些
+ * 「写作要求」不属于去 AI 味，全部保留。**
  */
 
 import {
@@ -29,8 +28,14 @@ import {
   MIN_LONG_PARA_RATIO,
   MIN_SECTIONS,
   PARA_LONG_MIN_SENT,
+  ZODIAC_MAX_DUPLICATE_PAIRS,
+  ZODIAC_MIN_DISTINCT_TERMS,
+  ZODIAC_SIGNS,
+  ZODIAC_TERMS,
+  ZODIAC_TEXTBOOK_PATTERNS,
 } from '../constants.ts';
 import { ALL_MARK_RE, parseArticle, type ParsedArticle } from './parse/index.ts';
+import { ruleFor } from './track-rules.ts';
 
 export type LintLevel = 'error' | 'warn';
 
@@ -47,10 +52,14 @@ export interface LintIssue {
     | 'para_overlong'
   | 'emphasis'
   | 'key_emphasis'
-  | 'summary_openers'
-  | 'ending_hook'
-  | 'ai_taste'
-  | 'citation';
+    | 'summary_openers'
+    | 'ending_hook'
+    | 'citation'
+    | 'fear_selling'
+    | 'zodiac_topic'
+    | 'zodiac_textbook'
+    | 'zodiac_repeat'
+    | 'zodiac_dup';
   message: string;
   /**
    * 命中片段（能精确定位时给出）。
@@ -84,17 +93,21 @@ export interface LintReport {
 
 /** 句末切分：中文句读 + 半角问叹号。省略号不切（那是语气延续，不是句断）。 */
 const SENT_SPLIT = /[。！？；!?]+/;
-/** 破折号：style_dna 明令禁止。 */
+/** 破折号：全学科一律禁止（提示词与门禁同源，见 writer.ts 的 SYSTEM_PROMPT 第 6 条）。 */
 const DASH_RE = /——/g;
 /**
- * 否定框架：「不是X而是Y」「少X多Y」。
+ * 否定框架：「不是X而是Y」「少X多Y」「与其X不如Y」。
  *
  * 变体为什么要列这么全：实测模型会改头换面用同一个套路——
  * 「这并不是复杂的技巧，而是简单的确认」被抓了，「不需要消除竞争，而是需要确认重要性」却能溜过。
  * 限制跨度（每种句式最多 24 字）是为了避免跨句误伤。
+ *
+ * ⚠️ 2026-11-11 补「与其X不如Y」：style_dna 的句式禁忌规范早就禁了它，
+ * 但这里一直没纳入正则——实测生成稿里出现了「与其猜他在忙什么，不如把解释权还给他」，
+ * 提示词禁了、体检却抓不到，等于那半个禁令是空的。
  */
 const NEGATION_RE =
-  /(?:不是|并非|不需要|不在于)[^。！？；]{1,24}而是|[^，。！？；]{1,12}而非[^。！？；]{1,24}|少[^。！？；]{1,8}多[^。！？；]{1,8}/g;
+  /(?:不是|并非|不需要|不在于)[^。！？；]{1,24}而是|[^，。！？；]{1,12}而非[^。！？；]{1,24}|少[^。！？；]{1,8}多[^。！？；]{1,8}|与其[^。！？；]{1,16}不如[^。！？；]{1,16}/g;
 /**
  * 否定框架的**换皮变体**（2026-10-14 实证）：「这不是他们不乖，这是他们在用本能求救」。
  * 连接词从「而是」换成「这是 / 那是 / 是」，上面的硬规则直接放行。
@@ -115,6 +128,13 @@ const EMOTION_SETTLE_RE =
     /(?:研究表明|研究指出|专家发现|专家指出|心理学家[^，。]{0,8}(?:发现|指出|的研究))/g;
 /** 口语/停顿标记。人类非虚构写作一定有，AI 中文稿常年低于 6 处。 */
 const ORAL_MARK_RE = /(其实|反正|后来|搞不懂|也说不清|就这么着|愣是|偏不|不知怎么着|不对|话说回来)/g;
+/**
+ * 恐吓 / 焦虑贩卖句式（提示级）。
+ * 2026-11-11 正能量总纲确立后加：这类句子是「制造焦虑」的显性特征，
+ * 落点必须指向方法/希望/成长。命中片段会带给改稿页与定向修补。
+ */
+const FEAR_SELLING_RE =
+  /再?不[^。！？]{0,15}(?:就毁了|就完了|就被淘汰|就晚了|来不及了|就全完了)|(?:毁了|毁掉)(?:孩子|一生|他的一生)|输在起跑线|再不努力就[^。！？]{0,8}(?:淘汰|出局)|你已被?时代抛弃|代价你承受不起/g;
 /**
  * 段落开头的概括句特征。只做**提示级**判定——中文里判断「这是不是一句总结」没有可靠办法，
  * 硬拦必然误伤，所以这里只数个数，超过 1 处才提示。
@@ -161,11 +181,174 @@ function pct(n: number): string {
   return `${Math.round(n * 100)}%`;
 }
 
+/** 变异系数（标准差÷均值）。AI 检测器判「机器感」最吃的统计量之一。 */
+function cv(xs: number[]): number {
+  if (xs.length < 2) return 0;
+  const m = xs.reduce((a, b) => a + b, 0) / xs.length;
+  if (m === 0) return 0;
+  const v = xs.reduce((a, b) => a + (b - m) ** 2, 0) / xs.length;
+  return Math.sqrt(v) / m;
+}
+
+/** 切出全文所有句子（按段落顺序），返回每句的纯文本。 */
+function splitSentences(text: string): string[] {
+  return text
+    .split(SENT_SPLIT)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/**
+ * 赛道专属体检：像不像这条赛道的内容。
+ *
+ * 为什么通用规则管不了这事：通用规范管的是「怎么写」（段落形态、句长、强调），
+ * 管不了「写的是什么」。实测两篇星座成稿通用体检全过，但通篇讲的是老板与 PPT、
+ * 伴侣沟通，星座只出现在标题里——这就是「不像星座类文章」的机器可判据。
+ *
+ * 全部只提示不拦：赛道内容特征没有客观红线，硬拦会误杀正常的稿子。
+ *
+ * @param checks 启用的检查项（来自 `r:{赛道}` 配置）。传空数组 = 一项都不跑。
+ */
+function lintTrackChecks(flat: string, p: ParsedArticle, checks: string[]): LintIssue[] {
+  const issues: LintIssue[] = [];
+  const on = (code: string): boolean => checks.includes(code);
+
+  // ① 像不像星座文章：星象/星座词够不够
+  if (on('zodiac_topic')) {
+    const distinct = ZODIAC_TERMS.filter((t) => flat.includes(t));
+    if (distinct.length < ZODIAC_MIN_DISTINCT_TERMS) {
+      issues.push({
+        level: 'warn',
+        code: 'zodiac_topic',
+        message:
+          `全文只出现 ${distinct.length} 个星象/星座相关词（需 ≥${ZODIAC_MIN_DISTINCT_TERMS}）` +
+          `（命中：${distinct.join('、') || '无'}）：这不像一篇星座文章，` +
+          '星座只是标题里的标签，正文写成了别的赛道',
+      });
+    }
+  }
+
+  // ② 教科书腔：星座稿最忌讳的「心理学概念 + 学术引用」插入式写法
+  if (on('zodiac_textbook')) {
+    const textbookHits: string[] = [];
+    for (const re of ZODIAC_TEXTBOOK_PATTERNS) {
+      for (const h of hitSnippets(flat, re, 2)) {
+        if (!textbookHits.includes(h)) textbookHits.push(h);
+      }
+    }
+    if (textbookHits.length > 0) {
+      issues.push({
+        level: 'warn',
+        code: 'zodiac_textbook',
+        message:
+          `有 ${textbookHits.length} 处教科书腔（心理学概念 / 研究引用 / 期刊名）：` +
+          '星座稿里插学术引用会瞬间变回心理科普，改成用生活画面说这件事',
+        hits: textbookHits.slice(0, MAX_HITS),
+      });
+    }
+  }
+
+  // ③ 跨星座复读：不同星座的描述不该近乎相同
+  if (on('zodiac_repeat')) {
+    const dupPairs = findDuplicateSignDescriptions(p);
+    if (dupPairs.length > ZODIAC_MAX_DUPLICATE_PAIRS) {
+      issues.push({
+        level: 'warn',
+        code: 'zodiac_repeat',
+        message:
+          `有 ${dupPairs.length} 对星座的描述高度雷同（${dupPairs.slice(0, 3).join('、')}）：` +
+          '每个星座必须写自己的具体行为切片，换个说法也算雷同',
+        hits: dupPairs.slice(0, MAX_HITS),
+      });
+    }
+  }
+
+  // ④ 同一个星座被写进多段：群像是一星座一段，写两段就退化成小故事
+  //
+  // 为什么必须机器查：这条规则写在提示词里（「禁止给同一个星座写两段」），但实测
+  // 模型会先老实列完 10 个星座，紧接着又给其中 5 个补了 3-5 段的小故事——
+  // 段落数从 13 涨到 18，形态从群像退化成散文，而所有既有检查（星象词够不够、
+  // 有没有复读、门禁过不过）全都是绿的。**没被检查的规则，模型就当它不存在。**
+  if (on('zodiac_dup')) {
+    const dupHits: string[] = [];
+    for (const sign of ZODIAC_SIGNS) {
+      const n = p.blocks.filter((b) => b.tag === 'p' && plainText(b.text).includes(sign)).length;
+      if (n > 1) dupHits.push(`${sign}×${n}`);
+    }
+    if (dupHits.length > 0) {
+      issues.push({
+        level: 'warn',
+        code: 'zodiac_dup',
+        message:
+          `有 ${dupHits.length} 个星座被写进了多段（${dupHits.slice(0, 5).join('、')}）：` +
+          '群像是一星座一段，给同一个星座补第二个场景就变回小故事了',
+        hits: dupHits.slice(0, MAX_HITS),
+      });
+    }
+  }
+
+  return issues;
+}
+
+/** 星座专有名词（用于复读检测里定位「这一段在说哪个星座」）。 */
+const SIGN_NAMES = ['白羊', '金牛', '双子', '巨蟹', '狮子', '处女', '天秤', '天蝎', '射手', '摩羯', '水瓶', '双鱼'];
+
+/**
+ * 找「不同星座说了几乎同样的话」的段落对。
+ *
+ * 判据：两个段落各以某个星座名开头，且去掉星座名之后的正文，
+ * 3 字 gram 重合度 ≥0.6（近似复读的阈值）。
+ */
+function findDuplicateSignDescriptions(p: ParsedArticle): string[] {
+  const paras = p.blocks
+    .filter((b) => b.tag === 'p')
+    .map((b) => plainText(b.text))
+    .filter((t) => t.length >= 30);
+  const bySign = new Map<string, string>();
+  for (const t of paras) {
+    const sign = SIGN_NAMES.find((s) => t.startsWith(s));
+    if (sign && !bySign.has(sign)) bySign.set(sign, t);
+  }
+  const entries = [...bySign.entries()];
+  const pairs: string[] = [];
+  for (let i = 0; i < entries.length; i += 1) {
+    for (let j = i + 1; j < entries.length; j += 1) {
+      const a = entries[i]?.[1] ?? '';
+      const b = entries[j]?.[1] ?? '';
+      const ga = new Set(a.slice(0, -1).split('').map((c, k, arr) => arr.slice(k, k + 3).join('')));
+      const gb = new Set(b.slice(0, -1).split('').map((c, k, arr) => arr.slice(k, k + 3).join('')));
+      if (ga.size === 0 || gb.size === 0) continue;
+      let inter = 0;
+      for (const g of ga) if (gb.has(g)) inter += 1;
+      const jaccard = inter / (ga.size + gb.size - inter);
+      if (jaccard >= 0.6) pairs.push(`${entries[i]?.[0]}≈${entries[j]?.[0]}`);
+    }
+  }
+  return pairs;
+}
+
 /**
  * 对一篇语义化 HTML 做体检。
  * 传入已解析结果可避免重复解析（改稿页已经 parse 过一次）。
+ *
+ * @param trackName 赛道名：星座赛道会追加星座专属检查项（像不像星座文章、教科书腔、跨星座复读）。
  */
-export function lintArticle(html: string, parsed?: ParsedArticle): LintReport {
+export function lintArticle(
+  html: string,
+  parsed?: ParsedArticle,
+  trackName = '',
+  /** 该赛道启用的专项检查（来自 `r:{赛道}` 配置）。缺省取出厂默认。 */
+  checks?: string[],
+  /**
+   * 该赛道豁免的 **warn** 项（来自 `r:{赛道}.relax`）。
+   *
+   * 为什么需要：段落形态这套判据是给「叙事散文」定的（复合长段落 ≥1/3、一句一段 ≤1/2）。
+   * 星座群像是一星座一段、育儿口语体是一句一段——它们不是写坏了，是**形式不同**。
+   * 用散文标准去量清单体，每篇都会刷出两条假警报，久了就没人看体检了。
+   * 只允许豁免 warn：error 是合规门禁，任何赛道都不能关。
+   */
+  relax?: string[],
+): LintReport {
   const p = parsed ?? parseArticle(html);
   const issues: LintIssue[] = [];
 
@@ -226,53 +409,6 @@ export function lintArticle(html: string, parsed?: ParsedArticle): LintReport {
     });
   }
 
-  const negSoftHit = flat.match(NEGATION_SOFT_RE)?.length ?? 0;
-  if (negSoftHit > 0) {
-    issues.push({
-      level: 'warn',
-      code: 'ai_taste',
-      message:
-        `有 ${negSoftHit} 处否定框架的换皮写法（「不是X，这是Y」），语法上不是错，但仍是作者替读者下判断` +
-        '：改成具体的动作或画面',
-      hits: hitSnippets(flat, NEGATION_SOFT_RE),
-    });
-  }
-
-  // ── 去 AI 味（提示级）──
-  // 为什么是 warn：这些没有客观红线（同一句话不同人读感受不同），硬拦会大量误杀；
-  // 它的作用是**把最像机器的几篇挑出来先改**，不是"不合格就废稿"。
-  // 2026-10-14 由朱雀检测的判定理由（语言模式化 / 结构高度规整 / 情感色彩较弱）反推而来。
-  const aiTaste: string[] = [];
-  const settleHit = flat.match(EMOTION_SETTLE_RE)?.length ?? 0;
-  if (settleHit > 0) {
-    aiTaste.push(
-      `${settleHit} 处情绪结算句（那一刻我明白了 / 心里那块石头…）。这是「情感色彩较弱」的主因：` +
-        '情绪被报告了没被经历，改写成当时身体在做什么',
-    );
-  }
-  const oralHit = flat.match(ORAL_MARK_RE)?.length ?? 0;
-  if (oralHit < 6) {
-    aiTaste.push(`口语毛边只有 ${oralHit} 处，建议 ≥6 处（其实/反正/后来/搞不懂…）。真人叙述一定带着这些`);
-  }
-  const ellipsisHit = (flat.match(/…/g) ?? []).length;
-  if (ellipsisHit < 2) {
-    aiTaste.push(`省略号只有 ${ellipsisHit} 处，建议 ≥2 处（写犹豫、拖音、话没说完）`);
-  }
-  const tinySent = p.blocks
-    .filter((b) => b.tag === 'p')
-    .flatMap((b) => plainText(b.text).split(SENT_SPLIT).map((s) => s.trim()))
-    .filter((s) => s.length > 0 && s.length <= 5).length;
-  if (tinySent < 3) {
-    aiTaste.push(`≤5 字的短句只有 ${tinySent} 处，建议 ≥3 处。缺少碎句，句长起伏不够（burstiness 低）`);
-  }
-  if (aiTaste.length > 0) {
-    issues.push({
-      level: 'warn',
-      code: 'ai_taste',
-      message: `AI 味：${aiTaste.join('；')}`,
-    });
-  }
-
   const citationHit = flat.match(UNSOURCED_CITATION_RE)?.length ?? 0;
   if (citationHit > 0) {
     issues.push({
@@ -282,6 +418,31 @@ export function lintArticle(html: string, parsed?: ParsedArticle): LintReport {
         `有 ${citationHit} 处无出处的权威引用（研究表明 / 专家发现 / 心理学家XX指出）。` +
         '必须带可检索出处（作者 + 书名或期刊 + 年份），查不到就不署名',
       hits: hitSnippets(flat, UNSOURCED_CITATION_RE),
+    });
+  }
+
+  // ── 星座赛道专属（提示级）──
+  // 只有星座赛道才查：通用规则管「怎么写」，这条管「写的是什么」。
+  // ── 赛道专属（提示级）──
+  // 跑哪些检查由 `r:{赛道}` 决定，代码里不再有赛道名判断。
+  // 没配置就是一项都不跑（新赛道默认无专项检查，不继承别的赛道的规则）。
+  const activeChecks = checks ?? ruleFor(trackName).checks;
+  if (activeChecks.length > 0) {
+    issues.push(...lintTrackChecks(flat, p, activeChecks));
+  }
+
+  // ── 正能量：恐吓 / 焦虑贩卖（提示级）──
+  // 创作总纲要求「不制造焦虑、落点指向方法/希望/成长」。只提示不拦：
+  // 有些赛道（教育警示型）确实要写后果，硬拦会误杀，交给人判断改写方式。
+  const fearHit = flat.match(FEAR_SELLING_RE)?.length ?? 0;
+  if (fearHit > 0) {
+    issues.push({
+      level: 'warn',
+      code: 'fear_selling',
+      message:
+        `有 ${fearHit} 处恐吓/焦虑贩卖句式（再不…就毁了 / 被淘汰 / 输在起跑线…）。` +
+        '改成共鸣 → 希望 → 赋能：先接情绪，再给方法，落点指向出路',
+      hits: hitSnippets(flat, FEAR_SELLING_RE),
     });
   }
 
@@ -362,8 +523,15 @@ export function lintArticle(html: string, parsed?: ParsedArticle): LintReport {
     });
   }
 
-  const errors = issues.filter((i) => i.level === 'error');
-  const warnings = issues.filter((i) => i.level === 'warn');
+  // 赛道豁免只对 warn 生效：error 是推送门禁，任何赛道都不能关。
+  // 放在最后统一过滤，避免每处 push 都写一遍判断（也避免漏掉）。
+  // 未显式传入时按赛道取出厂默认——这样 publisher / 文章页这些只加载了 checks 的
+  // 调用点也能拿到同一套豁免，不会出现「写稿时不报、推送时又报」的两套标准。
+  const relaxed = new Set(relax ?? ruleFor(trackName).relax ?? []);
+  const kept = relaxed.size === 0 ? issues : issues.filter((i) => !(i.level === 'warn' && relaxed.has(i.code)));
+
+  const errors = kept.filter((i) => i.level === 'error');
+  const warnings = kept.filter((i) => i.level === 'warn');
 
   return {
     ok: errors.length === 0,
@@ -378,7 +546,7 @@ export function lintArticle(html: string, parsed?: ParsedArticle): LintReport {
       longRatio,
       shortRatio,
     },
-    issues,
+    issues: kept,
     errors,
     warnings,
   };

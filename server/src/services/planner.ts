@@ -11,13 +11,16 @@
  * - 给出该赛道近作供写稿时做观点层去重
  */
 
+import { Prisma } from '@prisma/client';
 import type { Angle } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 
 import { prisma } from '../db.ts';
 import { NotFoundError } from '../errors.ts';
 import { packJson } from '../db-json.ts';
+import { logger } from '../logger.ts';
 import { dayKeyOf, dayKeyOffset, todayKey } from '../lib/day.ts';
+import { ANGLE_RELEASE_DATA } from './angle-claim.ts';
 import { getPipelineQuota, isPipelineEnabled, PIPELINES, scopesFor, type AngleScope, type PipelineKind } from './pipeline.ts';
 import { tryResolveForRole } from './llm.ts';
 import { generateDraft } from './writer.ts';
@@ -98,11 +101,16 @@ const CRED_STATUS_REASON: Record<string, string> = {
 export async function buildPlan(
   targetAccount?: string,
   backlogDays = 3,
+  // P3 归属过滤（高危点：本函数是 dashboard 与 /api/plan 双消费者，两处调用都必须传）
+  ownerUserId?: number | null,
 ): Promise<PlanResult> {
+  const accWhere = ownerUserId != null ? { ownerUserId } : {};
   const tracks = await prisma.track.findMany({
     include: {
-      accounts: { orderBy: { name: 'asc' } },
-      angles: { where: { used: false }, orderBy: { seq: 'asc' } },
+      accounts: { where: accWhere, orderBy: { name: 'asc' } },
+      // S4-1：只有 approved（人工审核通过）的选题可被排产消费；候选/待修改/已拒绝一概不进。
+      // 消费顺序不变：seq 升序 FIFO。
+      angles: { where: { used: false, status: 'approved' }, orderBy: { seq: 'asc' } },
       articles: { orderBy: { createdAt: 'desc' }, take: 8, select: { createdAt: true, title: true } },
       pipelines: true,
     },
@@ -259,6 +267,8 @@ async function scanBacklog(
 /**
  * 为指定账号在指定产线的角度切片里预留 need 个未用角度（事务内 CAS：先读未用池，再标记 used）。
  * article 消费 [article, shared]，comic 消费 [comic, shared]；used 全局先到先得。
+ * S4-1：**只消费 approved**（D1——candidate / needs_revision / rejected 不得进入生产）。
+ * approved 集合内保持 seq 升序 FIFO，不改变现有排产业务语义。
  */
 export async function reserveAnglesForPipeline(
   accountId: number,
@@ -267,11 +277,11 @@ export async function reserveAnglesForPipeline(
 ): Promise<Angle[]> {
   if (need <= 0) return [];
   return prisma.$transaction(async (tx) => {
-    const acc = await tx.account.findUnique({ where: { id: accountId }, include: { track: true } });
+    const acc = await tx.oAAccount.findUnique({ where: { id: accountId }, include: { track: true } });
     if (!acc) throw new NotFoundError(`账号 ${accountId} 不存在`);
     const today = todayStr();
     const pool = await tx.angle.findMany({
-      where: { trackId: acc.trackId, used: false, scope: { in: scopesFor(pipeline) } },
+      where: { trackId: acc.trackId, used: false, status: 'approved', scope: { in: scopesFor(pipeline) } },
       orderBy: { seq: 'asc' },
       take: need,
     });
@@ -279,7 +289,14 @@ export async function reserveAnglesForPipeline(
     if (ids.length > 0) {
       await tx.angle.updateMany({
         where: { id: { in: ids } },
-        data: { used: true, usedBy: acc.name, usedDate: today },
+        // P3：结构化归属（usedBy 保留作展示标签）——跨客户防重复的「谁抢到归谁」标记
+        data: {
+          used: true,
+          usedBy: acc.name,
+          usedDate: today,
+          usedById: acc.ownerUserId,
+          usedByAccountId: acc.id,
+        },
       });
     }
     return pool;
@@ -295,7 +312,12 @@ export interface TriggerResult {
   accountId: number;
   account: string;
   need: number;
+  /** 只含真实创建成功、有真实文章 id 的草稿；失败项一律不进这里。 */
   created: Array<{ id: number; title: string; angleId: number; modelUsed: string | null; note: string }>;
+  /** 本批失败项（含标题/选题/原因），只用于反馈与 TaskRun 记录，不含虚假文章 id。 */
+  failed: Array<{ title: string; angleId: number; note: string }>;
+  /** 本批因无可用选题等原因跳过的条数（0 表示没有跳过）。 */
+  skipped: number;
   reason?: string;
 }
 
@@ -309,99 +331,335 @@ export async function runPipelineForAccount(
   pipeline: PipelineKind,
   count?: number,
 ): Promise<TriggerResult> {
-  const acc = await prisma.account.findUnique({ where: { id: accountId }, include: { track: true } });
+  const acc = await prisma.oAAccount.findUnique({ where: { id: accountId }, include: { track: true } });
   if (!acc) throw new NotFoundError(`账号 ${accountId} 不存在`);
 
   const already = await todayPipelineCount(accountId, pipeline);
   const quota = await getPipelineQuota(acc.trackId, pipeline);
   let need = count != null ? count : Math.max(0, quota - already);
   if (need <= 0) {
-    return { accountId, account: acc.name, need: 0, created: [], reason: '今日配额已满' };
+    return { accountId, account: acc.name, need: 0, created: [], failed: [], skipped: 0, reason: '今日配额已满' };
   }
 
   const reserved = await reserveAnglesForPipeline(accountId, need, pipeline);
   if (reserved.length === 0) {
-    return { accountId, account: acc.name, need, created: [], reason: '角度池已空，请先扩库' };
+    // 跨赛道错配诊断：报错只说「扩库」会让人扩错赛道的题（2026-11-11 实测踩过：
+    // 题在【育儿】、账号在【星座】，用户以为扩完就能写）。把话说全。
+    const others = await prisma.angle.findMany({
+      where: { used: false, trackId: { not: acc.trackId } },
+      select: { track: { select: { name: true } } },
+    });
+    const byTrack = new Map<string, number>();
+    for (const o of others) byTrack.set(o.track.name, (byTrack.get(o.track.name) ?? 0) + 1);
+    const otherText = [...byTrack.entries()].map(([n, c]) => `【${n}】${c} 条`).join('、');
+    const kindText = pipeline === 'comic' ? '漫画' : '文章';
+    // S4-1：未审核的候选不是可用库存——区分「没题」与「有题但没审」，别让人白扩库。
+    const pendingReview = await prisma.angle.count({
+      where: { trackId: acc.trackId, used: false, status: { in: ['candidate', 'needs_revision'] }, scope: { in: scopesFor(pipeline) } },
+    });
+    const reviewHint =
+      pendingReview > 0
+        ? `注意：该赛道另有 ${pendingReview} 条候选/待修改选题**尚未通过人工审核**——只有审核通过（approved）才能被排产消费，请先到「赛道管理 → 选题库」审核。`
+        : '请先到「赛道管理 → 选题库」给该赛道扩库，并将候选审核通过后再排产。';
+    const reason =
+      `角度池已空（无可消费的已通过选题）：账号「${acc.name}」属【${acc.track.name}】赛道，该赛道没有可用的${kindText}选题。` +
+      reviewHint +
+      (byTrack.size > 0
+        ? `注意：未用选题在 ${otherText} ——那是别的赛道的池子，本账号吃不到。请给【${acc.track.name}】扩库（${kindText}切片），或把账号改绑到对应赛道。`
+        : '');
+    return { accountId, account: acc.name, need, created: [], failed: [], skipped: need, reason };
   }
 
   const created: TriggerResult['created'] = [];
+  /** 失败项单独收集（S5-UI-5-P1）：不再污染 created，但保留原因供反馈与 TaskRun 记录。 */
+  const failed: TriggerResult['failed'] = [];
+  /**
+   * 本次任务实际预留、但还没有产出文章的选题 id（S4-4-1 R5）。
+   * 集合只含 `reserved` 里的 id，因此补偿不会碰其他任务或人工占用的选题。
+   */
+  const pending = new Set<number>(reserved.map((a) => a.id));
 
-  if (pipeline === 'comic') {
+  try {
+    if (pipeline === 'comic') {
+      for (const angle of reserved) {
+        try {
+          const r = await createComicDraft(acc, angle, acc.track);
+          // 建稿即开跑插图（后台逐格推进，不阻塞本次触发）：用户打的是「生成漫画」，
+          // 交出去的应该是能预览的成品，而不是一份还要自己再去点一次生图的脚本。
+          kickComicImages(r.articleId);
+          pending.delete(angle.id);
+          created.push({ id: r.articleId, title: r.title, angleId: angle.id, modelUsed: null, note: `已建 ${r.unitCount} 格分镜，插图生成中（可在文章页看进度）` });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          // 补偿（R5）：这一题本次已预留、但没有产出文章 → 归还，避免变成永久孤儿。
+          // ⚠️ S4-4-1-R5-HF1：**先补偿、再决定是否出队**。旧写法是「先 pending.delete 再 release」，
+          // 一旦 release 撞上数据库异常（返回 0），这题就既没归还、也不在 pending 里，
+          // finally 再也不会管它 → 永久 used=true。现在只有「确定不需要/不能补偿」才出队。
+          const rel = await releaseReservedAngles([angle.id], acc.id, 'comic-script-failed', pipeline);
+          if (rel.retryable.length === 0) pending.delete(angle.id);
+          logger.error(
+            {
+              account: acc.name,
+              accountId: acc.id,
+              angleId: angle.id,
+              err: msg,
+              released: rel.released,
+              retryable: rel.retryable,
+              releaseErr: rel.error,
+            },
+            '漫画脚本生成失败（已尝试归还该选题）',
+          );
+          failed.push({
+            title: angle.content,
+            angleId: angle.id,
+            note:
+              `漫画脚本失败：${msg.slice(0, 160)}` +
+              (rel.released > 0
+                ? '（已归还该选题）'
+                : rel.retryable.length > 0
+                  ? '（该选题归还失败，将在本批次结束时再试一次）'
+                  : ''),
+          });
+        }
+      }
+      await prisma.taskRun.create({
+        data: {
+          jobType: 'comic_script',
+          // 不能把「一条都没成就」记成 success：任务流水要如实反映本批结果。
+          status: failed.length > 0 ? 'failed' : 'success',
+          trigger: 'manual',
+          trackId: acc.trackId,
+          accountId: acc.id,
+          runDate: todayStr(),
+          attempt: 1,
+          paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }) ?? Prisma.DbNull,
+          resultJson: packJson({ createdIds: created.map((c) => c.id).filter(Boolean) }) ?? Prisma.DbNull,
+          errorCode: failed.length > 0 ? 'comic_script_failed' : '',
+          errorMessage: failed.length > 0 ? summarizeFailures(failed) : '',
+        },
+      });
+      return { accountId, account: acc.name, need: reserved.length, created, failed, skipped: 0 };
+    }
+
+    const titlePrefix = await getTitlePrefix();
+
     for (const angle of reserved) {
       try {
-        const r = await createComicDraft(acc, angle, acc.track);
-        // 建稿即开跑插图（后台逐格推进，不阻塞本次触发）：用户打的是「生成漫画」，
-        // 交出去的应该是能预览的成品，而不是一份还要自己再去点一次生图的脚本。
-        kickComicImages(r.articleId);
-        created.push({ id: r.articleId, title: r.title, angleId: angle.id, modelUsed: null, note: `已建 ${r.unitCount} 格分镜，插图生成中（可在文章页看进度）` });
+        const draft = await generateDraft(angle, acc.track, acc);
+        const parsed = parseArticle(draft.contentHtml);
+        const rendered = renderArticle(parsed, { titlePrefix });
+        const article = await prisma.article.create({
+          data: {
+            trackId: acc.trackId,
+            accountId: acc.id,
+            angleId: angle.id,
+            pipeline: 'article',
+            title: rendered.title,
+            digest: rendered.digest,
+            contentHtml: draft.contentHtml,
+            contentWechat: rendered.contentWechat,
+            blocks: parsed.h2Count + parsed.pCount,
+            chars: parsed.charCount,
+            pushDate: '',
+            status: 'draft',
+            idempotencyKey: randomUUID(),
+          },
+        });
+        pending.delete(angle.id);
+        created.push({
+          id: article.id,
+          title: article.title,
+          angleId: angle.id,
+          modelUsed: draft.modelUsed,
+          note: draft.note,
+        });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        created.push({ id: 0, title: angle.content, angleId: angle.id, modelUsed: null, note: `漫画脚本失败：${msg.slice(0, 160)}` });
+        // 逐条隔离（R5-8）：一条失败不影响同批其余选题继续生成。
+        // ⚠️ S4-4-1-R5-HF1：先补偿、再出队（同漫画分支）——补偿失败要留给 finally 再试。
+        const rel = await releaseReservedAngles([angle.id], acc.id, 'write-failed', pipeline);
+        if (rel.retryable.length === 0) pending.delete(angle.id);
+        logger.error(
+          {
+            account: acc.name,
+            accountId: acc.id,
+            angleId: angle.id,
+            err: msg,
+            released: rel.released,
+            retryable: rel.retryable,
+            releaseErr: rel.error,
+          },
+          '文章建稿失败（已尝试归还该选题）',
+        );
+        failed.push({
+          title: angle.content,
+          angleId: angle.id,
+          note:
+            `建稿失败：${msg.slice(0, 160)}` +
+            (rel.released > 0
+              ? '（已归还该选题）'
+              : rel.retryable.length > 0
+                ? '（该选题归还失败，将在本批次结束时再试一次）'
+                : ''),
+        });
       }
     }
+
     await prisma.taskRun.create({
       data: {
-        jobType: 'comic_script',
-        status: 'success',
+        jobType: 'write',
+        status: failed.length > 0 ? 'failed' : 'success',
         trigger: 'manual',
         trackId: acc.trackId,
         accountId: acc.id,
         runDate: todayStr(),
         attempt: 1,
-        paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }),
-        resultJson: packJson({ createdIds: created.map((c) => c.id).filter(Boolean) }),
+        paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }) ?? Prisma.DbNull,
+        resultJson: packJson({ createdIds: created.map((c) => c.id), modelUsed: created[0]?.modelUsed ?? null }) ?? Prisma.DbNull,
+        errorCode: failed.length > 0 ? 'write_failed' : '',
+        errorMessage: failed.length > 0 ? summarizeFailures(failed) : '',
       },
     });
-    return { accountId, account: acc.name, need: reserved.length, created };
+
+    return { accountId, account: acc.name, need: reserved.length, created, failed, skipped: 0 };
+  } finally {
+    // 批次中途异常退出（render/create 抛错、进程级错误由上层捕获）时，
+    // 剩余「已预留但还没建稿或有补偿未成功」的选题在这里统一归还，不留孤儿（R5-3）。
+    // S4-4-1-R5-HF1：这里也会收到「失败分支补偿没成功」的选题（见上面两处 catch），
+    // 是这些选题的最后一次机会——但**只再试一次**，不做循环重试。
+    if (pending.size > 0) {
+      const left = [...pending];
+      pending.clear();
+      try {
+        const rel = await releaseReservedAngles(left, acc.id, 'batch-aborted', pipeline);
+        if (rel.released > 0) {
+          logger.warn(
+            { account: acc.name, accountId: acc.id, pipeline, released: rel.released, angleIds: left },
+            '批次提前结束，已归还未产出文章的预留选题',
+          );
+        }
+        if (rel.retryable.length > 0) {
+          // 兜底也失败：绝不假装成功。日志留全（账号/选题/原因/异常），
+          // 并把这条失败追加进本批结果，调用方与前端都能看到「这几个题没还上」。
+          logger.error(
+            {
+              account: acc.name,
+              accountId: acc.id,
+              pipeline,
+              angleIds: rel.retryable,
+              reason: 'batch-aborted',
+              err: rel.error,
+            },
+            '兜底补偿失败：这些选题仍为 used=true，需人工归还',
+          );
+          failed.push({
+            title: '（补偿未完成）',
+            angleId: rel.retryable[0] ?? 0,
+            note:
+              `兜底补偿失败：${rel.retryable.length} 个选题未能归还` +
+              `（angleId ${rel.retryable.join(',')}）：${rel.error ?? '未知原因'}；` +
+              '请到选题库手动归还',
+          });
+        }
+      } catch (e) {
+        // 补偿本身抛异常时只记日志：这里吞掉的是**补偿异常**，
+        // 若 try 里还有原始业务异常，它会在本 finally 结束后照常向外传播（不被掩盖）。
+        logger.error(
+          {
+            account: acc.name,
+            accountId: acc.id,
+            pipeline,
+            angleIds: left,
+            reason: 'batch-aborted',
+            err: e instanceof Error ? e.message : String(e),
+          },
+          '兜底补偿过程抛出异常（原始业务异常仍会继续上抛）',
+        );
+      }
+    }
   }
+}
 
-  const titlePrefix = await getTitlePrefix();
+/** 把失败项压成一行给 TaskRun.errorMessage（VarChar(1000)，留余量）。 */
+function summarizeFailures(failures: Array<{ note: string }>): string {
+  return `失败 ${failures.length} 条：${failures.map((f) => f.note).join('；')}`.slice(0, 900);
+}
 
-  for (const angle of reserved) {
-    const draft = await generateDraft(angle, acc.track, acc);
-    const parsed = parseArticle(draft.contentHtml);
-    const rendered = renderArticle(parsed, { titlePrefix });
-    const article = await prisma.article.create({
-      data: {
-        trackId: acc.trackId,
-        accountId: acc.id,
-        angleId: angle.id,
-        pipeline: 'article',
-        title: rendered.title,
-        digest: rendered.digest,
-        contentHtml: draft.contentHtml,
-        contentWechat: rendered.contentWechat,
-        blocks: parsed.h2Count + parsed.pCount,
-        chars: parsed.charCount,
-        pushDate: '',
-        status: 'draft',
-        idempotencyKey: randomUUID(),
-      },
-    });
-    created.push({
-      id: article.id,
-      title: article.title,
-      angleId: angle.id,
-      modelUsed: draft.modelUsed,
-      note: draft.note,
-    });
+/**
+ * 归还「本次任务预留、但没有产出文章」的选题（S4-4-1 R5）。
+ *
+ * 三重闸门，缺一不可：
+ *  1. `id ∈` 调用方传入的本次预留集合 —— 不碰别的任务；
+ *  2. `usedByAccountId === 该账号` —— 即使 id 传错/被复用，也不会放掉别人（或人工）的占用；
+ *  3. `articles: { none: {} }` —— 已经有文章引用的绝不释放（哪怕文章是本次刚建好的）。
+ *
+ * 返回值必须能区分四种结局（S4-4-1-R5-HF1）——旧的 `number` 把它们全压成 0，
+ * 调用方只能靠「>0 算成功」，一旦 DB 异常就和「本来就该保护」混为一谈，
+ * 于是失败分支把选题从 pending 里删掉、finally 不再重试，留下 used=true 的孤儿：
+ *
+ * | 结局 | released | retryable | skipped | error |
+ * |---|---|---|---|---|
+ * | 成功归还 | >0 | [] | 受保护/无需归还的 id | 无 |
+ * | 全部受保护（已有文章 / 非本账号 / 已未用） | 0 | [] | 全部 id | 无 |
+ * | 数据库异常（无法判断谁受保护） | 0 | 全部 id（保守，交给 finally 再试一次） | [] | 有 |
+ *
+ * 失败只记日志、不抛：补偿是善后动作，不该把已经成功的建稿结果连坐成异常。
+ */
+export interface ReservedReleaseResult {
+  /** 实际归还条数。 */
+  released: number;
+  /** 仍可能需要补偿的 id（只会在数据库异常时非空）——调用方**不得**在非空时把它们从 pending 里移除。 */
+  retryable: number[];
+  /** 经闸门确认「不需要/不能释放」的 id（已有文章引用、非本次账号占用、本来就没占用）。不重试。 */
+  skipped: number[];
+  /** 数据库异常信息（成功时缺省）。 */
+  error?: string;
+}
+
+export async function releaseReservedAngles(
+  angleIds: number[],
+  accountId: number,
+  reason: string,
+  pipeline?: string,
+): Promise<ReservedReleaseResult> {
+  const ids = [...new Set(angleIds)].filter((n) => Number.isInteger(n) && n > 0);
+  if (ids.length === 0 || !Number.isInteger(accountId)) {
+    return { released: 0, retryable: [], skipped: ids };
   }
-
-  await prisma.taskRun.create({
-    data: {
-      jobType: 'write',
-      status: 'success',
-      trigger: 'manual',
-      trackId: acc.trackId,
-      accountId: acc.id,
-      runDate: todayStr(),
-      attempt: 1,
-      paramsJson: packJson({ accountId, pipeline, count: count ?? null, need: reserved.length }),
-      resultJson: packJson({ createdIds: created.map((c) => c.id), modelUsed: created[0]?.modelUsed ?? null }),
-    },
-  });
-
-  return { accountId, account: acc.name, need: reserved.length, created };
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const free = await tx.angle.findMany({
+        where: {
+          id: { in: ids },
+          used: true,
+          usedByAccountId: accountId,
+          articles: { none: {} },
+        },
+        select: { id: true },
+      });
+      const freeIds = free.map((f) => f.id);
+      const skipped = ids.filter((id) => !freeIds.includes(id));
+      if (freeIds.length === 0) return { released: 0, retryable: [], skipped };
+      const released = await tx.angle.updateMany({
+        where: { id: { in: freeIds } },
+        data: ANGLE_RELEASE_DATA,
+      });
+      logger.warn(
+        { accountId, pipeline, reason, released: released.count, angleIds: freeIds, skipped },
+        '归还本次预留但未产出文章的选题',
+      );
+      return { released: released.count, retryable: [], skipped };
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.error(
+      { accountId, pipeline, reason, angleIds: ids, err: msg },
+      '归还预留选题失败（需人工检查这几个选题的 used 状态）',
+    );
+    // 异常时事务整体回滚，我们无法判断谁受保护 → 全部标为「可重试」，
+    // 交给 finally 再试一次（下次会重新过闸门，受保护的仍不会被释放）。
+    return { released: 0, retryable: ids, skipped: [], error: msg };
+  }
 }
 
 /** @deprecated 兼容旧调用方：等价于文章产线触发。 */
