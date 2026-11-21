@@ -2,7 +2,7 @@
 
 > **⚡ 最新（2026-11-13）：后续实施以 [`RESTRUCTURE-2.0-CONVERGED-PLAN.md`](./RESTRUCTURE-2.0-CONVERGED-PLAN.md)（2.0 重构方案·基于现有成果的精简修订版）为唯一依据**——T1-A REV 系列（含 REV4.1）已被其取代归档；T0 已验收保留不重做。
 
-**建立日期**：2026-11-12 | **状态**：**提交前整理**——S1（MySQL 切换 + T0 最小适配）、S2（SQLite 遗留清理）、S3（抽象裁剪，裁决冻结）、S4（业务与内容质量，S4-1～S4-5）、S5（UI/UX，S5-UI-1～6）、**S6（回归与收尾，S6-0～S6-4 + S6-5A + S6-5B 全部完成）均已完成**；S6-4 已提交推送（`2458d11`），S6-5A+B 待提交，详见下方「实施期关键报告索引」（分阶段授权，见总纲 §六）
+**建立日期**：2026-11-12 | **状态**：**第一期重构与交付审查已完成（正式关闭）**——S1（MySQL 切换 + T0 最小适配）、S2（SQLite 遗留清理）、S3（抽象裁剪，裁决冻结）、S4（业务与内容质量，S4-1～S4-5）、S5（UI/UX，S5-UI-1～6）、S6（回归与收尾，S6-0～S6-6 + S6-5A + S6-5B 全部完成）均已完成；**S6-6 最终交付审查判定 PASS WITH NOTES（无 P0/P1、无强制阻塞任务），第一期可停止重构、转入真实业务配置和试运行**。S6-4 已提交推送（`2458d11`），S6-5A+B 在 `39e05fc`（待提交），S6-6 报告为本次新增（待提交）；详见下方「实施期关键报告索引」（分阶段授权，见总纲 §六）
 **效力顺序**：`RESTRUCTURE-2.0-CONVERGED-PLAN.md`（当前最高）→ `00-FINAL-EXECUTION-CHARTER.md` → 本文决策表 → 其余文档。文档间若有冲突，以最新总纲为准并在本文登记。
 
 ## AI 阅读规则（接手 agent 必读）
@@ -42,6 +42,7 @@
 | `S6-4-FINAL-PRE-COMMIT` 系列 / 护栏脚本 `server/scripts/migrate-guard.ts` | Migration 命令级护栏（主目标+Shadow 双重身份校验）+ 交付文档纠偏 | S6-4 已提交推送 `2458d11`，自检 32/32 |
 | `S6-5B-PRECHECK-REPORT.md` | 六赛道初始化只读准备（创建链/字段/门禁/非幂等保护/回滚） | READY WITH CONDITIONS，前置条件已满足 |
 | `S6-5B-3-POST-CREATION-ACCEPTANCE-REPORT.md` | 六赛道创建后最终验收（Track/Pipeline/StylePrompt DIFF/前端匹配） | PASS，数据库写入 0，DIFF=0 |
+| `S6-6-FINAL-DELIVERY-AUDIT.md` | 第一期最终交付验收（10 项核心能力覆盖矩阵 + 部署可用性 + 安全红线 + 原计划指标核对 + P0–P3 清单 + 验证边界） | **PASS WITH NOTES**：无 P0/P1、无强制阻塞任务；第一期正式关闭，转入真实业务配置和试运行 |
 
 > 历史文档（保留不删，已被上表取代）：`docs/AUDIT-REPORT.md`、`docs/RESTRUCTURE-CHECKLIST.md`（V1）、`docs/RESTRUCTURE-PLAN-V1.md`（原始方案）、`docs/SECOND-OPINION.md`（实测数据）、`docs/FORM-ARCHITECTURE.md` / `TRACK-FORM-RESEARCH.md`（形态设计稿与调研）。
 
